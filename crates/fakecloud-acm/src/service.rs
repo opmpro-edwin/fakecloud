@@ -1983,12 +1983,16 @@ fn synth_domain_validation(
         .iter()
         .map(|d| match method {
             "DNS" => {
-                let token = synth_dns_token(d);
+                // ACM validates a wildcard name through its base domain:
+                // `*.example.com` gets the record `_<token>.example.com.`, the
+                // same one `example.com` gets, so both share one CNAME.
+                let base = d.strip_prefix("*.").unwrap_or(d);
+                let token = synth_dns_token(base);
                 DomainValidation {
                     domain_name: d.clone(),
                     validation_status: "PENDING_VALIDATION".to_string(),
                     validation_method: "DNS".to_string(),
-                    resource_record_name: Some(format!("_{token}.{d}.")),
+                    resource_record_name: Some(format!("_{token}.{base}.")),
                     resource_record_type: Some("CNAME".to_string()),
                     resource_record_value: Some(format!("_{token}.acm-validations.aws.")),
                     http_redirect_from: None,
@@ -2679,6 +2683,34 @@ mod tests {
         assert!(cert_pem.starts_with("-----BEGIN CERTIFICATE-----"));
         assert!(key_pem.contains("-----BEGIN PRIVATE KEY-----"));
         assert!(cert_pem.len() > 400);
+    }
+
+    #[test]
+    fn dns_validation_record_drops_wildcard_label() {
+        let dvs = synth_domain_validation(
+            "*.example.com",
+            &["example.com".to_string(), "*.api.example.com".to_string()],
+            "DNS",
+            &HashMap::new(),
+        );
+        assert_eq!(dvs.len(), 3);
+        let wildcard = dvs[0].resource_record_name.as_deref().unwrap();
+        let apex = dvs[1].resource_record_name.as_deref().unwrap();
+        let nested = dvs[2].resource_record_name.as_deref().unwrap();
+        assert_eq!(dvs[0].domain_name, "*.example.com");
+        assert!(!wildcard.contains('*'), "{wildcard}");
+        assert!(wildcard.starts_with('_'), "{wildcard}");
+        assert!(wildcard.ends_with(".example.com."), "{wildcard}");
+        assert_eq!(wildcard.matches('.').count(), 3, "{wildcard}");
+        // `*.example.com` and `example.com` share one validation record.
+        assert_eq!(wildcard, apex);
+        assert_eq!(
+            dvs[0].resource_record_value, dvs[1].resource_record_value,
+            "shared record must carry the same value"
+        );
+        assert!(nested.ends_with(".api.example.com."), "{nested}");
+        assert!(!nested.contains('*'), "{nested}");
+        assert_ne!(nested, wildcard);
     }
 
     #[test]

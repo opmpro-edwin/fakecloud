@@ -601,3 +601,114 @@ async fn acm_admin_endpoint_returns_404_for_unknown() {
         .await;
     assert_eq!(code, 404);
 }
+
+/// A wildcard name is validated through its base domain: `*.wild.example.com`
+/// and `wild.example.com` get the same `_<token>.wild.example.com.` CNAME, with
+/// no `*` label. Publishing that one record in Route 53 is enough for the
+/// certificate to reach `ISSUED`, which is the flow Terraform's
+/// `aws_acm_certificate_validation` drives.
+#[tokio::test]
+async fn wildcard_dns_validation_record_drops_wildcard_label() {
+    use aws_sdk_route53::types::{
+        Change, ChangeAction, ChangeBatch, ResourceRecord, ResourceRecordSet, RrType,
+    };
+
+    let server = TestServer::start_with_env(&[("FAKECLOUD_ACM_AUTO_ISSUE_SECS", "1")]).await;
+    let acm = server.acm_client().await;
+    let r53 = server.route53_client().await;
+
+    let arn = acm
+        .request_certificate()
+        .domain_name("*.wild.example.com")
+        .subject_alternative_names("wild.example.com")
+        .validation_method(ValidationMethod::Dns)
+        .send()
+        .await
+        .expect("request")
+        .certificate_arn()
+        .unwrap()
+        .to_string();
+
+    let cert = acm
+        .describe_certificate()
+        .certificate_arn(&arn)
+        .send()
+        .await
+        .expect("describe")
+        .certificate()
+        .unwrap()
+        .clone();
+    let dvo = cert.domain_validation_options();
+    assert_eq!(dvo.len(), 2);
+    assert_eq!(dvo[0].domain_name(), "*.wild.example.com");
+    assert_eq!(dvo[1].domain_name(), "wild.example.com");
+    let wildcard = dvo[0].resource_record().expect("wildcard record");
+    let apex = dvo[1].resource_record().expect("apex record");
+    assert!(!wildcard.name().contains('*'), "{}", wildcard.name());
+    assert!(wildcard.name().starts_with('_'));
+    assert!(wildcard.name().ends_with(".wild.example.com."));
+    assert_eq!(wildcard.name(), apex.name());
+    assert_eq!(wildcard.value(), apex.value());
+
+    let zone_id = r53
+        .create_hosted_zone()
+        .name("wild.example.com")
+        .caller_reference("acm-wildcard")
+        .send()
+        .await
+        .expect("create zone")
+        .hosted_zone()
+        .unwrap()
+        .id()
+        .to_string();
+    let rrset = ResourceRecordSet::builder()
+        .name(wildcard.name())
+        .r#type(RrType::Cname)
+        .ttl(60)
+        .resource_records(
+            ResourceRecord::builder()
+                .value(wildcard.value())
+                .build()
+                .unwrap(),
+        )
+        .build()
+        .unwrap();
+    r53.change_resource_record_sets()
+        .hosted_zone_id(&zone_id)
+        .change_batch(
+            ChangeBatch::builder()
+                .changes(
+                    Change::builder()
+                        .action(ChangeAction::Upsert)
+                        .resource_record_set(rrset)
+                        .build()
+                        .unwrap(),
+                )
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .expect("publish validation record");
+
+    let issued = helpers::wait_until(std::time::Duration::from_secs(15), || {
+        let acm = acm.clone();
+        let arn = arn.clone();
+        async move {
+            let cert = acm
+                .describe_certificate()
+                .certificate_arn(&arn)
+                .send()
+                .await
+                .ok()?
+                .certificate()?
+                .clone();
+            (cert.status() == Some(&CertificateStatus::Issued)).then_some(cert)
+        }
+    })
+    .await
+    .expect("certificate reaches ISSUED");
+    for dv in issued.domain_validation_options() {
+        assert_eq!(dv.validation_status().map(|s| s.as_str()), Some("SUCCESS"));
+    }
+}
