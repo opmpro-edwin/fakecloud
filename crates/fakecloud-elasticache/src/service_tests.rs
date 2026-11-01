@@ -132,6 +132,7 @@ fn cache_subnet_group_xml_contains_all_fields() {
 #[test]
 fn cache_cluster_xml_contains_expected_fields() {
     let cluster = CacheCluster {
+        requested_port: None,
         cache_cluster_id: "classic-1".to_string(),
         cache_node_type: "cache.t3.micro".to_string(),
         engine: "redis".to_string(),
@@ -704,6 +705,7 @@ fn service_with_cache_cluster(cluster_id: &str) -> ElastiCacheService {
         s.cache_clusters.insert(
             cluster_id.to_string(),
             CacheCluster {
+                requested_port: None,
                 cache_cluster_id: cluster_id.to_string(),
                 cache_node_type: "cache.t3.micro".to_string(),
                 engine: "redis".to_string(),
@@ -764,6 +766,7 @@ fn describe_cache_clusters_returns_all() {
         state.cache_clusters.insert(
             "cluster-b".to_string(),
             CacheCluster {
+                requested_port: None,
                 cache_cluster_id: "cluster-b".to_string(),
                 cache_node_type: "cache.t3.micro".to_string(),
                 engine: "valkey".to_string(),
@@ -1050,6 +1053,7 @@ fn add_cluster_to_replication_group_updates_members_and_count() {
     state.replication_groups.insert(
         "rg-1".to_string(),
         ReplicationGroup {
+            requested_port: None,
             replication_group_id: "rg-1".to_string(),
             description: "test group".to_string(),
             global_replication_group_id: None,
@@ -1123,6 +1127,7 @@ async fn delete_cache_cluster_removes_cluster_from_replication_group() {
         state.replication_groups.insert(
             "delete-rg".to_string(),
             ReplicationGroup {
+                requested_port: None,
                 replication_group_id: "delete-rg".to_string(),
                 description: "test group".to_string(),
                 global_replication_group_id: None,
@@ -1223,6 +1228,7 @@ fn service_with_replication_group(group_id: &str, num_clusters: i32) -> ElastiCa
         s.replication_groups.insert(
             group_id.to_string(),
             ReplicationGroup {
+                requested_port: None,
                 replication_group_id: group_id.to_string(),
                 description: "test group".to_string(),
                 global_replication_group_id: None,
@@ -1602,6 +1608,7 @@ fn replication_group_xml_emits_dynamic_encryption_and_kms() {
     state.replication_groups.insert(
         "enc-rg".to_string(),
         ReplicationGroup {
+            requested_port: None,
             replication_group_id: "enc-rg".to_string(),
             description: "encrypted".to_string(),
             global_replication_group_id: None,
@@ -3611,6 +3618,7 @@ fn replication_group_from_request(req: &AwsRequest) -> crate::state::Replication
         .unwrap_or(6379);
     let arn = format!("arn:aws:elasticache:us-east-1:123456789012:replicationgroup:{id}");
     crate::state::ReplicationGroup {
+        requested_port: None,
         replication_group_id: id.clone(),
         description,
         global_replication_group_id: None,
@@ -4341,6 +4349,7 @@ async fn reboot_cache_cluster_marks_rebooting_when_no_runtime() {
         account.cache_clusters.insert(
             "test-cc".to_string(),
             CacheCluster {
+                requested_port: None,
                 cache_cluster_id: "test-cc".to_string(),
                 cache_node_type: "cache.t4g.micro".to_string(),
                 engine: "redis".to_string(),
@@ -4518,6 +4527,7 @@ fn insert_test_cluster(svc: &ElastiCacheService, id: &str) {
     account.cache_clusters.insert(
         id.to_string(),
         CacheCluster {
+            requested_port: None,
             cache_cluster_id: id.to_string(),
             cache_node_type: "cache.t4g.micro".to_string(),
             engine: "redis".to_string(),
@@ -4825,6 +4835,7 @@ fn cache_cluster_from_request(req: &AwsRequest) -> crate::state::CacheCluster {
         parse_query_list_param(req, "PreferredOutpostArns", "PreferredOutpostArn");
     let arn = format!("arn:aws:elasticache:us-east-1:123456789012:cluster:{cache_cluster_id}");
     crate::state::CacheCluster {
+        requested_port: None,
         cache_cluster_id: cache_cluster_id.clone(),
         cache_node_type,
         engine,
@@ -5872,4 +5883,165 @@ async fn unresolvable_volume_skips_redis_recovery_but_not_memcached() {
         state.cache_clusters["mem-c"].cache_cluster_status,
         "starting"
     );
+}
+
+fn response_text(resp: AwsResponse) -> String {
+    String::from_utf8(resp.body.expect_bytes().to_vec()).unwrap()
+}
+
+/// `CreateReplicationGroup` with `NumCacheClusters=2` gives the group member
+/// clusters `<rg>-001` and `<rg>-002` that `DescribeCacheClusters` returns,
+/// carrying the group's configuration, and that go away with the group.
+#[tokio::test]
+async fn replication_group_member_clusters_are_describable() {
+    let shared = std::sync::Arc::new(parking_lot::RwLock::new(
+        fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
+    ));
+    let service = ElastiCacheService::new(shared);
+    service
+        .create_replication_group(&request(
+            "CreateReplicationGroup",
+            &[
+                ("ReplicationGroupId", "vk"),
+                ("ReplicationGroupDescription", "members"),
+                ("Engine", "valkey"),
+                ("EngineVersion", "8.1"),
+                ("CacheNodeType", "cache.t4g.micro"),
+                ("NumCacheClusters", "2"),
+                ("TransitEncryptionEnabled", "true"),
+                ("AtRestEncryptionEnabled", "true"),
+                ("SecurityGroupIds.SecurityGroupId.1", "sg-123"),
+                ("PreferredMaintenanceWindow", "sun:05:00-sun:06:00"),
+            ],
+        ))
+        .await
+        .unwrap();
+
+    let body = response_text(
+        service
+            .describe_cache_clusters(&request(
+                "DescribeCacheClusters",
+                &[("CacheClusterId", "vk-001"), ("ShowCacheNodeInfo", "true")],
+            ))
+            .unwrap(),
+    );
+    assert!(
+        body.contains("<CacheClusterId>vk-001</CacheClusterId>"),
+        "{body}"
+    );
+    assert!(body.contains("<ReplicationGroupId>vk</ReplicationGroupId>"));
+    assert!(body.contains("<Engine>valkey</Engine>"));
+    assert!(body.contains("<EngineVersion>8.1</EngineVersion>"));
+    assert!(body.contains("<CacheNodeType>cache.t4g.micro</CacheNodeType>"));
+    assert!(body.contains("<CacheClusterStatus>available</CacheClusterStatus>"));
+    assert!(body.contains("<NumCacheNodes>1</NumCacheNodes>"));
+    assert!(body.contains("<CacheNodeId>0001</CacheNodeId>"));
+    assert!(body.contains("<SecurityGroupId>sg-123</SecurityGroupId>"));
+    assert!(body.contains("<TransitEncryptionEnabled>true</TransitEncryptionEnabled>"));
+    assert!(body.contains("<AtRestEncryptionEnabled>true</AtRestEncryptionEnabled>"));
+    assert!(body
+        .contains("<PreferredMaintenanceWindow>sun:05:00-sun:06:00</PreferredMaintenanceWindow>"));
+    assert!(body.contains("<ARN>arn:aws:elasticache:us-east-1:123456789012:cluster:vk-001</ARN>"));
+
+    // Listing returns both members; the not-in-a-group filter drops them.
+    let all = response_text(
+        service
+            .describe_cache_clusters(&request("DescribeCacheClusters", &[]))
+            .unwrap(),
+    );
+    assert!(all.contains("<CacheClusterId>vk-001</CacheClusterId>"));
+    assert!(all.contains("<CacheClusterId>vk-002</CacheClusterId>"));
+    let standalone = response_text(
+        service
+            .describe_cache_clusters(&request(
+                "DescribeCacheClusters",
+                &[("ShowCacheClustersNotInReplicationGroups", "true")],
+            ))
+            .unwrap(),
+    );
+    assert!(!standalone.contains("vk-00"), "{standalone}");
+
+    // A member id is taken.
+    let err = service
+        .create_cache_cluster(&request(
+            "CreateCacheCluster",
+            &[("CacheClusterId", "vk-002"), ("Engine", "valkey")],
+        ))
+        .await
+        .err()
+        .expect("member id is taken");
+    assert_eq!(err.code(), "CacheClusterAlreadyExists");
+
+    // Members follow the group: a node type change shows on them.
+    service
+        .modify_replication_group(&request(
+            "ModifyReplicationGroup",
+            &[
+                ("ReplicationGroupId", "vk"),
+                ("CacheNodeType", "cache.r7g.large"),
+            ],
+        ))
+        .await
+        .unwrap();
+    let body = response_text(
+        service
+            .describe_cache_clusters(&request(
+                "DescribeCacheClusters",
+                &[("CacheClusterId", "vk-002")],
+            ))
+            .unwrap(),
+    );
+    assert!(body.contains("<CacheNodeType>cache.r7g.large</CacheNodeType>"));
+
+    // The primary cannot be deleted on its own, nor the last replica.
+    for id in ["vk-001", "vk-002"] {
+        let err = service
+            .delete_cache_cluster(&request("DeleteCacheCluster", &[("CacheClusterId", id)]))
+            .await
+            .err()
+            .expect("member delete rejected");
+        assert_eq!(err.code(), "InvalidCacheClusterState", "{id}");
+    }
+
+    service
+        .delete_replication_group(&request(
+            "DeleteReplicationGroup",
+            &[("ReplicationGroupId", "vk")],
+        ))
+        .await
+        .unwrap();
+    let err = service
+        .describe_cache_clusters(&request(
+            "DescribeCacheClusters",
+            &[("CacheClusterId", "vk-001")],
+        ))
+        .err()
+        .expect("member gone with its group");
+    assert_eq!(err.code(), "CacheClusterNotFound");
+}
+
+/// A read replica of a cluster-mode disabled group can be deleted through
+/// `DeleteCacheCluster`; it leaves the group.
+#[tokio::test]
+async fn deleting_a_read_replica_member_shrinks_the_group() {
+    let service = service_with_replication_group("rr", 3);
+    let body = response_text(
+        service
+            .delete_cache_cluster(&request(
+                "DeleteCacheCluster",
+                &[("CacheClusterId", "rr-003")],
+            ))
+            .await
+            .unwrap(),
+    );
+    assert!(body.contains("<CacheClusterStatus>deleting</CacheClusterStatus>"));
+    let group = service.state.read().default_ref().replication_groups["rr"].clone();
+    assert_eq!(group.member_clusters, vec!["rr-001", "rr-002"]);
+    assert_eq!(group.num_cache_clusters, 2);
+    assert!(service
+        .describe_cache_clusters(&request(
+            "DescribeCacheClusters",
+            &[("CacheClusterId", "rr-003")],
+        ))
+        .is_err());
 }

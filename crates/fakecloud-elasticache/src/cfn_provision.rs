@@ -24,6 +24,8 @@ const ENGINE_MEMCACHED: &str = "memcached";
 /// record is gone (e.g. the stack was deleted before the container booted).
 struct ClusterSpawnParams {
     is_memcached: bool,
+    engine: String,
+    requested_port: Option<u16>,
     rdb_path: Option<String>,
     pod_tags: BTreeMap<String, String>,
 }
@@ -60,6 +62,8 @@ pub async fn cfn_ensure_cluster_container(
         (
             ClusterSpawnParams {
                 is_memcached: cluster.engine == ENGINE_MEMCACHED,
+                engine: cluster.engine.clone(),
+                requested_port: cluster.requested_port,
                 rdb_path,
                 pod_tags,
             },
@@ -78,6 +82,7 @@ pub async fn cfn_ensure_cluster_container(
                 &incarnation,
                 &account_id,
                 &cache_cluster_id,
+                params.requested_port,
                 &params.pod_tags,
             )
             .await
@@ -87,6 +92,8 @@ pub async fn cfn_ensure_cluster_container(
                 &incarnation,
                 &account_id,
                 &cache_cluster_id,
+                &params.engine,
+                params.requested_port,
                 &volume,
                 params.rdb_path.as_deref(),
                 &params.pod_tags,
@@ -158,7 +165,7 @@ pub async fn cfn_ensure_replication_group_container(
     replication_group_id: String,
     account_id: String,
 ) {
-    let (rdb_path, pod_tags, cluster_enabled, incarnation, volume) = {
+    let (rdb_path, pod_tags, cluster_enabled, incarnation, volume, engine, requested_port) = {
         let accounts = state.read();
         let Some(st) = accounts.get(&account_id) else {
             return;
@@ -185,6 +192,8 @@ pub async fn cfn_ensure_replication_group_container(
                 fakecloud_core::data_volume::current_scope().tag(),
                 &account_id,
             ),
+            group.engine.clone(),
+            group.requested_port,
         )
     };
 
@@ -193,6 +202,8 @@ pub async fn cfn_ensure_replication_group_container(
             &incarnation,
             &account_id,
             &replication_group_id,
+            &engine,
+            requested_port,
             &volume,
             rdb_path.as_deref(),
             &pod_tags,

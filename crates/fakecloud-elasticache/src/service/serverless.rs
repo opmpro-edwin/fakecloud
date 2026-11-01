@@ -165,7 +165,7 @@ impl ElastiCacheService {
                 tags.iter().cloned().collect();
             // This incarnation's id and volume, pinned now (see
             // CreateCacheCluster).
-            let (incarnation, volume) = {
+            let (incarnation, volume, engine) = {
                 let accounts = self.state.read();
                 match accounts
                     .get(&account_id)
@@ -177,8 +177,9 @@ impl ElastiCacheService {
                             fakecloud_core::data_volume::current_scope().tag(),
                             &account_id,
                         ),
+                        c.engine.clone(),
                     ),
-                    None => (String::new(), String::new()),
+                    None => (String::new(), String::new(), String::new()),
                 }
             };
             tokio::spawn(async move {
@@ -186,7 +187,16 @@ impl ElastiCacheService {
                     return;
                 }
                 let result = runtime
-                    .ensure_redis(&incarnation, &account_id, &name, &volume, None, &pod_tags)
+                    .ensure_redis(
+                        &incarnation,
+                        &account_id,
+                        &name,
+                        &engine,
+                        None,
+                        &volume,
+                        None,
+                        &pod_tags,
+                    )
                     .await;
                 let mut stop_container = false;
                 {

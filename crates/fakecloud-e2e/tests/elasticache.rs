@@ -3615,3 +3615,240 @@ async fn elasticache_reboot_returns_immediately() {
     // It converges back to available in the background.
     helpers::wait_for_cache_cluster_available(&client, "reboot-cluster", 120).await;
 }
+
+/// Send one inline command to a Redis-protocol server and return the raw
+/// reply.
+async fn redis_inline(addr: &str, command: &str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    stream
+        .write_all(format!("{command}\r\n").as_bytes())
+        .await
+        .expect("write");
+    let mut reply = Vec::new();
+    let mut buf = [0u8; 4096];
+    // A bulk reply's header carries its length; read until all of it arrived.
+    loop {
+        let n = tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut buf))
+            .await
+            .expect("reply in time")
+            .expect("read");
+        if n == 0 {
+            break;
+        }
+        reply.extend_from_slice(&buf[..n]);
+        let text = String::from_utf8_lossy(&reply);
+        if let Some(rest) = text.strip_prefix('$') {
+            if let Some((len, body)) = rest.split_once("\r\n") {
+                if body.len() >= len.parse::<usize>().unwrap_or(0) {
+                    break;
+                }
+            }
+        } else if text.ends_with("\r\n") {
+            break;
+        }
+    }
+    String::from_utf8_lossy(&reply).into_owned()
+}
+
+/// A replication group's member clusters (`<rg>-001`, `<rg>-002`) are
+/// returned by DescribeCacheClusters with the group's settings and a node
+/// endpoint that reaches the group's engine, and an engine `valkey` group
+/// runs real Valkey. The members go away with the group.
+#[tokio::test]
+async fn elasticache_valkey_replication_group_member_clusters() {
+    if !require_docker_or_skip("elasticache_valkey_replication_group_member_clusters") {
+        return;
+    }
+
+    let server = TestServer::start().await;
+    let client = server.elasticache_client().await;
+
+    client
+        .create_replication_group()
+        .replication_group_id("vk-members")
+        .replication_group_description("valkey with members")
+        .engine("valkey")
+        .engine_version("8.1")
+        .cache_node_type("cache.t4g.micro")
+        .num_cache_clusters(2)
+        .automatic_failover_enabled(true)
+        .send()
+        .await
+        .unwrap();
+    let group = helpers::wait_for_replication_group_available(&client, "vk-members", 180).await;
+    assert_eq!(
+        group.member_clusters(),
+        &["vk-members-001".to_string(), "vk-members-002".to_string()]
+    );
+
+    for id in ["vk-members-001", "vk-members-002"] {
+        let resp = client
+            .describe_cache_clusters()
+            .cache_cluster_id(id)
+            .show_cache_node_info(true)
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("describe {id}: {e:?}"));
+        let cluster = &resp.cache_clusters()[0];
+        assert_eq!(cluster.cache_cluster_id(), Some(id));
+        assert_eq!(cluster.replication_group_id(), Some("vk-members"));
+        assert_eq!(cluster.engine(), Some("valkey"));
+        assert_eq!(cluster.cache_node_type(), Some("cache.t4g.micro"));
+        assert_eq!(cluster.cache_cluster_status(), Some("available"));
+        let nodes = cluster.cache_nodes();
+        assert_eq!(nodes.len(), 1);
+        let endpoint = nodes[0].endpoint().expect("node endpoint");
+        let addr = format!(
+            "{}:{}",
+            endpoint.address().unwrap(),
+            endpoint.port().unwrap()
+        );
+        let info = redis_inline(&addr, "INFO server").await;
+        assert!(
+            info.contains("valkey_version:8."),
+            "engine valkey must run Valkey 8, INFO said: {info}"
+        );
+    }
+
+    let listed = client.describe_cache_clusters().send().await.unwrap();
+    let ids: Vec<&str> = listed
+        .cache_clusters()
+        .iter()
+        .filter_map(|c| c.cache_cluster_id())
+        .collect();
+    assert!(ids.contains(&"vk-members-001") && ids.contains(&"vk-members-002"));
+
+    client
+        .delete_replication_group()
+        .replication_group_id("vk-members")
+        .send()
+        .await
+        .unwrap();
+    let err = client
+        .describe_cache_clusters()
+        .cache_cluster_id("vk-members-001")
+        .send()
+        .await
+        .expect_err("member gone with its group");
+    assert!(
+        err.into_service_error().is_cache_cluster_not_found_fault(),
+        "expected CacheClusterNotFound"
+    );
+}
+
+/// With `FAKECLOUD_PUBLISH_HOST=127.0.0.1` the engine's port is published on
+/// loopback only (not every interface), and the reported endpoint still
+/// reaches it.
+#[tokio::test]
+async fn elasticache_publish_host_binds_published_ports_to_loopback() {
+    if !require_docker_or_skip("elasticache_publish_host_binds_published_ports_to_loopback") {
+        return;
+    }
+    let server = TestServer::start_with_env(&[("FAKECLOUD_PUBLISH_HOST", "127.0.0.1")]).await;
+    let client = server.elasticache_client().await;
+    client
+        .create_cache_cluster()
+        .cache_cluster_id("loopback-only")
+        .engine("redis")
+        .send()
+        .await
+        .unwrap();
+    helpers::wait_for_cache_cluster_available(&client, "loopback-only", 120).await;
+    let described = client
+        .describe_cache_clusters()
+        .cache_cluster_id("loopback-only")
+        .show_cache_node_info(true)
+        .send()
+        .await
+        .unwrap();
+    let endpoint = described.cache_clusters()[0].cache_nodes()[0]
+        .endpoint()
+        .unwrap()
+        .clone();
+    assert_eq!(endpoint.address(), Some("127.0.0.1"));
+    let port = endpoint.port().unwrap();
+
+    let out = std::process::Command::new("docker")
+        .args([
+            "ps",
+            "--filter",
+            "label=fakecloud-elasticache=loopback-only",
+            "--format",
+            "{{.Ports}}",
+        ])
+        .output()
+        .unwrap();
+    let ports = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        ports.contains(&format!("127.0.0.1:{port}->6379/tcp")),
+        "published on loopback only: {ports}"
+    );
+    assert!(!ports.contains("0.0.0.0:"), "{ports}");
+    assert!(redis_inline(&format!("127.0.0.1:{port}"), "PING")
+        .await
+        .contains("PONG"));
+
+    client
+        .delete_cache_cluster()
+        .cache_cluster_id("loopback-only")
+        .send()
+        .await
+        .unwrap();
+}
+
+/// A replication group created with `Port` reports that port, as AWS does:
+/// the engine is published on it when it is free on the host. A second group
+/// asking for the same, now taken, port falls back to an ephemeral one.
+#[tokio::test]
+async fn elasticache_replication_group_is_published_on_its_requested_port() {
+    if !require_docker_or_skip("elasticache_replication_group_is_published_on_its_requested_port") {
+        return;
+    }
+    let server = TestServer::start().await;
+    let client = server.elasticache_client().await;
+    // A port free on the host right now.
+    let wanted = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+
+    for id in ["port-first", "port-second"] {
+        client
+            .create_replication_group()
+            .replication_group_id(id)
+            .replication_group_description("requested port")
+            .port(i32::from(wanted))
+            .send()
+            .await
+            .unwrap();
+    }
+    let first = helpers::wait_for_replication_group_available(&client, "port-first", 120).await;
+    let second = helpers::wait_for_replication_group_available(&client, "port-second", 120).await;
+    let port = |g: &aws_sdk_elasticache::types::ReplicationGroup| {
+        g.node_groups()[0]
+            .primary_endpoint()
+            .and_then(|e| e.port())
+            .unwrap()
+    };
+    let (first_port, second_port) = (port(&first), port(&second));
+    // Both started concurrently: exactly one got the requested port.
+    assert!(
+        (first_port == i32::from(wanted)) ^ (second_port == i32::from(wanted)),
+        "requested {wanted}, got {first_port} and {second_port}"
+    );
+    for p in [first_port, second_port] {
+        assert!(redis_inline(&format!("127.0.0.1:{p}"), "PING")
+            .await
+            .contains("PONG"));
+    }
+    for id in ["port-first", "port-second"] {
+        client
+            .delete_replication_group()
+            .replication_group_id(id)
+            .send()
+            .await
+            .unwrap();
+    }
+}

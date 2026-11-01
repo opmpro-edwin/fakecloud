@@ -378,6 +378,7 @@ impl ElastiCacheService {
             account_id: String,
             id: String,
             engine: String,
+            requested_port: Option<u16>,
             incarnation: String,
             volume: String,
         }
@@ -385,12 +386,14 @@ impl ElastiCacheService {
             account_id: String,
             id: String,
             engine: String,
+            requested_port: Option<u16>,
             incarnation: String,
             volume: String,
         }
         struct PendingServerless {
             account_id: String,
             name: String,
+            engine: String,
             incarnation: String,
             volume: String,
         }
@@ -428,6 +431,7 @@ impl ElastiCacheService {
                             account_id: account_id.clone(),
                             id: id.clone(),
                             engine: cluster.engine.clone(),
+                            requested_port: cluster.requested_port,
                             incarnation: cluster.incarnation(),
                             volume: cluster.data_volume_name(
                                 fakecloud_core::data_volume::current_scope().tag(),
@@ -451,6 +455,7 @@ impl ElastiCacheService {
                             account_id: account_id.clone(),
                             id: id.clone(),
                             engine: rg.engine.clone(),
+                            requested_port: rg.requested_port,
                             incarnation: rg.incarnation(),
                             volume: rg.data_volume_name(
                                 fakecloud_core::data_volume::current_scope().tag(),
@@ -472,6 +477,7 @@ impl ElastiCacheService {
                         serverless.push(PendingServerless {
                             account_id: account_id.clone(),
                             name: name.clone(),
+                            engine: sc.engine.clone(),
                             incarnation: sc.incarnation(),
                             volume: sc.data_volume_name(
                                 fakecloud_core::data_volume::current_scope().tag(),
@@ -518,7 +524,13 @@ impl ElastiCacheService {
                 let is_memcached = c.engine == "memcached";
                 let result = if is_memcached {
                     runtime
-                        .ensure_memcached(&c.incarnation, &c.account_id, &c.id, &pod_tags)
+                        .ensure_memcached(
+                            &c.incarnation,
+                            &c.account_id,
+                            &c.id,
+                            c.requested_port,
+                            &pod_tags,
+                        )
                         .await
                 } else {
                     runtime
@@ -526,6 +538,8 @@ impl ElastiCacheService {
                             &c.incarnation,
                             &c.account_id,
                             &c.id,
+                            &c.engine,
+                            c.requested_port,
                             &c.volume,
                             None,
                             &pod_tags,
@@ -624,7 +638,13 @@ impl ElastiCacheService {
                 let is_memcached = r.engine == "memcached";
                 let result = if is_memcached {
                     runtime
-                        .ensure_memcached(&r.incarnation, &r.account_id, &r.id, &pod_tags)
+                        .ensure_memcached(
+                            &r.incarnation,
+                            &r.account_id,
+                            &r.id,
+                            r.requested_port,
+                            &pod_tags,
+                        )
                         .await
                 } else {
                     runtime
@@ -632,6 +652,8 @@ impl ElastiCacheService {
                             &r.incarnation,
                             &r.account_id,
                             &r.id,
+                            &r.engine,
+                            r.requested_port,
                             &r.volume,
                             None,
                             &pod_tags,
@@ -730,6 +752,8 @@ impl ElastiCacheService {
                         &s.incarnation,
                         &s.account_id,
                         &s.name,
+                        &s.engine,
+                        None,
                         &s.volume,
                         None,
                         &pod_tags,

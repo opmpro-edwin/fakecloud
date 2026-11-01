@@ -22,14 +22,28 @@ pub use k8s::PendingRdb;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheEngineKind {
     Redis,
+    Valkey,
     Memcached,
 }
 
 impl CacheEngineKind {
-    /// Container image for this engine.
-    fn image(self) -> &'static str {
+    /// The Redis-protocol engine for an ElastiCache `Engine` value: `valkey`
+    /// runs Valkey, anything else (`redis`) runs Redis OSS.
+    pub fn redis_compatible(engine: &str) -> Self {
+        if engine.eq_ignore_ascii_case("valkey") {
+            CacheEngineKind::Valkey
+        } else {
+            CacheEngineKind::Redis
+        }
+    }
+
+    /// Container image for this engine. The Valkey image ships `redis-cli`
+    /// and `redis-server` links and keeps its data in `/data`, so every
+    /// Redis-protocol code path (exec, `SAVE`, RDB staging) works unchanged.
+    pub(crate) fn image(self) -> &'static str {
         match self {
             CacheEngineKind::Redis => "redis:7-alpine",
+            CacheEngineKind::Valkey => "valkey/valkey:8.1.10-alpine",
             CacheEngineKind::Memcached => "memcached:1.6-alpine",
         }
     }
@@ -37,9 +51,14 @@ impl CacheEngineKind {
     /// Default port the engine listens on.
     fn port(self) -> u16 {
         match self {
-            CacheEngineKind::Redis => 6379,
+            CacheEngineKind::Redis | CacheEngineKind::Valkey => 6379,
             CacheEngineKind::Memcached => 11211,
         }
+    }
+
+    /// Whether the engine speaks the Redis protocol and persists an RDB.
+    pub(crate) fn is_redis_compatible(self) -> bool {
+        matches!(self, CacheEngineKind::Redis | CacheEngineKind::Valkey)
     }
 }
 
@@ -204,36 +223,39 @@ impl ElastiCacheRuntime {
 
     /// Start (or replace) the Redis/Valkey container of resource incarnation
     /// `incarnation`, mounting `data_volume` (named from the resource row).
+    /// `engine` is the resource's ElastiCache `Engine` (`redis` or `valkey`)
+    /// and picks the image. `host_port` is the port the create request named:
+    /// the engine is published there when it is free (Docker), so the
+    /// endpoint reports it as AWS does; otherwise on an ephemeral port.
+    #[allow(clippy::too_many_arguments)]
     pub async fn ensure_redis(
         &self,
         incarnation: &str,
         account_id: &str,
         resource_id: &str,
+        engine: &str,
+        host_port: Option<u16>,
         data_volume: &str,
         rdb_path: Option<&str>,
         tags: &BTreeMap<String, String>,
     ) -> Result<RunningCacheContainer, RuntimeError> {
+        let kind = CacheEngineKind::redis_compatible(engine);
         let running = match &self.backend {
             CacheBackend::Docker(d) => {
                 d.spawn_container(
                     incarnation,
                     account_id,
                     resource_id,
-                    CacheEngineKind::Redis,
+                    kind,
+                    host_port,
                     rdb_path,
                     Some(data_volume),
                 )
                 .await?
             }
             CacheBackend::K8s(k) => {
-                k.spawn_pod(
-                    incarnation,
-                    resource_id,
-                    CacheEngineKind::Redis,
-                    rdb_path,
-                    tags,
-                )
-                .await?
+                k.spawn_pod(incarnation, resource_id, kind, rdb_path, tags)
+                    .await?
             }
         };
         self.containers
@@ -243,12 +265,14 @@ impl ElastiCacheRuntime {
     }
 
     /// Start the memcached container of resource incarnation `incarnation`
-    /// (in-memory only: no data volume).
+    /// (in-memory only: no data volume), published on `host_port` when it is
+    /// free (see [`Self::ensure_redis`]).
     pub async fn ensure_memcached(
         &self,
         incarnation: &str,
         account_id: &str,
         resource_id: &str,
+        host_port: Option<u16>,
         tags: &BTreeMap<String, String>,
     ) -> Result<RunningCacheContainer, RuntimeError> {
         let running = match &self.backend {
@@ -258,6 +282,7 @@ impl ElastiCacheRuntime {
                     account_id,
                     resource_id,
                     CacheEngineKind::Memcached,
+                    host_port,
                     None,
                     None,
                 )
@@ -432,22 +457,76 @@ struct DockerCache {
 }
 
 impl DockerCache {
+    /// Start the engine container, published on `host_port` when one is
+    /// given and the port is free, else on an ephemeral host port.
+    #[allow(clippy::too_many_arguments)]
     async fn spawn_container(
         &self,
         incarnation: &str,
         account_id: &str,
         resource_id: &str,
         engine: CacheEngineKind,
+        host_port: Option<u16>,
+        rdb_path: Option<&str>,
+        data_volume: Option<&str>,
+    ) -> Result<RunningCacheContainer, RuntimeError> {
+        if let Some(port) = host_port {
+            match self
+                .spawn_container_on(
+                    incarnation,
+                    account_id,
+                    resource_id,
+                    engine,
+                    Some(port),
+                    rdb_path,
+                    data_volume,
+                )
+                .await
+            {
+                Err(RuntimeError::ContainerStartFailed(message)) if port_taken(&message) => {
+                    tracing::info!(
+                        resource_id,
+                        port,
+                        "requested port is in use on the host; publishing on an ephemeral port"
+                    );
+                }
+                other => return other,
+            }
+        }
+        self.spawn_container_on(
+            incarnation,
+            account_id,
+            resource_id,
+            engine,
+            None,
+            rdb_path,
+            data_volume,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn spawn_container_on(
+        &self,
+        incarnation: &str,
+        account_id: &str,
+        resource_id: &str,
+        engine: CacheEngineKind,
+        host_port: Option<u16>,
         rdb_path: Option<&str>,
         data_volume: Option<&str>,
     ) -> Result<RunningCacheContainer, RuntimeError> {
         let image = engine.image();
         let container_port = engine.port();
+        let publish = match host_port {
+            Some(port) => format!("{port}:{container_port}"),
+            None => format!(":{container_port}"),
+        };
 
         let mut args: Vec<String> = vec![
             "create".to_string(),
             "-p".to_string(),
-            format!(":{container_port}"),
+            publish,
             "--label".to_string(),
             format!("fakecloud-elasticache={resource_id}"),
             "--label".to_string(),
@@ -467,7 +546,7 @@ impl DockerCache {
         // fakecloud reusing the id never reloads this RDB (#2630). memcached
         // is intentionally in-memory only, matching real ElastiCache (a reboot
         // clears it), so it gets no volume.
-        if let (CacheEngineKind::Redis, Some(volume)) = (engine, data_volume) {
+        if let (true, Some(volume)) = (engine.is_redis_compatible(), data_volume) {
             let volume = volume.to_string();
             fakecloud_core::data_volume::ensure_volume(
                 &self.cli,
@@ -545,7 +624,9 @@ impl DockerCache {
         };
 
         let wait_result = match engine {
-            CacheEngineKind::Redis => self.wait_for_redis(host_port).await,
+            CacheEngineKind::Redis | CacheEngineKind::Valkey => {
+                self.wait_for_redis(host_port).await
+            }
             CacheEngineKind::Memcached => self.wait_for_memcached(host_port).await,
         };
         if let Err(error) = wait_result {
@@ -717,6 +798,16 @@ impl DockerCache {
     }
 }
 
+/// Whether a container start failed because its host port is taken. Docker
+/// reports `port is already allocated` or `address already in use`; Docker
+/// Desktop `ports are not available`.
+fn port_taken(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("already allocated")
+        || message.contains("address already in use")
+        || message.contains("ports are not available")
+}
+
 /// Docker volume name for a resource's redis data dir in a volume scope
 /// (`fakecloud_core::data_volume`): stable for the same data dir across
 /// restarts, distinct for any other data dir, memory-mode process, or
@@ -773,6 +864,31 @@ mod tests {
             legacy_data_volume_name("my-cache"),
             "fakecloud-elasticache-data-my-cache"
         );
+    }
+
+    #[test]
+    fn port_in_use_start_failures_are_recognised() {
+        assert!(port_taken(
+            "container start failed: Bind for 0.0.0.0:6379 failed: port is already allocated"
+        ));
+        assert!(port_taken(
+            "ports are not available: exposing port TCP 127.0.0.1:6379 -> 0.0.0.0:0: listen tcp \
+             127.0.0.1:6379: bind: address already in use"
+        ));
+        assert!(!port_taken("container start failed: no such image"));
+    }
+
+    #[test]
+    fn valkey_engine_runs_a_valkey_image() {
+        let valkey = CacheEngineKind::redis_compatible("valkey");
+        assert_eq!(valkey, CacheEngineKind::Valkey);
+        assert!(valkey.image().starts_with("valkey/valkey:8."));
+        assert!(valkey.is_redis_compatible());
+        assert_eq!(valkey.port(), 6379);
+        let redis = CacheEngineKind::redis_compatible("redis");
+        assert_eq!(redis, CacheEngineKind::Redis);
+        assert!(redis.image().starts_with("redis:"));
+        assert!(!CacheEngineKind::Memcached.is_redis_compatible());
     }
 
     /// A delete and a recreate under the same id are different incarnations:

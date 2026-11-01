@@ -130,7 +130,7 @@ impl K8sCache {
 
         // Stage snapshot bytes (Redis only) for the Pod to fetch, then
         // build the spec referencing the RDB endpoint.
-        let rdb_url = if matches!(engine, CacheEngineKind::Redis) {
+        let rdb_url = if engine.is_redis_compatible() {
             if let Some(bytes) = rdb {
                 self.pending_rdb.write().insert(pod_name.clone(), bytes);
                 Some(format!(
@@ -281,7 +281,7 @@ impl K8sCache {
         running: &RunningCacheContainer,
         tags: &std::collections::BTreeMap<String, String>,
     ) -> Result<RunningCacheContainer, RuntimeError> {
-        let preserved = if matches!(running.engine, CacheEngineKind::Redis) {
+        let preserved = if running.engine.is_redis_compatible() {
             self.snapshot_live_rdb(&running.container_id).await
         } else {
             None

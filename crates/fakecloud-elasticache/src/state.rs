@@ -147,6 +147,11 @@ pub struct CacheCluster {
     /// container listens elsewhere.
     #[serde(default)]
     pub port: u16,
+    /// `Port` when the create request named one. The engine is then
+    /// published on that host port when it is free, so the endpoint reports
+    /// the requested port as AWS does (see `ElastiCacheRuntime::ensure_redis`).
+    #[serde(default)]
+    pub requested_port: Option<u16>,
     /// `PreferredMaintenanceWindow` from the request, e.g. `sun:23:00-mon:01:30`.
     #[serde(default)]
     pub preferred_maintenance_window: Option<String>,
@@ -291,6 +296,10 @@ pub struct ReplicationGroup {
     /// echoes the requested value through pending modifications.
     #[serde(default)]
     pub port: u16,
+    /// `Port` when the create request named one; see
+    /// [`CacheCluster::requested_port`].
+    #[serde(default)]
+    pub requested_port: Option<u16>,
     /// SNS topic ARN for replication-group events.
     #[serde(default)]
     pub notification_topic_arn: Option<String>,
@@ -696,6 +705,70 @@ impl ReplicationGroup {
         cache_incarnation(&self.arn, &self.created_at)
     }
 
+    /// Member cluster `member_id` (`<group>-001`, `<group>-002`, ...) as
+    /// `DescribeCacheClusters` reports it, or `None` when it is not a member.
+    ///
+    /// AWS creates one single-node cache cluster per member. fakecloud backs
+    /// the whole group with one container, so a member has no row or
+    /// container of its own: it is derived from the group on every read and
+    /// so follows the group through create, modify and delete. Every member
+    /// reports the group's status, configuration and endpoint.
+    pub fn member_cluster(&self, member_id: &str) -> Option<CacheCluster> {
+        if !self.member_clusters.iter().any(|m| m == member_id) {
+            return None;
+        }
+        let (arn_prefix, region) = match self.arn.rsplit_once(":replicationgroup:") {
+            Some((prefix, _)) => (prefix, prefix.split(':').nth(3).unwrap_or_default()),
+            None => ("", ""),
+        };
+        Some(CacheCluster {
+            requested_port: None,
+            cache_cluster_id: member_id.to_string(),
+            cache_node_type: self.cache_node_type.clone(),
+            engine: self.engine.clone(),
+            engine_version: self.engine_version.clone(),
+            cache_cluster_status: self.status.clone(),
+            num_cache_nodes: 1,
+            preferred_availability_zone: format!("{region}a"),
+            cache_subnet_group_name: self.cache_subnet_group_name.clone(),
+            auto_minor_version_upgrade: self.auto_minor_version_upgrade,
+            arn: format!("{arn_prefix}:cluster:{member_id}"),
+            created_at: self.created_at.clone(),
+            endpoint_address: self.endpoint_address.clone(),
+            endpoint_port: self.endpoint_port,
+            container_id: String::new(),
+            host_port: self.host_port,
+            data_volume: None,
+            replication_group_id: Some(self.replication_group_id.clone()),
+            cache_parameter_group_name: self.cache_parameter_group_name.clone(),
+            security_group_ids: self.security_group_ids.clone(),
+            log_delivery_configurations: self.log_delivery_configurations.clone(),
+            transit_encryption_enabled: self.transit_encryption_enabled,
+            at_rest_encryption_enabled: self.at_rest_encryption_enabled,
+            auth_token_enabled: self.auth_token_enabled,
+            port: self.port,
+            preferred_maintenance_window: self.preferred_maintenance_window.clone(),
+            preferred_availability_zones: Vec::new(),
+            notification_topic_arn: self.notification_topic_arn.clone(),
+            cache_security_group_names: Vec::new(),
+            snapshot_arns: Vec::new(),
+            snapshot_name: None,
+            snapshot_retention_limit: self.snapshot_retention_limit,
+            snapshot_window: Some(self.snapshot_window.clone()),
+            outpost_mode: None,
+            preferred_outpost_arn: None,
+            network_type: self.network_type.clone(),
+            ip_discovery: self.ip_discovery.clone(),
+            az_mode: None,
+            auth_token: None,
+            kms_key_id: self.kms_key_id.clone(),
+            transit_encryption_mode: self.transit_encryption_mode.clone(),
+            data_tiering_enabled: self.data_tiering_enabled,
+            cluster_mode: None,
+            preferred_outpost_arns: Vec::new(),
+        })
+    }
+
     pub fn data_volume_name(&self, scope_tag: &str, account_id: &str) -> String {
         cache_data_volume_name(
             &self.data_volume,
@@ -913,6 +986,33 @@ impl ElastiCacheState {
         self.update_actions.clear();
     }
 
+    /// The replication group whose derived member cluster is
+    /// `cache_cluster_id`. A cache-cluster row of the same id (a cluster
+    /// added with `CreateCacheCluster --replication-group-id`) takes
+    /// precedence, so this is `None` for it.
+    pub fn replication_group_of_member(&self, cache_cluster_id: &str) -> Option<&ReplicationGroup> {
+        if self.cache_clusters.contains_key(cache_cluster_id) {
+            return None;
+        }
+        self.replication_groups
+            .values()
+            .find(|g| g.member_clusters.iter().any(|m| m == cache_cluster_id))
+    }
+
+    /// Every replication-group member cluster that has no row of its own,
+    /// derived from its group (see [`ReplicationGroup::member_cluster`]).
+    pub fn derived_member_clusters(&self) -> Vec<CacheCluster> {
+        self.replication_groups
+            .values()
+            .flat_map(|g| {
+                g.member_clusters
+                    .iter()
+                    .filter(|id| !self.cache_clusters.contains_key(id.as_str()))
+                    .filter_map(|id| g.member_cluster(id))
+            })
+            .collect()
+    }
+
     /// Whether a taggable resource with the given ARN currently exists in this
     /// account's state. Used by the tag handlers (Add/List/Remove) to tell
     /// "resource exists but has no tags" (return an empty TagList) apart from
@@ -979,6 +1079,7 @@ impl ElastiCacheState {
 
     pub fn begin_cache_cluster_creation(&mut self, cache_cluster_id: &str) -> bool {
         if self.cache_clusters.contains_key(cache_cluster_id)
+            || self.replication_group_of_member(cache_cluster_id).is_some()
             || self
                 .in_progress_cache_cluster_ids
                 .contains(cache_cluster_id)
@@ -1700,6 +1801,7 @@ pub(crate) mod tests {
         state.replication_groups.insert(
             "my-group".to_string(),
             ReplicationGroup {
+                requested_port: None,
                 replication_group_id: "my-group".to_string(),
                 description: "test".to_string(),
                 global_replication_group_id: None,
@@ -1793,6 +1895,7 @@ pub(crate) mod tests {
         state.cache_clusters.insert(
             "classic-cluster".to_string(),
             CacheCluster {
+                requested_port: None,
                 cache_cluster_id: "classic-cluster".to_string(),
                 cache_node_type: "cache.t3.micro".to_string(),
                 engine: "redis".to_string(),
@@ -1846,6 +1949,7 @@ pub(crate) mod tests {
 
     pub(crate) fn fixture_cluster(id: &str, engine: &str) -> CacheCluster {
         CacheCluster {
+            requested_port: None,
             cache_cluster_id: id.to_string(),
             cache_node_type: "cache.t3.micro".to_string(),
             engine: engine.to_string(),

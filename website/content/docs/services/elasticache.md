@@ -9,8 +9,9 @@ fakecloud implements **75 of 75** ElastiCache operations at 100% Smithy conforma
 ## Supported features
 
 - **Cache clusters** — `CreateCacheCluster`, `ModifyCacheCluster`, `DeleteCacheCluster`, `DescribeCacheClusters`, `RebootCacheCluster`
-- **Real engines via Docker** — Redis, Valkey, and Memcached all run as real containers (`redis:7-alpine`, `valkey:8-alpine`, `memcached:1.6-alpine`). All commands work, including streams, pub/sub, Lua, modules, CAS, and the Memcached text/binary protocols
+- **Real engines via Docker** — Redis, Valkey, and Memcached all run as real containers (`redis:7-alpine` for `Engine=redis`, `valkey/valkey:8.1.10-alpine` for `Engine=valkey`, `memcached:1.6-alpine`). All commands work, including streams, pub/sub, Lua, modules, CAS, and the Memcached text/binary protocols
 - **Replication groups** — `CreateReplicationGroup` with primary/replica topology (Redis/Valkey only — matches AWS). Persisted fields include `AtRestEncryptionEnabled`, `TransitEncryptionEnabled`, `TransitEncryptionMode`, `AuthTokenEnabled`, `KmsKeyId`, `LogDeliveryConfigurations`, `ClusterEnabled`, `MultiAZ`, `AutomaticFailover`, `DataTiering`, `NetworkType`, `IpDiscovery`, `SnapshotRetentionLimit`, `SnapshotWindow`, `PreferredMaintenanceWindow`, and node-group member topology — all round-tripped through `DescribeReplicationGroups`
+- **Replication group member clusters** — a group with `NumCacheClusters=N` has the member clusters `<group>-001` ... `<group>-00N`, as on AWS. `DescribeCacheClusters` returns them (by id, and in the unfiltered listing unless `ShowCacheClustersNotInReplicationGroups=true`) with `ReplicationGroupId`, the group's engine, version, node type, status, security groups, parameter group, maintenance window and encryption flags, and with `ShowCacheNodeInfo=true` one cache node whose endpoint reaches the group's engine. The members follow the group: `ModifyReplicationGroup`, replica-count changes and `DeleteReplicationGroup` show on them immediately. `DeleteCacheCluster` on a member deletes a read replica of a cluster-mode disabled group (it leaves the group) and rejects the primary, the last replica and members of a Multi-AZ or cluster-mode enabled group with `InvalidCacheClusterState`, as AWS does. `RebootCacheCluster` on a member restarts the group's engine. `ModifyCacheCluster` on a member returns `InvalidCacheClusterState`; change the group with `ModifyReplicationGroup` instead
 - **Global replication groups** — cross-region global datastores (CRUD)
 - **Serverless caches** — `CreateServerlessCache`, `ModifyServerlessCache` (Redis/Valkey only — matches AWS)
 - **Snapshots** — `CreateSnapshot`, `CopySnapshot`, `DeleteSnapshot`, `RestoreReplicationGroupFromSnapshot`. Restore reads back the **real RDB file** dumped during snapshot creation and seeds the replacement Redis/Valkey container with `BGSAVE`-captured data, so your test fixture's keys survive snapshot/restore round-trips
@@ -33,7 +34,7 @@ Query protocol. Form-encoded body, `Action` parameter, XML responses.
 
 ## How the Docker integration works
 
-When you call `CreateCacheCluster` (or `CreateReplicationGroup` for Redis/Valkey topologies), fakecloud starts a real Docker container running the corresponding official image and reports the mapped host port. Your application connects with a normal Redis or Memcached client. Memcached gets a real `memcached:1.6-alpine` container running the full text and binary protocols — not a stub.
+When you call `CreateCacheCluster` (or `CreateReplicationGroup` for Redis/Valkey topologies), fakecloud starts a real Docker container running the corresponding official image and reports the mapped host port. A request that names a `Port` gets that port, as on AWS: the engine is published on it when it is free on the host (so Terraform's `port` reads back unchanged), and on an ephemeral port when it is taken. Without `Port` the host port is always ephemeral. `FAKECLOUD_PUBLISH_HOST` picks the address it is published on (see [configuration](/docs/reference/configuration/)). Your application connects with a normal Redis or Memcached client. Memcached gets a real `memcached:1.6-alpine` container running the full text and binary protocols — not a stub.
 
 ## Introspection
 
@@ -48,6 +49,7 @@ All four are exposed by the introspection SDKs (`fakecloud.elasticache.clusters(
 
 - **Requires a Docker socket.** ElastiCache needs access to `/var/run/docker.sock`.
 - **First use pulls the image.** Expect a slower first run while the Redis/Valkey/Memcached image downloads.
+- **One engine per replication group.** A replication group runs one Redis/Valkey container, not one per node: every member cluster reports the same endpoint, and the primary and its replicas are the same process. Failover (`TestFailover`) is modelled in the API only.
 - **Memcached is cache-cluster only.** AWS does not support replication groups or serverless caches for Memcached, and neither does fakecloud. Use `CreateCacheCluster` with `Engine=memcached`.
 
 ## Source

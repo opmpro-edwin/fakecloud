@@ -1,6 +1,8 @@
 //! ElastiCache `clusters` family handlers extracted from service.rs
 //! by audit-2026-05-19 file-split.
 
+use std::borrow::Cow;
+
 use super::*;
 
 impl ElastiCacheService {
@@ -71,9 +73,9 @@ impl ElastiCacheService {
         } else {
             6379
         };
-        let port = optional_query_param(request, "Port")
-            .and_then(|v| v.parse::<u16>().ok())
-            .unwrap_or(default_port);
+        let requested_port =
+            optional_query_param(request, "Port").and_then(|v| v.parse::<u16>().ok());
+        let port = requested_port.unwrap_or(default_port);
         let preferred_maintenance_window =
             optional_query_param(request, "PreferredMaintenanceWindow");
         let preferred_availability_zones =
@@ -208,6 +210,7 @@ impl ElastiCacheService {
             at_rest_encryption_enabled,
             auth_token_enabled,
             port,
+            requested_port,
             preferred_maintenance_window,
             preferred_availability_zones,
             notification_topic_arn,
@@ -270,6 +273,7 @@ impl ElastiCacheService {
             let account_id = request.account_id.clone();
             let id = cache_cluster_id.clone();
             let is_memcached = engine == ENGINE_MEMCACHED;
+            let engine = engine.clone();
             // Reserved `fakecloud-k8s/*` scheduling tags for this cluster's
             // Pod, from the create-time tags (ignored on the Docker backend).
             let pod_tags: std::collections::BTreeMap<String, String> =
@@ -299,7 +303,7 @@ impl ElastiCacheService {
                 }
                 let result = if is_memcached {
                     runtime
-                        .ensure_memcached(&incarnation, &account_id, &id, &pod_tags)
+                        .ensure_memcached(&incarnation, &account_id, &id, requested_port, &pod_tags)
                         .await
                 } else {
                     runtime
@@ -307,6 +311,8 @@ impl ElastiCacheService {
                             &incarnation,
                             &account_id,
                             &id,
+                            &engine,
+                            requested_port,
                             &volume,
                             rdb_path.as_deref(),
                             &pod_tags,
@@ -401,14 +407,30 @@ impl ElastiCacheService {
         let show_cache_node_info =
             parse_optional_bool(optional_query_param(request, "ShowCacheNodeInfo").as_deref())?
                 .unwrap_or(false);
+        let not_in_replication_groups = parse_optional_bool(
+            optional_query_param(request, "ShowCacheClustersNotInReplicationGroups").as_deref(),
+        )?
+        .unwrap_or(false);
         let max_records = optional_usize_param(request, "MaxRecords")?;
         let marker = optional_query_param(request, "Marker");
 
         let accounts = self.state.read();
         let empty = ElastiCacheState::new(&request.account_id, &request.region);
         let state = accounts.get(&request.account_id).unwrap_or(&empty);
-        let clusters: Vec<&CacheCluster> = if let Some(ref cluster_id) = cache_cluster_id {
-            match state.cache_clusters.get(cluster_id) {
+        // Replication-group members have no row of their own; they are
+        // derived from their group (`ReplicationGroup::member_cluster`).
+        let clusters: Vec<Cow<'_, CacheCluster>> = if let Some(ref cluster_id) = cache_cluster_id {
+            let found = state
+                .cache_clusters
+                .get(cluster_id)
+                .map(Cow::Borrowed)
+                .or_else(|| {
+                    state
+                        .replication_group_of_member(cluster_id)
+                        .and_then(|g| g.member_cluster(cluster_id))
+                        .map(Cow::Owned)
+                });
+            match found {
                 Some(cluster) => vec![cluster],
                 None => {
                     return Err(AwsServiceError::aws_error(
@@ -419,7 +441,13 @@ impl ElastiCacheService {
                 }
             }
         } else {
-            let mut clusters: Vec<&CacheCluster> = state.cache_clusters.values().collect();
+            let mut clusters: Vec<Cow<'_, CacheCluster>> = state
+                .cache_clusters
+                .values()
+                .map(Cow::Borrowed)
+                .chain(state.derived_member_clusters().into_iter().map(Cow::Owned))
+                .filter(|c| !not_in_replication_groups || c.replication_group_id.is_none())
+                .collect();
             clusters.sort_by(|a, b| a.cache_cluster_id.cmp(&b.cache_cluster_id));
             clusters
         };
@@ -476,6 +504,48 @@ impl ElastiCacheService {
             } else if state.cache_cluster_creation_in_progress(&cache_cluster_id) {
                 state.request_cache_cluster_delete_during_creation(&cache_cluster_id);
                 None
+            } else if let Some(group) = state.replication_group_of_member(&cache_cluster_id) {
+                // A derived replication-group member (no container of its
+                // own). As on AWS, only a read replica of a cluster-mode
+                // disabled group can be deleted this way, and never the last
+                // one or one in a Multi-AZ group; it leaves the group.
+                let group_id = group.replication_group_id.clone();
+                let is_primary = group.member_clusters.first() == Some(&cache_cluster_id);
+                let replicas = group.member_clusters.len().saturating_sub(1);
+                if group.cluster_enabled || is_primary || replicas <= 1 || group.multi_az_enabled {
+                    return Err(AwsServiceError::aws_error(
+                        StatusCode::BAD_REQUEST,
+                        "InvalidCacheClusterState",
+                        format!(
+                            "Cache cluster {cache_cluster_id} is a member of replication group \
+                             {group_id} and cannot be deleted on its own: it is the primary, the \
+                             last read replica, or the group is cluster-mode enabled or Multi-AZ. \
+                             Modify or delete the replication group instead."
+                        ),
+                    ));
+                }
+                let mut member = group
+                    .member_cluster(&cache_cluster_id)
+                    .expect("member of its own group");
+                remove_cluster_from_replication_group(state, &group_id, &cache_cluster_id);
+                if let Some(g) = state.replication_groups.get_mut(&group_id) {
+                    if let Some(r) = g.replicas_per_node_group.as_mut() {
+                        *r = (*r - 1).max(0);
+                    }
+                }
+                member.cache_cluster_status = "deleting".to_string();
+                return Ok(AwsResponse::xml(
+                    StatusCode::OK,
+                    query_response_xml(
+                        "DeleteCacheCluster",
+                        ELASTICACHE_NS,
+                        &format!(
+                            "<CacheCluster>{}</CacheCluster>",
+                            cache_cluster_xml(&member, true)
+                        ),
+                        &request.request_id,
+                    ),
+                ));
             } else {
                 return Err(AwsServiceError::aws_error(
                     StatusCode::NOT_FOUND,
@@ -537,6 +607,19 @@ impl ElastiCacheService {
 
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&request.account_id);
+        if let Some(group) = state.replication_group_of_member(&id) {
+            // A derived member carries its group's configuration; AWS applies
+            // these settings through ModifyReplicationGroup.
+            return Err(AwsServiceError::aws_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidCacheClusterState",
+                format!(
+                    "Cache cluster {id} is a member of replication group {}; use \
+                     ModifyReplicationGroup to change it.",
+                    group.replication_group_id
+                ),
+            ));
+        }
         let cluster = state.cache_clusters.get_mut(&id).ok_or_else(|| {
             AwsServiceError::aws_error(
                 StatusCode::NOT_FOUND,
@@ -598,6 +681,9 @@ impl ElastiCacheService {
         request: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
         let id = required_query_param(request, "CacheClusterId")?;
+        if let Some(response) = self.reboot_replication_group_member(request, &id) {
+            return Ok(response);
+        }
         let (xml, pod_tags, incarnation) = {
             let mut accounts = self.state.write();
             let state = accounts.get_or_create(&request.account_id);
@@ -658,6 +744,57 @@ impl ElastiCacheService {
                 "RebootCacheCluster",
                 ELASTICACHE_NS,
                 &format!("<CacheCluster>{xml}</CacheCluster>"),
+                &request.request_id,
+            ),
+        ))
+    }
+
+    /// RebootCacheCluster on a derived replication-group member: every member
+    /// shares the group's one container, so rebooting a member restarts it.
+    /// `None` when `id` is not a derived member.
+    fn reboot_replication_group_member(
+        &self,
+        request: &AwsRequest,
+        id: &str,
+    ) -> Option<AwsResponse> {
+        let (mut member, group_id, incarnation, pod_tags) = {
+            let accounts = self.state.read();
+            let state = accounts.get(&request.account_id)?;
+            let group = state.replication_group_of_member(id)?;
+            let member = group.member_cluster(id)?;
+            let pod_tags: std::collections::BTreeMap<String, String> = state
+                .tags
+                .get(&group.arn)
+                .map(|t| t.iter().cloned().collect())
+                .unwrap_or_default();
+            (
+                member,
+                group.replication_group_id.clone(),
+                group.incarnation(),
+                pod_tags,
+            )
+        };
+        if let Some(runtime) = self.runtime.clone() {
+            tokio::spawn(async move {
+                if let Err(error) = runtime.restart(&incarnation, &group_id, &pod_tags).await {
+                    tracing::warn!(
+                        replication_group_id = %group_id,
+                        %error,
+                        "RebootCacheCluster: replication group container restart failed"
+                    );
+                }
+            });
+        }
+        member.cache_cluster_status = "rebooting cache cluster nodes".to_string();
+        Some(AwsResponse::xml(
+            StatusCode::OK,
+            query_response_xml(
+                "RebootCacheCluster",
+                ELASTICACHE_NS,
+                &format!(
+                    "<CacheCluster>{}</CacheCluster>",
+                    cache_cluster_xml(&member, true)
+                ),
                 &request.request_id,
             ),
         ))

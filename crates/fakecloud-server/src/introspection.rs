@@ -648,6 +648,7 @@ mod tests {
 
     fn test_replication_group(id: &str, user_group_ids: Vec<String>) -> ReplicationGroup {
         ReplicationGroup {
+            requested_port: None,
             replication_group_id: id.to_string(),
             description: "test".to_string(),
             global_replication_group_id: None,

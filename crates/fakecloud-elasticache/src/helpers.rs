@@ -1824,6 +1824,7 @@ mod cluster_xml_tests {
 
     fn fixture() -> CacheCluster {
         CacheCluster {
+            requested_port: None,
             cache_cluster_id: "c1".into(),
             cache_node_type: "cache.t3.micro".into(),
             engine: "redis".into(),
@@ -1953,6 +1954,7 @@ mod replication_group_xml_tests {
 
     fn fixture() -> ReplicationGroup {
         ReplicationGroup {
+            requested_port: None,
             replication_group_id: "rg1".into(),
             description: "fixture".into(),
             global_replication_group_id: None,

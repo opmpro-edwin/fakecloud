@@ -106,9 +106,9 @@ impl ElastiCacheService {
             || cluster_mode.as_deref() == Some("enabled")
             || cluster_mode.as_deref() == Some("compatible");
         // ElastiCache Redis defaults to 6379 when Port is omitted.
-        let port = optional_query_param(request, "Port")
-            .and_then(|v| v.parse::<u16>().ok())
-            .unwrap_or(6379);
+        let requested_port =
+            optional_query_param(request, "Port").and_then(|v| v.parse::<u16>().ok());
+        let port = requested_port.unwrap_or(6379);
         let cache_parameter_group_name = optional_query_param(request, "CacheParameterGroupName");
         let cache_subnet_group_name = optional_query_param(request, "CacheSubnetGroupName");
         let security_group_ids =
@@ -185,6 +185,7 @@ impl ElastiCacheService {
             (arn, request.region.clone())
         };
 
+        let runtime_engine = engine.clone();
         let group = ReplicationGroup {
             replication_group_id: replication_group_id.clone(),
             description,
@@ -236,6 +237,7 @@ impl ElastiCacheService {
             replicas_per_node_group,
             auth_token,
             port,
+            requested_port,
             notification_topic_arn,
             cluster_mode,
             data_tiering_enabled,
@@ -299,6 +301,8 @@ impl ElastiCacheService {
                         &incarnation,
                         &account_id,
                         &id,
+                        &runtime_engine,
+                        requested_port,
                         &volume,
                         rdb_path.as_deref(),
                         &pod_tags,

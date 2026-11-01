@@ -494,6 +494,7 @@ impl ResourceProvisioner {
             fakecloud_elasticache::elasticache_arn(&self.region, &self.account_id, "cluster", &id);
         let endpoint_address = format!("{id}.fakecloud.{}.cache.amazonaws.com", self.region);
         let cluster = EcCacheCluster {
+            requested_port: None,
             cache_cluster_id: id.clone(),
             cache_node_type,
             engine,
@@ -800,6 +801,7 @@ impl ResourceProvisioner {
         };
 
         let group = EcReplicationGroup {
+            requested_port: None,
             replication_group_id: id.clone(),
             description,
             global_replication_group_id: None,
