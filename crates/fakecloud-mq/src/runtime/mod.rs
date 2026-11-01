@@ -415,7 +415,9 @@ impl MqRuntime {
         let mut args: Vec<String> = vec!["create".to_string()];
         for (_, cport) in engine.published_ports() {
             args.push("-p".to_string());
-            args.push(format!(":{cport}"));
+            args.push(fakecloud_core::container_net::publish_spec(&format!(
+                ":{cport}"
+            )));
         }
         args.push("--label".to_string());
         args.push(format!("fakecloud-mq={broker_id}"));

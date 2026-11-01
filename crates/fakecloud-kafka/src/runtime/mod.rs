@@ -891,9 +891,11 @@ fn broker_create_args(
     let mut args: Vec<String> = vec![
         "create".to_string(),
         "-p".to_string(),
-        format!("{port}:{EXTERNAL_PORT}"),
+        fakecloud_core::container_net::publish_spec(&format!("{port}:{EXTERNAL_PORT}")),
         "-p".to_string(),
-        format!("{container_port}:{CONTAINER_LISTENER_PORT}"),
+        fakecloud_core::container_net::publish_spec(&format!(
+            "{container_port}:{CONTAINER_LISTENER_PORT}"
+        )),
         "--label".to_string(),
         format!("fakecloud-kafka={cluster_arn}"),
         "--label".to_string(),

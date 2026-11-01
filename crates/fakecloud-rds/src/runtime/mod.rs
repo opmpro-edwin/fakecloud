@@ -375,7 +375,7 @@ impl RdsRuntime {
         let mut args = vec![
             "create".to_string(),
             "-p".to_string(),
-            format!(":{}", port),
+            fakecloud_core::container_net::publish_spec(&format!(":{port}")),
             "--label".to_string(),
             format!("fakecloud-rds={db_instance_identifier}"),
             "--label".to_string(),

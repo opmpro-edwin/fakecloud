@@ -176,7 +176,7 @@ impl DockerBackend {
         let mut cmd = tokio::process::Command::new(&self.cli);
         cmd.arg("create")
             .arg("-p")
-            .arg(":8080")
+            .arg(fakecloud_core::container_net::publish_spec(":8080"))
             .arg("--label")
             .arg(format!("fakecloud-lambda={}", func.function_name))
             .arg("--label")
@@ -260,7 +260,7 @@ impl DockerBackend {
         let mut cmd = tokio::process::Command::new(&self.cli);
         cmd.arg("create")
             .arg("-p")
-            .arg(":8080")
+            .arg(fakecloud_core::container_net::publish_spec(":8080"))
             .arg("--label")
             .arg(format!("fakecloud-lambda={}", func.function_name))
             .arg("--label")

@@ -224,7 +224,7 @@ pub(crate) fn forwarder_argv(
         "--name".into(),
         forwarder_name(instance_id, port),
         "--publish".into(),
-        format!("{port}/tcp"),
+        fakecloud_core::container_net::publish_spec(&format!("{port}/tcp")),
         "--label".into(),
         format!("fakecloud-ec2-fwd={instance_id}"),
         "--label".into(),

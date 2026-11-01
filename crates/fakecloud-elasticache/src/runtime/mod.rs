@@ -526,7 +526,7 @@ impl DockerCache {
         let mut args: Vec<String> = vec![
             "create".to_string(),
             "-p".to_string(),
-            publish,
+            fakecloud_core::container_net::publish_spec(&publish),
             "--label".to_string(),
             format!("fakecloud-elasticache={resource_id}"),
             "--label".to_string(),

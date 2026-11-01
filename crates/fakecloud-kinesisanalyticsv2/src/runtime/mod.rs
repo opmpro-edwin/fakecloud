@@ -243,7 +243,9 @@ impl FlinkRuntime {
         // re-reads it the same way.
         let mut args: Vec<String> = vec!["create".to_string()];
         args.push("-p".to_string());
-        args.push(rest_publish_spec());
+        args.push(fakecloud_core::container_net::publish_spec(
+            &rest_publish_spec(),
+        ));
         args.push("--label".to_string());
         args.push(format!("fakecloud-flink={app_arn}"));
         args.push("--label".to_string());

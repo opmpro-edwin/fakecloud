@@ -809,6 +809,45 @@ pub fn resolve_ecr_registry_host(env_value: Option<String>, podman: bool, linux:
     }
 }
 
+/// The host address published container ports bind to, from
+/// `FAKECLOUD_PUBLISH_HOST` (for example `127.0.0.1`, to keep databases and
+/// caches off the machine's other interfaces). `None` (the default) publishes
+/// on every interface, as `docker run -p` does without an address.
+pub fn publish_host() -> Option<String> {
+    std::env::var("FAKECLOUD_PUBLISH_HOST")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// A `-p` / `--publish` value (`[hostPort:]containerPort[/proto]`, or
+/// `:containerPort` for an ephemeral host port) bound to [`publish_host`].
+/// Every container fakecloud publishes goes through this.
+pub fn publish_spec(spec: &str) -> String {
+    publish_spec_on(publish_host().as_deref(), spec)
+}
+
+/// [`publish_spec`] with the host address given (`None`: unchanged).
+pub fn publish_spec_on(host: Option<&str>, spec: &str) -> String {
+    let Some(host) = host else {
+        return spec.to_string();
+    };
+    // An IPv6 address is bracketed so its colons don't read as port fields.
+    let host = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    let port_part = spec.split('/').next().unwrap_or(spec);
+    if let Some(ephemeral) = spec.strip_prefix(':') {
+        format!("{host}::{ephemeral}")
+    } else if port_part.contains(':') {
+        format!("{host}:{spec}")
+    } else {
+        format!("{host}::{spec}")
+    }
+}
+
 /// Host port from `<cli> port <container> <port>` output. Docker prints one
 /// `<ip>:<port>` line per bound address family (`0.0.0.0:49153`,
 /// `[::]:49153`); podman prints the same shape. The first parseable port wins.
@@ -1623,6 +1662,22 @@ mod endpoint_tests {
             4
         );
         assert_eq!(registry_auth_hosts_with(4566, Some(" ".into())).len(), 4);
+    }
+
+    #[test]
+    fn publish_spec_binds_the_configured_host() {
+        // Unset: the spec is passed through, publishing on every interface.
+        assert_eq!(publish_spec_on(None, ":5432"), ":5432");
+        assert_eq!(publish_spec_on(None, "8080:80/tcp"), "8080:80/tcp");
+        let lo = Some("127.0.0.1");
+        assert_eq!(publish_spec_on(lo, ":5432"), "127.0.0.1::5432");
+        assert_eq!(publish_spec_on(lo, "8080:80/tcp"), "127.0.0.1:8080:80/tcp");
+        assert_eq!(publish_spec_on(lo, "80/tcp"), "127.0.0.1::80/tcp");
+        assert_eq!(publish_spec_on(lo, "6379"), "127.0.0.1::6379");
+        assert_eq!(publish_spec_on(Some("::1"), ":5432"), "[::1]::5432");
+        assert_eq!(publish_spec_on(Some("[::1]"), "1:2"), "[::1]:1:2");
+        // `<cli> port` output on a bound address still parses.
+        assert_eq!(parse_published_port("127.0.0.1:49153\n"), Some(49153));
     }
 
     #[test]

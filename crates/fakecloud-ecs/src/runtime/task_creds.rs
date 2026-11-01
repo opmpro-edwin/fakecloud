@@ -300,14 +300,12 @@ pub(crate) fn namespace_network_argv(
     // failed and we fell back to bridge, the task's declared mapping applies.
     for pm in &plan.port_mappings {
         argv.push("--publish".into());
-        if use_awsvpc_network {
-            argv.push(format!("{}/{}", pm.container_port, pm.protocol));
+        let spec = if use_awsvpc_network {
+            format!("{}/{}", pm.container_port, pm.protocol)
         } else {
-            argv.push(format!(
-                "{}:{}/{}",
-                pm.host_port, pm.container_port, pm.protocol
-            ));
-        }
+            format!("{}:{}/{}", pm.host_port, pm.container_port, pm.protocol)
+        };
+        argv.push(fakecloud_core::container_net::publish_spec(&spec));
     }
     argv
 }
