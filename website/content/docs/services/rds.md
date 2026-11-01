@@ -13,7 +13,9 @@ fakecloud implements **164 of 164** RDS operations at 100% Smithy conformance. D
 - **Snapshots** — automated and manual, CreateDBSnapshot, RestoreDBInstanceFromDBSnapshot, CopyDBSnapshot, DeleteDBSnapshot
 - **Read replicas** — CreateDBInstanceReadReplica, PromoteReadReplica
 - **Storage encryption** - `StorageEncrypted` without a `KmsKeyId` encrypts with the account's AWS-managed `aws/rds` key for the region and reports its key ARN; a key named by alias or key id is reported as its key ARN. Aurora cluster members report their cluster's encryption and key, and snapshots, copies, read replicas and restores carry the source's key (a restore or copy that names a `KmsKeyId` uses it).
-- **Parameter groups** — DBParameterGroup and DBClusterParameterGroup CRUD, parameter management
+- **Parameter groups** — DBParameterGroup and DBClusterParameterGroup CRUD, parameter management. A PostgreSQL instance's DB parameter group runs its server; see [DB parameter groups on PostgreSQL](#db-parameter-groups-on-postgresql)
+- **Managed master password** — `ManageMasterUserPassword` on `CreateDBInstance` / `ModifyDBInstance`; see [Master password in Secrets Manager](#master-password-in-secrets-manager)
+- **Storage autoscaling** — `MaxAllocatedStorage` is stored on create and modify and reported by `DescribeDBInstances`; a value equal to `AllocatedStorage` turns autoscaling off and is then omitted, as on AWS. Storage never actually grows (fakecloud has no storage quota to hit)
 - **Option groups** — CRUD
 - **Subnet groups** — CRUD. Subnets resolve in EC2: the group reports their `VpcId` and each subnet's real Availability Zone, unknown subnets or subnets spanning VPCs are rejected with `InvalidSubnet`, and fewer than two zones with `DBSubnetGroupDoesNotCoverEnoughAZs`
 - **DB clusters** — Aurora-style clusters with full lifecycle: ModifyDBCluster (every mutable field on AWS's surface, including ServerlessV2 scaling, log-export updates, VPC SGs, NewDBClusterIdentifier rename), StartDBCluster / StopDBCluster (status transitions with `InvalidDBClusterStateFault` validation), RebootDBCluster, FailoverDBCluster (auto-picks a replica when no target is provided, swaps the writer flag, rejects non-member targets when the cluster tracks members), BacktrackDBCluster (Aurora MySQL only — `InvalidParameterCombination` on Aurora PostgreSQL — records BacktrackTo and the change-record count, append-tracked under DescribeDBClusterBacktracks)
@@ -26,6 +28,31 @@ fakecloud implements **164 of 164** RDS operations at 100% Smithy conformance. D
 - **PostgreSQL `aws_lambda` extension** — call fakecloud Lambda functions from inside RDS PostgreSQL via `CREATE EXTENSION aws_lambda CASCADE` and `aws_lambda.invoke(...)` (subset of the AWS RDS extension surface; see below)
 - **PostgreSQL `aws_s3` extension** — import objects from fakecloud S3 into tables (`aws_s3.table_import_from_s3`) and export query results back to S3 (`aws_s3.query_export_to_s3`); see below
 - **MySQL / MariaDB Aurora Lambda bridge** — Aurora-compatible `mysql.lambda_async` / `mysql.lambda_sync` stored procedures invoke fakecloud Lambda functions from inside the DB container; see below
+- **PostgreSQL `pg_cron`** — the PostgreSQL image ships `pg_cron`, as RDS for PostgreSQL does: add `pg_cron` to `shared_preload_libraries` (and set `cron.database_name` for a database other than `postgres`) in the instance's DB parameter group, then `CREATE EXTENSION pg_cron`
+
+## Master password in Secrets Manager
+
+With `ManageMasterUserPassword=true`, `CreateDBInstance` generates the master password, as RDS does, and keeps it in a Secrets Manager secret named `rds!db-<uuid>` whose value is `{"username": "<master>", "password": "<generated>"}`. The secret is encrypted under `MasterUserSecretKmsKeyId` or, without one, the account's AWS-managed `aws/secretsmanager` key, and is tagged `aws:rds:primaryDBInstanceArn` and `aws:secretsmanager:owningService=rds`. `CreateDBInstance`, `DescribeDBInstances` and `ModifyDBInstance` report it as `MasterUserSecret` (`SecretArn`, `SecretStatus=active`, `KmsKeyId`). The database runs with that password, so `GetSecretValue` returns credentials that log in. Giving `MasterUserPassword` as well is `InvalidParameterCombination`.
+
+`ModifyDBInstance` changes the database's password too, asynchronously as RDS does (a client may need a moment before the new password logs in):
+
+- `ManageMasterUserPassword=true` on an instance with its own password generates a new password and secret.
+- `ManageMasterUserPassword=false` needs `MasterUserPassword`; the secret is deleted and the database takes the given password.
+- `RotateMasterUserPassword=true` generates a new password and stores it as the secret's `AWSCURRENT` version (the old one becomes `AWSPREVIOUS`).
+- `MasterUserSecretKmsKeyId` re-encrypts the secret under the new key.
+- `MasterUserPassword` applies as soon as possible whatever `ApplyImmediately` says, as on RDS, and the database's password changes with it. While the password is managed, `MasterUserPassword` alone is `InvalidParameterCombination`, and `RotateMasterUserPassword` on an unmanaged password is too.
+
+Password changes need the instance to be `available` (`InvalidDBInstanceState` otherwise). `DeleteDBInstance` deletes the instance's secret. A read replica or point-in-time restore reports its source's secret. Changing the password of a running instance is supported for PostgreSQL, MySQL and MariaDB; managed rotation through a Lambda function is not modelled (`RotateMasterUserPassword` rotates at once).
+
+## DB parameter groups on PostgreSQL
+
+The user-set values of a PostgreSQL instance's DB parameter group are the server's configuration. fakecloud writes them with `ALTER SYSTEM` (so they live in the data directory's `postgresql.auto.conf`) and reloads, which gives RDS's behavior:
+
+- At `CreateDBInstance` the whole group takes effect, static parameters included (the server restarts once if a static parameter such as `shared_preload_libraries` is set).
+- `ModifyDBParameterGroup` / `ResetDBParameterGroup` apply dynamic parameters to every available instance using the group at once, whatever their `ApplyMethod`; static ones (`postmaster` context in PostgreSQL) wait for the next `RebootDBInstance`, as `pending-reboot` parameters do on RDS. A `ModifyDBInstance` that switches `DBParameterGroupName` with `ApplyImmediately` does the same for that instance.
+- `RebootDBInstance` re-applies the group before the restart.
+
+A comma-separated list for `shared_preload_libraries`, `session_preload_libraries`, `local_preload_libraries`, `search_path` and `temp_tablespaces` is set element by element. Not every RDS parameter is a PostgreSQL setting: `rds.*` parameters (for example `rds.force_ssl`; fakecloud serves no TLS), `ssl`, and values that are RDS formulas such as `{DBInstanceClassMemory/32768}` are skipped. A value PostgreSQL refuses is logged and skipped rather than failing the instance. `ParameterApplyStatus` is always reported `in-sync`. Parameter groups are not applied to MySQL, MariaDB or the commercial engines, nor to instances restored from snapshots or created as read replicas until their next reboot. On the Kubernetes backend a restart recreates the Pod and its data directory, so static parameters are not applied there.
 
 ## EventBridge integration
 
@@ -89,7 +116,7 @@ Implemented function signatures (subset of the AWS RDS Lambda API):
 
 `invocation_type = 'Event'` returns `(202, NULL, '$LATEST', NULL)` immediately and runs the Lambda asynchronously.
 
-The first time you create a PostgreSQL DB instance, fakecloud lazily builds a `fakecloud-postgres:<major>-<hash>` Docker image off `postgres:<major>` that bakes in `plpython3u` and the extension files. The build typically takes ~60s and the image is cached locally for subsequent runs (the hash invalidates the cache when fakecloud changes the embedded extension definitions).
+The first time you create a PostgreSQL DB instance, fakecloud lazily builds a `fakecloud-postgres:<major>-<version>-<assets>` Docker image off `postgres:<major>` that bakes in `plpython3u`, `pg_cron` and the extension files. The build typically takes ~60s and the image is cached locally for subsequent runs (`<assets>` hashes the embedded Dockerfile and extension files, so changing them invalidates the cache).
 
 Inside the container, the extension's `plpython3u` body POSTs to `http://host.docker.internal:<server_port>/_fakecloud/rds/lambda-invoke`, which routes through fakecloud's standard Lambda invocation path.
 
@@ -185,7 +212,7 @@ When you call `CreateDBInstance` for PostgreSQL/MySQL/MariaDB/Oracle/SQL Server/
 
 | Engine | Image | Port | Wait probe |
 |--------|-------|------|------------|
-| `postgres` | `ghcr.io/faiscadev/fakecloud-postgres:<major>-<fakecloud-version>` (prebuilt with `plpython3u` + the `aws_commons`, `aws_lambda`, and `aws_s3` extensions on top of `postgres:<major>`; falls back to a local build if the pull fails) | 5432 | `tokio-postgres` ping |
+| `postgres` | `ghcr.io/faiscadev/fakecloud-postgres:<major>-<fakecloud-version>-<assets>` (prebuilt with `plpython3u`, `pg_cron` and the `aws_commons`, `aws_lambda`, and `aws_s3` extensions on top of `postgres:<major>`; falls back to a local build if the pull fails) | 5432 | `tokio-postgres` ping |
 | `mysql` | `ghcr.io/faiscadev/fakecloud-mysql:<major>-<fakecloud-version>` (prebuilt with the libcurl-backed `fakecloud_post` UDF + Aurora-compatible `mysql.lambda_async` / `mysql.lambda_sync` stored procedures on top of `mysql:<major>`; falls back to a local build if the pull fails) | 3306 | `mysql_async` ping |
 | `mariadb` | `ghcr.io/faiscadev/fakecloud-mariadb:<major>-<fakecloud-version>` (same UDF + stored procedures, on top of `mariadb:<major>`) | 3306 | `mysql_async` ping |
 | `oracle-ee` / `oracle-se2` (+`-cdb`) | `gvenzl/oracle-free:23-slim` | 1521 | log marker `DATABASE IS READY TO USE!` + TCP probe |
@@ -196,11 +223,13 @@ The Oracle / SQL Server / Db2 images are large (1-3 GB) and take 30-300 s to fir
 
 ### Prebuilt PostgreSQL image
 
-`ghcr.io/faiscadev/fakecloud-postgres:<major>-<fakecloud-version>` is published on every fakecloud release tag (workflow: `.github/workflows/docker-rds-images.yml`) for postgres `13`, `14`, `15`, `16`, `17`, both `linux/amd64` and `linux/arm64`. Each release also gets a rolling `:<major>` tag pointing at the latest version for that major. Resolution order at runtime:
+`ghcr.io/faiscadev/fakecloud-postgres:<major>-<fakecloud-version>-<assets>` is published on every fakecloud release tag (workflow: `.github/workflows/docker-rds-images.yml`) for postgres `13`, `14`, `15`, `16`, `17`, both `linux/amd64` and `linux/arm64`. Each release also gets a rolling `:<major>` tag pointing at the latest version for that major. `<assets>` is the first 12 hex digits of the SHA-256 of the build context's `sha256sum` manifest (`cd crates/fakecloud-rds/assets/postgres && LC_ALL=C sha256sum $(LC_ALL=C ls) | sha256sum`), and the MySQL and MariaDB images are tagged the same way, so a build whose embedded files differ from a published image's (a fork, a local edit) never pulls or reuses that image. Resolution order at runtime:
 
 1. Image already on the local Docker daemon -> use it.
-2. `docker pull` of the version-pinned tag -> use it.
-3. Local `docker build` from the embedded `crates/fakecloud-rds/assets/postgres/` Dockerfile (covers dev / unreleased / airgapped setups).
+2. `docker pull` of the version- and assets-pinned tag -> use it.
+3. Local `docker build` from the embedded `crates/fakecloud-rds/assets/postgres/` Dockerfile (covers dev / unreleased / forks / airgapped setups).
+
+The Kubernetes backend cannot build images, so it needs that tag published (or mirrored under `FAKECLOUD_POSTGRES_REGISTRY`).
 
 Override knobs (env vars, both optional):
 

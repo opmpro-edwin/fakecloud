@@ -202,6 +202,12 @@ pub struct RdsService {
     /// EC2 state: a DB subnet group's subnets resolve there (its `VpcId` and
     /// per-subnet Availability Zones). `None` in memory-only unit tests.
     ec2_state: Option<fakecloud_ec2::SharedEc2State>,
+    /// Secrets Manager state (and its persistence hook), where RDS keeps the
+    /// master user secrets of `ManageMasterUserPassword` instances.
+    secretsmanager: Option<(
+        fakecloud_secretsmanager::SharedSecretsManagerState,
+        Option<fakecloud_persistence::SnapshotHook>,
+    )>,
 }
 
 /// Source type for RDS EventBridge events. Maps `aws.rds` detail-type.
@@ -257,7 +263,10 @@ mod cluster_snapshots;
 mod engine;
 mod instances;
 mod log_files;
+pub(crate) mod master_secret;
 mod parameter_groups;
+mod server_config;
+pub(crate) use server_config::apply_postgres_settings_at_boot;
 mod replicas;
 mod restore;
 mod snapshots;
@@ -280,7 +289,31 @@ impl RdsService {
             delivery_bus: None,
             kms_hook: None,
             ec2_state: None,
+            secretsmanager: None,
         }
+    }
+
+    /// Wire Secrets Manager, where `ManageMasterUserPassword` instances keep
+    /// their master user secret. `snapshot_hook` persists Secrets Manager
+    /// state after RDS changes it.
+    pub fn with_secretsmanager(
+        mut self,
+        state: fakecloud_secretsmanager::SharedSecretsManagerState,
+        snapshot_hook: Option<fakecloud_persistence::SnapshotHook>,
+    ) -> Self {
+        self.secretsmanager = Some((state, snapshot_hook));
+        self
+    }
+
+    /// The store for master user secrets, `None` without Secrets Manager.
+    pub(crate) fn master_secrets(&self) -> Option<master_secret::MasterSecretStore> {
+        self.secretsmanager.as_ref().map(|(state, hook)| {
+            master_secret::MasterSecretStore::new(
+                state.clone(),
+                self.kms_hook.clone(),
+                hook.clone(),
+            )
+        })
     }
 
     pub fn with_ec2_state(mut self, ec2_state: fakecloud_ec2::SharedEc2State) -> Self {
@@ -1657,7 +1690,23 @@ impl AwsService for RdsService {
             }
             "ListTagsForResource" => self.list_tags_for_resource(&request),
             "ModifyDBInstance" => self.modify_db_instance(&request),
-            "ModifyDBParameterGroup" => self.modify_db_parameter_group(&request),
+            "ModifyDBParameterGroup" | "ResetDBParameterGroup" => {
+                let result = if request.action == "ModifyDBParameterGroup" {
+                    self.modify_db_parameter_group(&request)
+                } else {
+                    self.handle_extra_action(&request)
+                };
+                // The instances using the group pick up its dynamic settings
+                // at once and its static ones at their next reboot.
+                if result.is_ok() {
+                    if let Some(group) = optional_query_param(&request, "DBParameterGroupName") {
+                        self.spawn_parameter_sync(&request.account_id, |i| {
+                            i.db_parameter_group_name.as_deref() == Some(group.as_str())
+                        });
+                    }
+                }
+                result
+            }
             "ModifyDBSubnetGroup" => self.modify_db_subnet_group(&request),
             "RebootDBInstance" => self.reboot_db_instance(&request).await,
             "StartDBInstance" => self.start_db_instance(&request).await,

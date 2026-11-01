@@ -133,10 +133,51 @@ impl RdsService {
         let allocated_storage = optional_i32_param(request, "AllocatedStorage")?
             .filter(|v| *v > 0)
             .unwrap_or(20);
+        // Storage autoscaling's ceiling. A ceiling equal to the allocated
+        // storage is autoscaling turned off, which RDS reports by leaving
+        // MaxAllocatedStorage out.
+        let max_allocated_storage = optional_i32_param(request, "MaxAllocatedStorage")?
+            .filter(|max| *max != allocated_storage);
         let master_username =
             optional_query_param(request, "MasterUsername").unwrap_or_else(|| "admin".to_string());
-        let master_user_password = optional_query_param(request, "MasterUserPassword")
-            .unwrap_or_else(|| "Password1!".to_string());
+        let manage_master_user_password = parse_optional_bool(
+            optional_query_param(request, "ManageMasterUserPassword").as_deref(),
+        )?
+        .unwrap_or(false);
+        let requested_master_password = optional_query_param(request, "MasterUserPassword");
+        if manage_master_user_password && requested_master_password.is_some() {
+            return Err(AwsServiceError::aws_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidParameterCombination",
+                "You can't specify MasterUserPassword when ManageMasterUserPassword is turned on.",
+            ));
+        }
+        // A managed master password is generated, as RDS does; the database
+        // runs with it and its secret holds it.
+        let master_user_password = if manage_master_user_password {
+            master_secret::generate_master_password()
+        } else {
+            requested_master_password.unwrap_or_else(|| "Password1!".to_string())
+        };
+        let master_secrets = if manage_master_user_password {
+            Some(self.master_secrets().ok_or_else(|| {
+                AwsServiceError::aws_error(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidParameterCombination",
+                    "ManageMasterUserPassword needs Secrets Manager, which is not available.",
+                )
+            })?)
+        } else {
+            None
+        };
+        // Resolved before the RDS lock: KMS may mint the AWS-managed key.
+        let master_user_secret_kms_key_id = master_secrets.as_ref().and_then(|store| {
+            store.kms_key(
+                optional_query_param(request, "MasterUserSecretKmsKeyId").as_deref(),
+                &request.account_id,
+                &request.region,
+            )
+        });
         let db_name = optional_query_param(request, "DBName");
         let engine_version = match self.aurora_member_engine_version(request, &engine)? {
             Some(cluster_version) => cluster_version,
@@ -263,6 +304,45 @@ impl RdsService {
             )?;
         }
 
+        let master_user_secret_arn = match &master_secrets {
+            Some(store) => {
+                let instance_arn = rds_arn(
+                    &request.region,
+                    &request.account_id,
+                    "db",
+                    &db_instance_identifier,
+                );
+                match store.create(
+                    &request.account_id,
+                    &request.region,
+                    &instance_arn,
+                    &master_username,
+                    &master_user_password,
+                    master_user_secret_kms_key_id.as_deref(),
+                ) {
+                    Ok(arn) => {
+                        store.persist().await;
+                        Some(arn)
+                    }
+                    Err(error) => {
+                        let mut accounts = self.state.write();
+                        accounts
+                            .get_or_create(&request.account_id)
+                            .cancel_instance_creation(&db_instance_identifier);
+                        return Err(error);
+                    }
+                }
+            }
+            None => None,
+        };
+        // The parameter group's PostgreSQL settings, applied once the server
+        // is up (see `crate::db_parameters`).
+        let postgres_settings = self.postgres_settings_for(
+            &request.account_id,
+            &engine,
+            db_parameter_group_name.as_deref(),
+        );
+
         let logical_db_name = db_name
             .clone()
             .unwrap_or_else(|| default_db_name(&engine).to_string());
@@ -332,10 +412,12 @@ impl RdsService {
                 character_set_name,
                 auto_minor_version_upgrade,
                 copy_tags_to_snapshot,
-                master_user_secret_arn: None,
-                master_user_secret_kms_key_id: None,
+                master_user_secret_kms_key_id: master_user_secret_arn
+                    .as_ref()
+                    .and(master_user_secret_kms_key_id),
+                master_user_secret_arn,
                 license_model: None,
-                max_allocated_storage: None,
+                max_allocated_storage,
                 multi_tenant: None,
                 storage_throughput: None,
                 tde_credential_arn: None,
@@ -391,6 +473,9 @@ impl RdsService {
                 fakecloud_core::data_volume::current_scope().tag(),
                 &account_id,
             );
+            let master_secret_to_drop = master_secrets
+                .clone()
+                .zip(instance.master_user_secret_arn.clone());
             tokio::spawn(async move {
                 match runtime
                     .ensure_postgres(
@@ -459,6 +544,23 @@ impl RdsService {
                                 tracing::error!(%error, db_instance_identifier=%id, "cluster restore dump replay failed");
                             }
                         }
+                        // The DB parameter group takes effect at creation,
+                        // static settings included: apply it, and restart
+                        // when a static setting waits for one.
+                        let running = match super::apply_postgres_settings_at_boot(
+                            &runtime,
+                            &incarnation,
+                            &engine,
+                            &master_username,
+                            &master_user_password,
+                            &logical_db_name_task,
+                            &postgres_settings,
+                        )
+                        .await
+                        {
+                            Some(restarted) => restarted,
+                            None => running,
+                        };
 
                         let instance_present = {
                             let mut accounts = state_handle.write();
@@ -539,6 +641,10 @@ impl RdsService {
                         // may already have created this incarnation's volume
                         // (and a container), which nothing else names.
                         super::reap_gone_start(&runtime, &incarnation, &volume).await;
+                        if let Some((store, secret_arn)) = &master_secret_to_drop {
+                            store.delete(&account_id, &region, secret_arn);
+                            store.persist().await;
+                        }
                         save_snapshot_static(
                             state_handle.clone(),
                             snapshot_store.clone(),
@@ -639,7 +745,7 @@ impl RdsService {
             .await?;
         }
 
-        let (instance, subnet_group) = {
+        let (instance, subnet_group, orphaned_secret) = {
             let mut accounts = self.state.write();
             let state = accounts.get_or_create(&request.account_id);
             if state
@@ -672,8 +778,21 @@ impl RdsService {
             }
 
             let subnet_group = instance_subnet_group(state, &instance).cloned();
-            (instance, subnet_group)
+            // The master user secret goes with the instance that owns it. A
+            // read replica or restored copy reports its source's secret, so
+            // a secret another instance still reports stays.
+            let orphaned_secret = instance.master_user_secret_arn.clone().filter(|arn| {
+                !state
+                    .instances
+                    .values()
+                    .any(|i| i.master_user_secret_arn.as_ref() == Some(arn))
+            });
+            (instance, subnet_group, orphaned_secret)
         };
+        if let (Some(secret_arn), Some(store)) = (orphaned_secret, self.master_secrets()) {
+            store.delete(&request.account_id, &request.region, &secret_arn);
+            store.persist().await;
+        }
 
         // When a final snapshot was requested, its backgrounded finalizer owns
         // the teardown: the source container must stay up until the async dump
@@ -777,6 +896,9 @@ impl RdsService {
             parse_optional_bool(optional_query_param(request, "DisableDomain").as_deref())?;
         let rotate_master_user_password = parse_optional_bool(
             optional_query_param(request, "RotateMasterUserPassword").as_deref(),
+        )?;
+        let manage_master_user_password = parse_optional_bool(
+            optional_query_param(request, "ManageMasterUserPassword").as_deref(),
         )?;
 
         let new_db_instance_identifier = optional_query_param(request, "NewDBInstanceIdentifier");
@@ -892,15 +1014,91 @@ impl RdsService {
             || domain_dns_ips.is_some()
             || disable_domain.is_some()
             || rotate_master_user_password.is_some()
+            || manage_master_user_password.is_some()
             || new_db_instance_identifier
                 .as_deref()
                 .is_some_and(|new_id| new_id != db_instance_identifier);
+        // Secrets Manager and the master user secret's key, resolved before
+        // the RDS lock (KMS may mint the AWS-managed key).
+        let secret_change_requested = manage_master_user_password == Some(true)
+            || rotate_master_user_password == Some(true)
+            || master_user_secret_kms_key_id.is_some();
+        let master_secrets = secret_change_requested
+            .then(|| self.master_secrets())
+            .flatten();
+        let named_secret_kms_key = master_secrets.as_ref().and_then(|store| {
+            master_user_secret_kms_key_id
+                .as_deref()
+                .and_then(|k| store.kms_key(Some(k), &request.account_id, &request.region))
+        });
+        let default_secret_kms_key = match (&master_secrets, manage_master_user_password) {
+            (Some(store), Some(true)) => store.kms_key(None, &request.account_id, &request.region),
+            _ => None,
+        };
+        let parameter_group_changed =
+            db_parameter_group_name.is_some() && apply_immediately != Some(false);
+
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&request.account_id);
         let instance = state
             .instances
             .get_mut(&db_instance_identifier)
             .ok_or_else(|| db_instance_not_found(&db_instance_identifier))?;
+
+        // Master password management, checked before mutating anything.
+        let managed = instance.master_user_secret_arn.is_some();
+        if manage_master_user_password == Some(true) && master_user_password.is_some() {
+            return Err(AwsServiceError::aws_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidParameterCombination",
+                "You can't specify MasterUserPassword when ManageMasterUserPassword is turned on.",
+            ));
+        }
+        if manage_master_user_password == Some(false) && managed && master_user_password.is_none() {
+            return Err(AwsServiceError::aws_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidParameterCombination",
+                "MasterUserPassword is required when ManageMasterUserPassword is turned off.",
+            ));
+        }
+        // A managed password changes only through RDS: by rotation, or by
+        // turning management off with a new MasterUserPassword.
+        if managed && master_user_password.is_some() && manage_master_user_password != Some(false) {
+            return Err(AwsServiceError::aws_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidParameterCombination",
+                "You can't specify MasterUserPassword for a DB instance whose master user password is managed in Secrets Manager.",
+            ));
+        }
+        if rotate_master_user_password == Some(true)
+            && !(managed && manage_master_user_password != Some(false))
+        {
+            return Err(AwsServiceError::aws_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidParameterCombination",
+                "RotateMasterUserPassword applies only to a DB instance whose master user password is managed in Secrets Manager.",
+            ));
+        }
+        if manage_master_user_password == Some(true) && !managed && master_secrets.is_none() {
+            return Err(AwsServiceError::aws_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidParameterCombination",
+                "ManageMasterUserPassword needs Secrets Manager, which is not available.",
+            ));
+        }
+        let changes_password = master_user_password.is_some()
+            || rotate_master_user_password == Some(true)
+            || (manage_master_user_password == Some(true) && !managed);
+        if changes_password && instance.db_instance_status != "available" {
+            return Err(AwsServiceError::aws_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidDBInstanceState",
+                format!(
+                    "DB instance {db_instance_identifier} is {} and its master password can't be changed.",
+                    instance.db_instance_status
+                ),
+            ));
+        }
 
         // AWS only renames a settled instance (`available`, or `stopped`);
         // one that is creating, starting, rebooting or being deleted is
@@ -971,8 +1169,64 @@ impl RdsService {
         if let Some(ca_id) = ca_certificate_identifier {
             instance.ca_certificate_identifier = Some(ca_id);
         }
-        if let Some(kms_key) = master_user_secret_kms_key_id {
-            instance.master_user_secret_kms_key_id = Some(kms_key);
+        let current_password = instance.master_user_password.clone();
+        let mut secrets_changed = false;
+        match (manage_master_user_password, &master_secrets) {
+            // Turn management on: a generated password and a new secret.
+            (Some(true), Some(store)) if !managed => {
+                let password = master_secret::generate_master_password();
+                let kms = named_secret_kms_key.clone().or(default_secret_kms_key);
+                let arn = store.create(
+                    &request.account_id,
+                    &request.region,
+                    &instance.db_instance_arn,
+                    &instance.master_username,
+                    &password,
+                    kms.as_deref(),
+                )?;
+                instance.master_user_password = password;
+                instance.master_user_secret_arn = Some(arn);
+                instance.master_user_secret_kms_key_id = kms;
+                secrets_changed = true;
+            }
+            // Turn management off: RDS deletes the secret and the database
+            // takes MasterUserPassword (applied below).
+            (Some(false), _) if managed => {
+                if let (Some(arn), Some(store)) = (
+                    instance.master_user_secret_arn.take(),
+                    self.master_secrets(),
+                ) {
+                    store.delete(&request.account_id, &request.region, &arn);
+                    secrets_changed = true;
+                }
+                instance.master_user_secret_kms_key_id = None;
+            }
+            _ => {
+                if let Some(kms_key) = master_user_secret_kms_key_id {
+                    // A managed secret moves to the new key.
+                    if let (Some(arn), Some(store), Some(kms)) = (
+                        instance.master_user_secret_arn.as_deref(),
+                        &master_secrets,
+                        named_secret_kms_key.as_deref(),
+                    ) {
+                        store.put(
+                            &request.account_id,
+                            &request.region,
+                            arn,
+                            &instance.master_username,
+                            &instance.master_user_password,
+                            Some(kms),
+                        );
+                        secrets_changed = true;
+                    }
+                    instance.master_user_secret_kms_key_id = named_secret_kms_key.or(Some(kms_key));
+                }
+            }
+        }
+        // A new master password applies as soon as possible whatever
+        // ApplyImmediately says, as on RDS.
+        if let Some(pwd) = master_user_password {
+            instance.master_user_password = pwd;
         }
         if let Some(name) = option_group_name {
             instance.option_group_name = Some(name);
@@ -990,7 +1244,11 @@ impl RdsService {
             instance.iam_database_authentication_enabled = b;
         }
         if let Some(n) = max_allocated_storage {
-            instance.max_allocated_storage = Some(n);
+            // Equal to the allocated storage turns storage autoscaling off.
+            let allocated = allocated_storage
+                .filter(|_| apply_immediately != Some(false))
+                .unwrap_or(instance.allocated_storage);
+            instance.max_allocated_storage = (n != allocated).then_some(n);
         }
         // Enhanced Monitoring role and Performance Insights settings apply
         // immediately in AWS (no reboot), mirroring their already-applied
@@ -1044,11 +1302,32 @@ impl RdsService {
             }
             instance.enabled_cloudwatch_logs_exports = current;
         }
-        // RotateMasterUserPassword: AWS rotates the secret in place. We
-        // record a marker by bumping a synthetic password — callers don't
-        // see plaintext, only that the secret status remains active.
+        // RotateMasterUserPassword: RDS generates a new password and stores
+        // it as the secret's current value.
         if rotate_master_user_password == Some(true) {
-            instance.master_user_password = format!("rotated-{}", uuid::Uuid::new_v4().simple());
+            let password = master_secret::generate_master_password();
+            if let (Some(arn), Some(store)) =
+                (instance.master_user_secret_arn.as_deref(), &master_secrets)
+            {
+                store.put(
+                    &request.account_id,
+                    &request.region,
+                    arn,
+                    &instance.master_username,
+                    &password,
+                    None,
+                );
+                secrets_changed = true;
+            }
+            instance.master_user_password = password;
+        }
+        if instance.master_user_password != current_password {
+            self.spawn_master_password_change(instance, current_password);
+        }
+        if secrets_changed {
+            if let Some(store) = self.master_secrets() {
+                tokio::spawn(async move { store.persist().await });
+            }
         }
 
         // ── ApplyImmediately-gated fields ────────────────────────
@@ -1056,9 +1335,6 @@ impl RdsService {
         if immediate {
             if let Some(class) = db_instance_class {
                 instance.db_instance_class = class;
-            }
-            if let Some(pwd) = master_user_password {
-                instance.master_user_password = pwd;
             }
             if let Some(version) = engine_version {
                 instance.engine_version = version;
@@ -1125,7 +1401,6 @@ impl RdsService {
             }
         } else {
             let any_deferred = db_instance_class.is_some()
-                || master_user_password.is_some()
                 || engine_version.is_some()
                 || allocated_storage.is_some()
                 || db_parameter_group_name.is_some()
@@ -1149,9 +1424,6 @@ impl RdsService {
                     .get_or_insert(Default::default());
                 if let Some(class) = db_instance_class {
                     pending.db_instance_class = Some(class);
-                }
-                if let Some(pwd) = master_user_password {
-                    pending.master_user_password = Some(pwd);
                 }
                 if let Some(version) = engine_version {
                     pending.engine_version = Some(version);
@@ -1254,6 +1526,7 @@ impl RdsService {
             .get(&final_identifier)
             .expect("instance present after modify");
         let instance_arn = instance.db_instance_arn.clone();
+        let incarnation = instance.dbi_resource_id.clone();
         let xml = query_response_xml(
             "ModifyDBInstance",
             RDS_NS,
@@ -1268,6 +1541,11 @@ impl RdsService {
             &request.request_id,
         );
         drop(accounts);
+        // A new DB parameter group's dynamic settings apply at once; its
+        // static ones at the next reboot.
+        if parameter_group_changed {
+            self.spawn_parameter_sync(&request.account_id, |i| i.dbi_resource_id == incarnation);
+        }
 
         self.emit_event(
             RdsSourceType::DbInstance,
@@ -1315,7 +1593,7 @@ impl RdsService {
         // (runtime log-marker deadlines), well past the ~60s client read
         // timeout. Awaiting it inline timed out the CLI on every non-PG/MySQL
         // reboot (bug-hunt 2026-06-24, 3.1); mirror the EC2 RebootInstances fix.
-        let instance = {
+        let (instance, password_before) = {
             let mut accounts = self.state.write();
             let state = accounts.get_or_create(&request.account_id);
             let instance = state
@@ -1323,6 +1601,7 @@ impl RdsService {
                 .get_mut(&db_instance_identifier)
                 .ok_or_else(|| db_instance_not_found(&db_instance_identifier))?;
             instance.db_instance_status = "rebooting".to_string();
+            let password_before = instance.master_user_password.clone();
             // Apply pending modifications SYNCHRONOUSLY: AWS applies these to the
             // instance metadata as part of the reboot, and the response must
             // reflect the new values with pending cleared. Only the container
@@ -1330,8 +1609,18 @@ impl RdsService {
             if let Some(pending) = instance.pending_modified_values.take() {
                 apply_pending_to_instance(instance, pending);
             }
-            instance.clone()
+            (instance.clone(), password_before)
         };
+        // The reboot is when the DB parameter group's static settings take
+        // effect: write the group's settings before the restart.
+        let reboot_settings = (crate::runtime::container_engine(&instance.engine) == "postgres")
+            .then(|| {
+                self.postgres_settings_for(
+                    &request.account_id,
+                    &instance.engine,
+                    instance.db_parameter_group_name.as_deref(),
+                )
+            });
 
         {
             let state_handle = self.state.clone();
@@ -1347,6 +1636,36 @@ impl RdsService {
                     .db_name
                     .clone()
                     .unwrap_or_else(|| default_db_name(&inst.engine).to_string());
+                if inst.master_user_password != password_before {
+                    // A master password left pending by an older build.
+                    if let Err(error) = runtime
+                        .set_master_password(
+                            &inst.dbi_resource_id,
+                            &inst.engine,
+                            &inst.master_username,
+                            &password_before,
+                            &inst.master_user_password,
+                            &logical_db,
+                        )
+                        .await
+                    {
+                        tracing::error!(%error, db_instance_identifier=%id, "changing the master password failed");
+                    }
+                }
+                if let Some(settings) = &reboot_settings {
+                    if let Err(error) = runtime
+                        .apply_postgres_settings(
+                            &inst.dbi_resource_id,
+                            &inst.master_username,
+                            &inst.master_user_password,
+                            &logical_db,
+                            settings,
+                        )
+                        .await
+                    {
+                        tracing::warn!(%error, db_instance_identifier=%id, "applying the DB parameter group failed");
+                    }
+                }
                 let running = match runtime
                     .restart(
                         &inst.dbi_resource_id,

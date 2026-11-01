@@ -13,6 +13,7 @@ fakecloud-core = { workspace = true }
 fakecloud-ec2 = { workspace = true }
 fakecloud-k8s = { workspace = true }
 fakecloud-persistence = { workspace = true }
+fakecloud-secretsmanager = { workspace = true }
 k8s-openapi = { workspace = true }
 async-trait = { workspace = true }
 http = { workspace = true }
@@ -29,6 +30,7 @@ mysql_async = "0.34"
 base64 = { workspace = true }
 tracing = { workspace = true }
 tempfile = { workspace = true }
+sha2 = { workspace = true }
 
 [dev-dependencies]
 fakecloud-kms = { workspace = true, features = ["test-util"] }

@@ -168,18 +168,30 @@ jobs:
         id: sha
         run: echo "short=$(echo "${{ github.sha }}" | cut -c1-7)" >> "$GITHUB_OUTPUT"
 
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      # The runtime asks for `<version>-<release>-<assets>`, where <assets>
+      # hashes the build context (bridge_image_tag in
+      # crates/fakecloud-rds/src/runtime/mod.rs computes the same value).
+      - name: Hash the build context
+        id: assets
+        working-directory: crates/fakecloud-rds/assets/${{ matrix.target.engine }}
+        run: echo "hash=$(LC_ALL=C sha256sum $(LC_ALL=C ls) | sha256sum | cut -c1-12)" >> "$GITHUB_OUTPUT"
+
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6.1.0
         with:
           images: ${{ env.IMAGE_BASE }}
-          # On a real release tag (`v*`): pinned `<version>-<release>` plus
-          # a rolling `<version>` tag.
+          # On a real release tag (`v*`): pinned `<version>-<release>`, the
+          # `<version>-<release>-<assets>` tag the runtime pulls, and a
+          # rolling `<version>` tag.
           # On `workflow_dispatch`: a one-off `<version>-dev-<short-sha>`
           # tag so we can validate the full publish + manifest-merge
           # path end-to-end without overwriting any release tag.
           tags: |
             type=semver,pattern=${{ matrix.target.version }}-{{version}}
+            type=semver,pattern=${{ matrix.target.version }}-{{version}}-${{ steps.assets.outputs.hash }}
             type=raw,value=${{ matrix.target.version }},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
             type=raw,value=${{ matrix.target.version }}-dev-${{ steps.sha.outputs.short }},enable=${{ github.event_name == 'workflow_dispatch' }}
 

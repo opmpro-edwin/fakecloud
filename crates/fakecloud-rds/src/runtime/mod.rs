@@ -30,6 +30,32 @@ const MARIADB_BOOTSTRAP_SH: &str = include_str!("../../assets/mariadb/fakecloud-
 const MARIADB_BOOTSTRAP_SQL: &str =
     include_str!("../../assets/mariadb/99-fakecloud-bootstrap.sql.tmpl");
 
+/// The build context of each bridge image: file name and contents, exactly
+/// the files of `assets/<engine>/`. Their content hash is part of the image
+/// tag (see [`bridge_image_tag`]).
+const POSTGRES_ASSETS: &[(&str, &str)] = &[
+    ("Dockerfile", POSTGRES_DOCKERFILE),
+    ("aws_commons.control", AWS_COMMONS_CONTROL),
+    ("aws_commons--1.1.sql", AWS_COMMONS_SQL),
+    ("aws_commons--1.0--1.1.sql", AWS_COMMONS_UPGRADE_SQL),
+    ("aws_lambda.control", AWS_LAMBDA_CONTROL),
+    ("aws_lambda--1.0.sql", AWS_LAMBDA_SQL),
+    ("aws_s3.control", AWS_S3_CONTROL),
+    ("aws_s3--1.0.sql", AWS_S3_SQL),
+];
+const MYSQL_ASSETS: &[(&str, &str)] = &[
+    ("Dockerfile", MYSQL_DOCKERFILE),
+    ("fakecloud_udf.c", MYSQL_UDF_C),
+    ("fakecloud-bootstrap.sh", MYSQL_BOOTSTRAP_SH),
+    ("99-fakecloud-bootstrap.sql.tmpl", MYSQL_BOOTSTRAP_SQL),
+];
+const MARIADB_ASSETS: &[(&str, &str)] = &[
+    ("Dockerfile", MARIADB_DOCKERFILE),
+    ("fakecloud_udf.c", MARIADB_UDF_C),
+    ("fakecloud-bootstrap.sh", MARIADB_BOOTSTRAP_SH),
+    ("99-fakecloud-bootstrap.sql.tmpl", MARIADB_BOOTSTRAP_SQL),
+];
+
 /// Default registry that hosts the prebuilt postgres images. CI publishes
 /// to `ghcr.io/faiscadev/fakecloud-postgres:<major>-<version>` on each
 /// release tag (see `.github/workflows/docker-rds-images.yml`).
@@ -602,6 +628,152 @@ impl RdsRuntime {
         }
     }
 
+    /// Whether instances run as Kubernetes Pods rather than containers.
+    pub fn is_k8s(&self) -> bool {
+        self.k8s.is_some()
+    }
+
+    fn tracked(&self, incarnation: &str) -> Result<RunningDbContainer, RuntimeError> {
+        self.containers
+            .read()
+            .get(incarnation)
+            .cloned()
+            .ok_or(RuntimeError::Unavailable)
+    }
+
+    async fn postgres_client(
+        running: &RunningDbContainer,
+        username: &str,
+        password: &str,
+        db_name: &str,
+    ) -> Result<tokio_postgres::Client, RuntimeError> {
+        let mut config = tokio_postgres::Config::new();
+        config
+            .host(&running.endpoint_address)
+            .port(running.endpoint_port)
+            .user(username)
+            .password(password)
+            .dbname(db_name)
+            .connect_timeout(Duration::from_secs(10));
+        let (client, connection) = config
+            .connect(NoTls)
+            .await
+            .map_err(|e| RuntimeError::ContainerStartFailed(format!("connect to postgres: {e}")))?;
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        Ok(client)
+    }
+
+    /// Make the PostgreSQL server of `incarnation` run with `settings` (a DB
+    /// parameter group's PostgreSQL settings, see `crate::db_parameters`):
+    /// `ALTER SYSTEM RESET ALL`, one `ALTER SYSTEM SET` per setting, then a
+    /// reload, which applies the dynamic settings at once. A setting the
+    /// server refuses is logged and skipped. Returns whether one of the
+    /// settings is static (`postmaster` context) and so waits for a restart.
+    pub async fn apply_postgres_settings(
+        &self,
+        incarnation: &str,
+        username: &str,
+        password: &str,
+        db_name: &str,
+        settings: &[(String, String)],
+    ) -> Result<bool, RuntimeError> {
+        let running = self.tracked(incarnation)?;
+        let client = Self::postgres_client(&running, username, password, db_name).await?;
+        let sql_error = |e: tokio_postgres::Error| {
+            RuntimeError::ContainerStartFailed(format!("apply parameter group: {e}"))
+        };
+        client
+            .batch_execute("ALTER SYSTEM RESET ALL")
+            .await
+            .map_err(sql_error)?;
+        for (name, value) in settings {
+            let Some(statement) = crate::db_parameters::alter_system_set(name, value) else {
+                continue;
+            };
+            if let Err(error) = client.batch_execute(&statement).await {
+                tracing::warn!(
+                    parameter = %name,
+                    %error,
+                    "postgres refused a DB parameter group setting; skipping it"
+                );
+            }
+        }
+        client
+            .batch_execute("SELECT pg_reload_conf()")
+            .await
+            .map_err(sql_error)?;
+        let names: Vec<String> = settings
+            .iter()
+            .map(|(name, _)| name.to_ascii_lowercase())
+            .collect();
+        let row = client
+            .query_one(
+                "SELECT count(*) FROM pg_settings WHERE context = 'postmaster' \
+                 AND lower(name) = ANY($1)",
+                &[&names],
+            )
+            .await
+            .map_err(sql_error)?;
+        let static_settings: i64 = row.get(0);
+        Ok(static_settings > 0)
+    }
+
+    /// Set the master user's password in the running database of
+    /// `incarnation` to `new_password`, connecting with `current_password`.
+    /// PostgreSQL, MySQL and MariaDB (and their Aurora flavours).
+    pub async fn set_master_password(
+        &self,
+        incarnation: &str,
+        engine: &str,
+        username: &str,
+        current_password: &str,
+        new_password: &str,
+        db_name: &str,
+    ) -> Result<(), RuntimeError> {
+        let running = self.tracked(incarnation)?;
+        match container_engine(engine) {
+            "postgres" => {
+                let client =
+                    Self::postgres_client(&running, username, current_password, db_name).await?;
+                let statement = format!(
+                    "ALTER ROLE {} WITH PASSWORD {}",
+                    crate::db_parameters::quote_ident(username),
+                    crate::db_parameters::quote_literal(new_password)
+                );
+                client.batch_execute(&statement).await.map_err(|e| {
+                    RuntimeError::ContainerStartFailed(format!("set master password: {e}"))
+                })
+            }
+            "mysql" | "mariadb" => {
+                use mysql_async::prelude::*;
+                let opts = mysql_async::OptsBuilder::default()
+                    .ip_or_hostname(running.endpoint_address.as_str())
+                    .tcp_port(running.endpoint_port)
+                    .user(Some(username))
+                    .pass(Some(current_password))
+                    .db_name(Some(db_name));
+                let mut conn = mysql_async::Conn::new(opts).await.map_err(|e| {
+                    RuntimeError::ContainerStartFailed(format!("connect to mysql: {e}"))
+                })?;
+                let escaped = new_password.replace('\\', "\\\\").replace('\'', "\\'");
+                let result = conn
+                    .query_drop(format!(
+                        "ALTER USER CURRENT_USER() IDENTIFIED BY '{escaped}'"
+                    ))
+                    .await;
+                let _ = conn.disconnect().await;
+                result.map_err(|e| {
+                    RuntimeError::ContainerStartFailed(format!("set master password: {e}"))
+                })
+            }
+            other => Err(RuntimeError::ContainerStartFailed(format!(
+                "changing the master password of a running {other} instance is not supported"
+            ))),
+        }
+    }
+
     pub async fn stop_all(&self) {
         let containers: Vec<String> = {
             let mut containers = self.containers.write();
@@ -900,19 +1072,9 @@ impl RdsRuntime {
         major_version: &str,
         tag: &str,
     ) -> Result<(), RuntimeError> {
-        let assets: [(&str, &str); 8] = [
-            ("Dockerfile", POSTGRES_DOCKERFILE),
-            ("aws_commons.control", AWS_COMMONS_CONTROL),
-            ("aws_commons--1.1.sql", AWS_COMMONS_SQL),
-            ("aws_commons--1.0--1.1.sql", AWS_COMMONS_UPGRADE_SQL),
-            ("aws_lambda.control", AWS_LAMBDA_CONTROL),
-            ("aws_lambda--1.0.sql", AWS_LAMBDA_SQL),
-            ("aws_s3.control", AWS_S3_CONTROL),
-            ("aws_s3--1.0.sql", AWS_S3_SQL),
-        ];
         self.build_image_local(
             tag,
-            &assets,
+            POSTGRES_ASSETS,
             &format!("PG_VERSION={major_version}"),
             "fakecloud-postgres",
         )
@@ -995,15 +1157,9 @@ impl RdsRuntime {
         major_version: &str,
         tag: &str,
     ) -> Result<(), RuntimeError> {
-        let assets: [(&str, &str); 4] = [
-            ("Dockerfile", MYSQL_DOCKERFILE),
-            ("fakecloud_udf.c", MYSQL_UDF_C),
-            ("fakecloud-bootstrap.sh", MYSQL_BOOTSTRAP_SH),
-            ("99-fakecloud-bootstrap.sql.tmpl", MYSQL_BOOTSTRAP_SQL),
-        ];
         self.build_image_local(
             tag,
-            &assets,
+            MYSQL_ASSETS,
             &format!("MYSQL_VERSION={major_version}"),
             "fakecloud-mysql",
         )
@@ -1015,15 +1171,9 @@ impl RdsRuntime {
         major_version: &str,
         tag: &str,
     ) -> Result<(), RuntimeError> {
-        let assets: [(&str, &str); 4] = [
-            ("Dockerfile", MARIADB_DOCKERFILE),
-            ("fakecloud_udf.c", MARIADB_UDF_C),
-            ("fakecloud-bootstrap.sh", MARIADB_BOOTSTRAP_SH),
-            ("99-fakecloud-bootstrap.sql.tmpl", MARIADB_BOOTSTRAP_SQL),
-        ];
         self.build_image_local(
             tag,
-            &assets,
+            MARIADB_ASSETS,
             &format!("MARIADB_VERSION={major_version}"),
             "fakecloud-mariadb",
         )
@@ -1337,17 +1487,43 @@ pub fn legacy_data_volume_name(account_id: &str, db_instance_identifier: &str) -
 }
 
 /// Build the prebuilt-image reference for a given engine + major
-/// version. Uses `<registry>/<image>:<major>-<fakecloud-version>`,
+/// version. Uses `<registry>/<image>:<major>-<fakecloud-version>-<assets>`,
 /// where the registry comes from `FAKECLOUD_POSTGRES_REGISTRY` (kept
-/// historical name; defaults to the public `ghcr.io/faiscadev`).
-/// The version pin guarantees the runtime asks the daemon for the
-/// same image CI publishes for this fakecloud release; mismatched
-/// assets force a local rebuild via the fall-through in
-/// `ensure_bridge_image`.
+/// historical name; defaults to the public `ghcr.io/faiscadev`) and
+/// `<assets>` is the content hash of the image's build context
+/// ([`bridge_assets_hash`]). The version pins the image to this fakecloud
+/// release, and the hash to the exact Dockerfile and extension files this
+/// binary embeds: a build whose assets differ (a fork, a local edit) never
+/// pulls or reuses an image built from other assets, and builds its own.
 pub(crate) fn bridge_image_tag(image: &str, major_version: &str) -> String {
     let registry = std::env::var("FAKECLOUD_POSTGRES_REGISTRY")
         .unwrap_or_else(|_| DEFAULT_POSTGRES_REGISTRY.to_string());
     bridge_image_tag_with_registry(&registry, image, major_version)
+}
+
+/// The build context of the bridge image `image`.
+fn bridge_assets(image: &str) -> &'static [(&'static str, &'static str)] {
+    match image {
+        "fakecloud-mysql" => MYSQL_ASSETS,
+        "fakecloud-mariadb" => MARIADB_ASSETS,
+        _ => POSTGRES_ASSETS,
+    }
+}
+
+/// Content hash of an image build context: the first 12 hex digits of the
+/// SHA-256 of its `sha256sum` manifest (`<sha256>  <name>` lines, sorted by
+/// name). The same value comes out of
+/// `cd crates/fakecloud-rds/assets/<engine> && LC_ALL=C sha256sum $(LC_ALL=C ls) | sha256sum | cut -c1-12`.
+fn bridge_assets_hash(assets: &[(&str, &str)]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut sorted: Vec<&(&str, &str)> = assets.iter().collect();
+    sorted.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+    let manifest: String = sorted
+        .iter()
+        .map(|(name, content)| format!("{:x}  {name}\n", Sha256::digest(content.as_bytes())))
+        .collect();
+    let digest = format!("{:x}", Sha256::digest(manifest.as_bytes()));
+    digest[..12].to_string()
 }
 
 /// The container engine an RDS engine runs on. Aurora cluster members store
@@ -1379,11 +1555,12 @@ pub(crate) fn mariadb_major(engine_version: &str) -> &'static str {
 fn bridge_image_tag_with_registry(registry: &str, image: &str, major_version: &str) -> String {
     let registry = registry.trim_end_matches('/');
     format!(
-        "{}/{}:{}-{}",
+        "{}/{}:{}-{}-{}",
         registry,
         image,
         major_version,
-        env!("CARGO_PKG_VERSION")
+        env!("CARGO_PKG_VERSION"),
+        bridge_assets_hash(bridge_assets(image))
     )
 }
 
@@ -1491,22 +1668,25 @@ mod tests {
         assert_eq!(
             bridge_image_tag_with_registry(DEFAULT_POSTGRES_REGISTRY, "fakecloud-postgres", "16"),
             format!(
-                "ghcr.io/faiscadev/fakecloud-postgres:16-{}",
-                env!("CARGO_PKG_VERSION")
+                "ghcr.io/faiscadev/fakecloud-postgres:16-{}-{}",
+                env!("CARGO_PKG_VERSION"),
+                bridge_assets_hash(POSTGRES_ASSETS)
             )
         );
         assert_eq!(
             bridge_image_tag_with_registry(DEFAULT_POSTGRES_REGISTRY, "fakecloud-mysql", "8.0"),
             format!(
-                "ghcr.io/faiscadev/fakecloud-mysql:8.0-{}",
-                env!("CARGO_PKG_VERSION")
+                "ghcr.io/faiscadev/fakecloud-mysql:8.0-{}-{}",
+                env!("CARGO_PKG_VERSION"),
+                bridge_assets_hash(MYSQL_ASSETS)
             )
         );
         assert_eq!(
             bridge_image_tag_with_registry(DEFAULT_POSTGRES_REGISTRY, "fakecloud-mariadb", "10.11"),
             format!(
-                "ghcr.io/faiscadev/fakecloud-mariadb:10.11-{}",
-                env!("CARGO_PKG_VERSION")
+                "ghcr.io/faiscadev/fakecloud-mariadb:10.11-{}-{}",
+                env!("CARGO_PKG_VERSION"),
+                bridge_assets_hash(MARIADB_ASSETS)
             )
         );
 
@@ -1514,8 +1694,9 @@ mod tests {
         assert_eq!(
             bridge_image_tag_with_registry("registry.example.com/team", "fakecloud-postgres", "15"),
             format!(
-                "registry.example.com/team/fakecloud-postgres:15-{}",
-                env!("CARGO_PKG_VERSION")
+                "registry.example.com/team/fakecloud-postgres:15-{}-{}",
+                env!("CARGO_PKG_VERSION"),
+                bridge_assets_hash(POSTGRES_ASSETS)
             )
         );
 
@@ -1527,9 +1708,53 @@ mod tests {
                 "13"
             ),
             format!(
-                "registry.example.com/team/fakecloud-postgres:13-{}",
-                env!("CARGO_PKG_VERSION")
+                "registry.example.com/team/fakecloud-postgres:13-{}-{}",
+                env!("CARGO_PKG_VERSION"),
+                bridge_assets_hash(POSTGRES_ASSETS)
             )
+        );
+    }
+
+    /// The embedded asset lists are exactly the files of `assets/<engine>/`,
+    /// so the tag hash covers the whole build context, and the hash is the
+    /// documented `sha256sum` manifest digest: independent of list order and
+    /// different for different contents.
+    #[test]
+    fn bridge_assets_hash_covers_the_build_context() {
+        for (dir, assets) in [
+            ("postgres", POSTGRES_ASSETS),
+            ("mysql", MYSQL_ASSETS),
+            ("mariadb", MARIADB_ASSETS),
+        ] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("assets")
+                .join(dir);
+            let mut on_disk: Vec<String> = std::fs::read_dir(&path)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            on_disk.sort();
+            let mut embedded: Vec<String> = assets.iter().map(|(n, _)| n.to_string()).collect();
+            embedded.sort();
+            assert_eq!(
+                on_disk, embedded,
+                "{dir}: embedded assets differ from the directory"
+            );
+            for (name, content) in assets {
+                assert_eq!(
+                    std::fs::read_to_string(path.join(name)).unwrap(),
+                    *content,
+                    "{dir}/{name}"
+                );
+            }
+        }
+        let hash = bridge_assets_hash(&[("b", "2"), ("a", "1")]);
+        assert_eq!(hash.len(), 12);
+        assert_eq!(hash, bridge_assets_hash(&[("a", "1"), ("b", "2")]));
+        assert_ne!(hash, bridge_assets_hash(&[("a", "1"), ("b", "3")]));
+        assert!(
+            bridge_image_tag_with_registry("r", "fakecloud-postgres", "17")
+                .ends_with(&bridge_assets_hash(POSTGRES_ASSETS))
         );
     }
 

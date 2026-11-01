@@ -7869,3 +7869,334 @@ fn detaching_the_writer_promotes_the_next_member() {
     assert!(cluster["DBClusterMembers"].as_array().unwrap().is_empty());
     assert!(cluster.get("WriterDBInstanceIdentifier").is_none());
 }
+
+fn secretsmanager_state() -> fakecloud_secretsmanager::SharedSecretsManagerState {
+    Arc::new(RwLock::new(
+        fakecloud_core::multi_account::MultiRegionState::new("123456789012", "us-east-1", ""),
+    ))
+}
+
+fn response_text(response: fakecloud_core::service::AwsResponse) -> String {
+    String::from_utf8(response.body.expect_bytes().to_vec()).expect("utf8")
+}
+
+fn xml_field(xml: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let start = xml.find(&open)? + open.len();
+    let end = xml[start..].find(&format!("</{tag}>"))? + start;
+    Some(xml[start..end].to_string())
+}
+
+/// The `{"username", "password"}` value of a master user secret, read the way
+/// GetSecretValue reads it (decrypted).
+fn master_secret_value(
+    sm: &fakecloud_secretsmanager::SharedSecretsManagerState,
+    hook: Option<&dyn fakecloud_core::delivery::KmsHook>,
+    arn: &str,
+) -> serde_json::Value {
+    let value = fakecloud_secretsmanager::value::read_secret_value(
+        sm,
+        hook,
+        "123456789012",
+        "us-east-1",
+        arn,
+        None,
+        None,
+    )
+    .expect("secret readable");
+    serde_json::from_str(value.secret_string.as_deref().unwrap()).unwrap()
+}
+
+/// CreateDBInstance with ManageMasterUserPassword generates the password,
+/// keeps it in an `rds!db-<uuid>` secret encrypted under the account's
+/// `aws/secretsmanager` key, reports the secret as MasterUserSecret and stores
+/// MaxAllocatedStorage. A create whose database never comes up takes the
+/// secret with it.
+#[tokio::test]
+async fn create_db_instance_with_managed_master_password() {
+    let sm = secretsmanager_state();
+    let (kms, hook) = fakecloud_kms::test_support::kms_hook("123456789012");
+    let svc = make_service()
+        .with_kms_hook(hook.clone())
+        .with_secretsmanager(sm.clone(), None)
+        .with_runtime(Arc::new(crate::runtime::RdsRuntime::new_stub()));
+
+    let both = svc
+        .create_db_instance(&request(
+            "CreateDBInstance",
+            &[
+                ("DBInstanceIdentifier", "both"),
+                ("DBInstanceClass", "db.t3.micro"),
+                ("Engine", "postgres"),
+                ("ManageMasterUserPassword", "true"),
+                ("MasterUserPassword", "given"),
+            ],
+        ))
+        .await
+        .err()
+        .expect("a password and a managed password are exclusive");
+    assert_eq!(both.code(), "InvalidParameterCombination");
+
+    let body = response_text(
+        svc.create_db_instance(&request(
+            "CreateDBInstance",
+            &[
+                ("DBInstanceIdentifier", "managed"),
+                ("DBInstanceClass", "db.t3.micro"),
+                ("Engine", "postgres"),
+                ("MasterUsername", "master"),
+                ("AllocatedStorage", "200"),
+                ("MaxAllocatedStorage", "1000"),
+                ("ManageMasterUserPassword", "true"),
+            ],
+        ))
+        .await
+        .expect("create"),
+    );
+    assert_eq!(
+        xml_field(&body, "MaxAllocatedStorage").as_deref(),
+        Some("1000")
+    );
+    let secret_xml = xml_field(&body, "MasterUserSecret").expect("MasterUserSecret");
+    let secret_arn = xml_field(&secret_xml, "SecretArn").unwrap();
+    assert!(
+        secret_arn.starts_with("arn:aws:secretsmanager:us-east-1:123456789012:secret:rds!db-"),
+        "{secret_arn}"
+    );
+    assert_eq!(
+        xml_field(&secret_xml, "SecretStatus").as_deref(),
+        Some("active")
+    );
+    let key = xml_field(&secret_xml, "KmsKeyId").expect("secret key");
+    fakecloud_kms::test_support::assert_aws_managed_key(
+        &kms,
+        "123456789012",
+        "us-east-1",
+        &key,
+        "alias/aws/secretsmanager",
+    );
+    {
+        let accounts = sm.read();
+        let secret = accounts
+            .regional("123456789012", "us-east-1")
+            .unwrap()
+            .secrets
+            .values()
+            .find(|s| s.arn == secret_arn)
+            .expect("secret created")
+            .clone();
+        assert_eq!(secret.kms_key_id.as_deref(), Some(key.as_str()));
+        assert!(secret
+            .tags
+            .contains(&("aws:secretsmanager:owningService".into(), "rds".into())));
+    }
+
+    // The stub runtime never brings a database up: the failed create removes
+    // the instance, and its secret with it.
+    let gone = async {
+        loop {
+            let instance_gone = !svc
+                .state
+                .read()
+                .default_ref()
+                .instances
+                .contains_key("managed");
+            if instance_gone {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), gone)
+        .await
+        .expect("failed create cleans up");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let exists = sm
+            .read()
+            .regional("123456789012", "us-east-1")
+            .is_some_and(|s| s.secrets.values().any(|x| x.arn == secret_arn));
+        if !exists {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "secret outlived its instance"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// ModifyDBInstance turns management on (a generated password and a new
+/// secret), rotates the password, turns management off with a new
+/// MasterUserPassword (the secret is deleted) and DeleteDBInstance deletes the
+/// secret of a managed instance. MaxAllocatedStorage equal to the allocated
+/// storage turns storage autoscaling off.
+#[tokio::test]
+async fn modify_and_delete_db_instance_manage_the_master_secret() {
+    let sm = secretsmanager_state();
+    let (_kms, hook) = fakecloud_kms::test_support::kms_hook("123456789012");
+    let svc = make_service()
+        .with_kms_hook(hook.clone())
+        .with_secretsmanager(sm.clone(), None);
+    seed_instance(&svc, "db1");
+    let password = |svc: &RdsService| {
+        svc.state.read().default_ref().instances["db1"]
+            .master_user_password
+            .clone()
+    };
+
+    // Rotation needs a managed password.
+    let err = svc
+        .modify_db_instance(&request(
+            "ModifyDBInstance",
+            &[
+                ("DBInstanceIdentifier", "db1"),
+                ("RotateMasterUserPassword", "true"),
+            ],
+        ))
+        .err()
+        .expect("rotation of an unmanaged password");
+    assert_eq!(err.code(), "InvalidParameterCombination");
+
+    // Turn management on.
+    let body = response_text(
+        svc.modify_db_instance(&request(
+            "ModifyDBInstance",
+            &[
+                ("DBInstanceIdentifier", "db1"),
+                ("ManageMasterUserPassword", "true"),
+                ("ApplyImmediately", "false"),
+            ],
+        ))
+        .expect("manage"),
+    );
+    let arn = xml_field(&xml_field(&body, "MasterUserSecret").unwrap(), "SecretArn").unwrap();
+    let value = master_secret_value(&sm, Some(hook.as_ref()), &arn);
+    assert_eq!(value["username"], "admin");
+    assert_eq!(value["password"], password(&svc));
+    assert_eq!(password(&svc).chars().count(), 28);
+
+    // While managed, the password changes only through RDS.
+    let err = svc
+        .modify_db_instance(&request(
+            "ModifyDBInstance",
+            &[
+                ("DBInstanceIdentifier", "db1"),
+                ("MasterUserPassword", "sneaky"),
+            ],
+        ))
+        .err()
+        .expect("MasterUserPassword on a managed instance");
+    assert_eq!(err.code(), "InvalidParameterCombination");
+
+    // Rotate: a new current value, which the instance uses.
+    let before = password(&svc);
+    svc.modify_db_instance(&request(
+        "ModifyDBInstance",
+        &[
+            ("DBInstanceIdentifier", "db1"),
+            ("RotateMasterUserPassword", "true"),
+            ("ApplyImmediately", "true"),
+        ],
+    ))
+    .expect("rotate");
+    assert_ne!(password(&svc), before);
+    let value = master_secret_value(&sm, Some(hook.as_ref()), &arn);
+    assert_eq!(value["password"], password(&svc));
+
+    // Turning management off needs a password; it deletes the secret.
+    let err = svc
+        .modify_db_instance(&request(
+            "ModifyDBInstance",
+            &[
+                ("DBInstanceIdentifier", "db1"),
+                ("ManageMasterUserPassword", "false"),
+            ],
+        ))
+        .err()
+        .expect("password required");
+    assert_eq!(err.code(), "InvalidParameterCombination");
+    let body = response_text(
+        svc.modify_db_instance(&request(
+            "ModifyDBInstance",
+            &[
+                ("DBInstanceIdentifier", "db1"),
+                ("ManageMasterUserPassword", "false"),
+                ("MasterUserPassword", "back-to-mine"),
+                ("ApplyImmediately", "false"),
+            ],
+        ))
+        .expect("unmanage"),
+    );
+    assert!(!body.contains("<MasterUserSecret>"), "{body}");
+    assert_eq!(password(&svc), "back-to-mine");
+    assert!(fakecloud_secretsmanager::value::read_secret_value(
+        &sm,
+        Some(hook.as_ref()),
+        "123456789012",
+        "us-east-1",
+        &arn,
+        None,
+        None
+    )
+    .is_err());
+
+    // Storage autoscaling: set, then off by matching the allocated storage.
+    let allocated = svc.state.read().default_ref().instances["db1"].allocated_storage;
+    let body = response_text(
+        svc.modify_db_instance(&request(
+            "ModifyDBInstance",
+            &[
+                ("DBInstanceIdentifier", "db1"),
+                ("MaxAllocatedStorage", "500"),
+            ],
+        ))
+        .unwrap(),
+    );
+    assert_eq!(
+        xml_field(&body, "MaxAllocatedStorage").as_deref(),
+        Some("500")
+    );
+    let body = response_text(
+        svc.modify_db_instance(&request(
+            "ModifyDBInstance",
+            &[
+                ("DBInstanceIdentifier", "db1"),
+                ("MaxAllocatedStorage", &allocated.to_string()),
+            ],
+        ))
+        .unwrap(),
+    );
+    assert!(!body.contains("<MaxAllocatedStorage>"), "{body}");
+
+    // A managed instance's secret goes with it.
+    svc.modify_db_instance(&request(
+        "ModifyDBInstance",
+        &[
+            ("DBInstanceIdentifier", "db1"),
+            ("ManageMasterUserPassword", "true"),
+        ],
+    ))
+    .expect("manage again");
+    let arn = svc.state.read().default_ref().instances["db1"]
+        .master_user_secret_arn
+        .clone()
+        .unwrap();
+    svc.delete_db_instance(&request(
+        "DeleteDBInstance",
+        &[
+            ("DBInstanceIdentifier", "db1"),
+            ("SkipFinalSnapshot", "true"),
+        ],
+    ))
+    .await
+    .expect("delete");
+    assert!(!sm
+        .read()
+        .regional("123456789012", "us-east-1")
+        .unwrap()
+        .secrets
+        .values()
+        .any(|s| s.arn == arn));
+}

@@ -70,8 +70,6 @@ CRATES=(
   fakecloud-lambda
   fakecloud-logs
   fakecloud-ses
-  fakecloud-rds
-  fakecloud-rds-data        # depends on rds
   fakecloud-dsql
   fakecloud-resource-groups  # only core/persistence/aws deps
   fakecloud-resource-groups-tagging  # only core/persistence/aws deps
@@ -144,6 +142,8 @@ CRATES=(
   # Layer 3b: depend on layer 3a
   fakecloud-sns            # depends on ses
   fakecloud-secretsmanager # depends on iam
+  fakecloud-rds            # depends on ec2, secretsmanager (managed master user secret)
+  fakecloud-rds-data        # depends on rds
   fakecloud-cognito        # depends on iam
   fakecloud-elbv2          # depends on wafv2
   fakecloud-apigatewayv2   # depends on wafv2

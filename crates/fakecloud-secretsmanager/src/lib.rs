@@ -1,3 +1,4 @@
+pub mod managed;
 pub mod rotation;
 pub(crate) mod service;
 pub(crate) mod state;

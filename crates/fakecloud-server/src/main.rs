@@ -431,6 +431,7 @@ async fn main() {
     // into their own SSM / Secrets Manager services below.
     let ssm_state_for_codebuild = ssm_state.clone();
     let secretsmanager_state_for_codebuild = secretsmanager_state.clone();
+    let secretsmanager_state_for_rds = secretsmanager_state.clone();
     let s3_state = Arc::new(parking_lot::RwLock::new(
         fakecloud_core::multi_account::MultiAccountState::new(
             &cli.account_id,
@@ -2349,6 +2350,9 @@ async fn main() {
     if let Some(h) = secretsmanager_service.snapshot_hook() {
         cfn_snapshot_hooks.insert("secretsmanager", h);
     }
+    // RDS writes the master user secrets of ManageMasterUserPassword
+    // instances, and persists them through the same hook.
+    let secretsmanager_snapshot_hook_for_rds = secretsmanager_service.snapshot_hook();
     registry.register(Arc::new(secretsmanager_service));
     // `logs_snapshot_store` + `logs_snapshot_lock` are created earlier (ahead of
     // the EventBridge service/scheduler) so the EventBridge -> Logs delivery can
@@ -3246,7 +3250,11 @@ async fn main() {
         };
     let mut rds_service = RdsService::new(rds_state.clone())
         .with_kms_hook(kms_hook_for_services.clone())
-        .with_ec2_state(ec2_state.clone());
+        .with_ec2_state(ec2_state.clone())
+        .with_secretsmanager(
+            secretsmanager_state_for_rds,
+            secretsmanager_snapshot_hook_for_rds,
+        );
     if let Some(ref rt) = rds_runtime {
         rds_service = rds_service.with_runtime(rt.clone());
     }

@@ -1,9 +1,9 @@
 # Built and pushed on each fakecloud release tag by
-# .github/workflows/docker-rds-images.yml as
-#   ghcr.io/faiscadev/fakecloud-postgres:<major>-<fakecloud-version>
-# (plus a rolling :<major> tag). RdsRuntime::ensure_postgres_image
-# tries to pull that tag first and falls back to building from this
-# Dockerfile locally when the pull fails (dev / unreleased / airgapped).
+# .github/workflows/docker-rds-images.yml. RdsRuntime::ensure_postgres_image
+# uses ghcr.io/faiscadev/fakecloud-postgres:<major>-<fakecloud-version>-<assets>,
+# where <assets> is the content hash of this directory (bridge_image_tag): it
+# reuses or pulls that tag and builds from this Dockerfile locally when the
+# pull fails (dev / unreleased / forks / airgapped).
 # PG_VERSION must sit before the first FROM so its substitution is
 # available there. Do NOT re-declare it inside the postgres stage: that
 # image already sets `ENV PG_VERSION=<major>.<minor>-<n>.pgdg<rel>` (e.g.
@@ -34,10 +34,16 @@ RUN chmod 0755 /usr/local/bin/gosu
 # Trivy flags those as HIGH/CRITICAL even when fixes are available in
 # the same Debian release. Running upgrade keeps the published image
 # clean against the latest debian13 security DB at build time.
+#
+# pg_cron comes from the PGDG repository the base image already uses. As on
+# RDS for PostgreSQL, it needs `pg_cron` in `shared_preload_libraries` (and
+# `cron.database_name` for a database other than `postgres`), set through the
+# instance's DB parameter group.
 RUN apt-get update \
     && apt-get upgrade -y --no-install-recommends \
     && apt-get install -y --no-install-recommends \
         postgresql-plpython3-${PG_MAJOR} \
+        postgresql-${PG_MAJOR}-cron \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
