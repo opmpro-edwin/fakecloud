@@ -459,6 +459,7 @@ impl EcsRuntime {
                 "ECS_CONTAINER_METADATA_URI_V4".into(),
                 format!("{base}/_fakecloud/ecs/v4/{task_id}"),
             ));
+            super::aws_env::push_aws_sdk_env(&mut env, base, &region);
             resolved.push((plan, env));
         }
 

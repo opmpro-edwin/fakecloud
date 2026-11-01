@@ -144,6 +144,7 @@ pub struct EcsRuntime {
         parking_lot::Mutex<std::collections::HashMap<String, Vec<tokio::task::JoinHandle<()>>>>,
 }
 
+mod aws_env;
 mod config;
 pub(crate) mod eni;
 mod k8s;

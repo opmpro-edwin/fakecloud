@@ -61,7 +61,7 @@ Task-definition families track revisions monotonically; `DeleteTaskDefinitions` 
 4. `docker logs <id>` (captured stdout/stderr stored on the task + exposed via the introspection endpoint)
 5. `docker rm <id>` (cleanup)
 
-Environment variables from the task definition are forwarded with `localhost` / `127.0.0.1` rewritten to `host.docker.internal` so containers reach fakecloud itself the same way Lambda does. `ECS_CONTAINER_METADATA_URI` and `ECS_CONTAINER_METADATA_URI_V4` are also injected, pointing at fakecloud's task-metadata endpoint (`/_fakecloud/ecs/v3/{task_id}` and `/_fakecloud/ecs/v4/{task_id}`) so SDKs and sidecars that read task metadata work out of the box.
+Environment variables from the task definition are forwarded with `localhost` / `127.0.0.1` rewritten to `host.docker.internal` so containers reach fakecloud itself the same way Lambda does. `ECS_CONTAINER_METADATA_URI` and `ECS_CONTAINER_METADATA_URI_V4` are also injected, pointing at fakecloud's task-metadata endpoint (`/_fakecloud/ecs/v3/{task_id}` and `/_fakecloud/ecs/v4/{task_id}`) so SDKs and sidecars that read task metadata work out of the box. Each container also gets `AWS_ENDPOINT_URL` (fakecloud's endpoint as the container reaches it, e.g. `http://host.docker.internal:4566`, or `FAKECLOUD_K8S_SELF_URL` on the Kubernetes backend) and `AWS_REGION` / `AWS_DEFAULT_REGION` (the task's region, as Fargate sets them), so an unmodified production task definition calls fakecloud instead of real AWS and finds its region without the instance metadata service. A variable the container definition sets itself (in `environment` or `secrets`) is kept as is.
 
 ### Container definition fidelity
 

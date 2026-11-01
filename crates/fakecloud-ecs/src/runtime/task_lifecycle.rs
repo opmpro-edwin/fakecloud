@@ -89,6 +89,11 @@ impl EcsRuntime {
                     self.server_port, task_id
                 ),
             ));
+            super::aws_env::push_aws_sdk_env(
+                &mut env,
+                &format!("http://{host_alias}:{}", self.server_port),
+                &region,
+            );
             resolved_plans.push(ResolvedContainerPlan { plan, env });
         }
 
