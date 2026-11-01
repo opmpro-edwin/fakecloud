@@ -316,3 +316,63 @@ async fn s3control_tags_errors() {
     let svc = err.into_service_error();
     assert_eq!(svc.meta().code(), Some("InvalidRequest"), "{svc:?}");
 }
+
+/// With a plain custom endpoint (`AWS_ENDPOINT_URL=http://localhost:<port>`)
+/// the SDK sends S3 Control calls to `<account-id>.localhost:<port>` with the
+/// account ID in `x-amz-account-id`, no `s3-control` label. fakecloud must
+/// route them to S3 Control, not read the account label as a virtual-hosted
+/// bucket.
+#[tokio::test]
+async fn s3control_tags_through_a_custom_endpoint_host() {
+    let server = TestServer::start().await;
+    let s3 = server.s3_client().await;
+    let conf = aws_sdk_s3control::config::Builder::from(&server.aws_config().await)
+        .endpoint_url(format!("http://localhost:{}", server.port()))
+        .interceptor(ConnectLocally {
+            port: server.port(),
+        })
+        .build();
+    let control = aws_sdk_s3control::Client::from_conf(conf);
+    s3.create_bucket()
+        .bucket("custom-endpoint-bucket")
+        .send()
+        .await
+        .unwrap();
+    let arn = "arn:aws:s3:::custom-endpoint-bucket";
+
+    control
+        .tag_resource()
+        .account_id(ACCOUNT)
+        .resource_arn(arn)
+        .tags(tag("stack", "local"))
+        .send()
+        .await
+        .expect("TagResource through <account-id>.localhost");
+    let listed = control
+        .list_tags_for_resource()
+        .account_id(ACCOUNT)
+        .resource_arn(arn)
+        .send()
+        .await
+        .expect("ListTagsForResource through <account-id>.localhost");
+    assert_eq!(
+        sorted(listed.tags()),
+        vec![("stack".to_string(), "local".to_string())]
+    );
+    control
+        .untag_resource()
+        .account_id(ACCOUNT)
+        .resource_arn(arn)
+        .tag_keys("stack")
+        .send()
+        .await
+        .expect("UntagResource through <account-id>.localhost");
+    let listed = control
+        .list_tags_for_resource()
+        .account_id(ACCOUNT)
+        .resource_arn(arn)
+        .send()
+        .await
+        .unwrap();
+    assert!(listed.tags().is_empty());
+}

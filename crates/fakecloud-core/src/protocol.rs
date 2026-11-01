@@ -380,16 +380,30 @@ pub fn parse_routing_host(host: &str) -> Option<RoutingHost> {
 /// `s3` handler, so the host is the only thing telling the two apart. The
 /// `s3-control` label must lead the host (after the SDK's account-ID
 /// prefix), so a bucket whose name merely contains `s3-control` stays S3.
+///
+/// With a custom endpoint (`AWS_ENDPOINT_URL=http://<host>:<port>`) the host
+/// has no `s3-control` label: the SDK sends S3 Control calls to
+/// `<account-id>.<host>` and repeats the account ID in `x-amz-account-id`.
+/// A leading 12-digit label equal to that header is S3 Control too; S3 data
+/// plane requests never carry the header, so a bucket named like an account
+/// ID is still virtual-hosted S3.
 pub fn is_s3_control_host(headers: &HeaderMap) -> bool {
     let Some(host) = headers.get("host").and_then(|v| v.to_str().ok()) else {
         return false;
     };
     let hostname = host.split(':').next().unwrap_or("").to_ascii_lowercase();
     let labels: Vec<&str> = hostname.split('.').collect();
+    let is_account_id =
+        |label: &str| label.len() == 12 && label.bytes().all(|b| b.is_ascii_digit());
     let control_label = match labels.as_slice() {
         ["s3-control", ..] => true,
-        [account, "s3-control", ..] => {
-            account.len() == 12 && account.bytes().all(|b| b.is_ascii_digit())
+        [account, "s3-control", ..] => is_account_id(account),
+        [account, _, ..] => {
+            is_account_id(account)
+                && headers
+                    .get("x-amz-account-id")
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|id| id.trim() == *account)
         }
         _ => false,
     };
@@ -1091,6 +1105,40 @@ mod tests {
         ));
         assert!(!is_control("a.s3-control.b.s3.us-east-1.amazonaws.com"));
         assert!(!is_control("localhost:4566"));
+    }
+
+    /// A custom endpoint host carries no `s3-control` label: the SDK prefixes
+    /// it with the account ID and sends the same ID in `x-amz-account-id`.
+    #[test]
+    fn s3_control_on_a_custom_endpoint_is_the_account_label_plus_header() {
+        let is_control = |host: &str, account_header: Option<&str>| {
+            let mut headers = HeaderMap::new();
+            headers.insert("host", host.parse().unwrap());
+            if let Some(id) = account_header {
+                headers.insert("x-amz-account-id", id.parse().unwrap());
+            }
+            is_s3_control_host(&headers)
+        };
+        assert!(is_control(
+            "111122223333.host.docker.internal:14566",
+            Some("111122223333")
+        ));
+        assert!(is_control(
+            "123456789012.localhost:4566",
+            Some("123456789012")
+        ));
+        // Without the header, or with another account, it is not S3 Control.
+        assert!(!is_control("111122223333.host.docker.internal:14566", None));
+        assert!(!is_control(
+            "111122223333.host.docker.internal:14566",
+            Some("444455556666")
+        ));
+        // A virtual-hosted bucket named like an account ID stays S3.
+        assert!(!is_control(
+            "111122223333.s3.us-east-1.amazonaws.com",
+            Some("111122223333")
+        ));
+        assert!(!is_control("localhost:4566", Some("111122223333")));
     }
 
     #[test]
