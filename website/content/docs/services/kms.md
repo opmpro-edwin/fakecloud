@@ -17,6 +17,7 @@ fakecloud implements **54 of 54** KMS operations at 100% Smithy conformance.
 - **Grants** — CreateGrant, RetireGrant, RevokeGrant, ListGrants
 - **Key rotation** — automatic rotation flag (tracked), on-demand rotation
 - **Key policies** — PutKeyPolicy, GetKeyPolicy, ListKeyPolicies
+- **IAM conditions** — under `--iam strict`, policies can gate the cryptographic operations on `kms:EncryptionContext:<key>` and `kms:EncryptionContextKeys` (from the request's encryption context; `ReEncrypt` checks `kms:ReEncryptFrom` against the source context and `kms:ReEncryptTo` against the destination context) and on `kms:CallerAccount`. A `Decrypt` without `KeyId` is authorized on the key the ciphertext records. See [security](/docs/reference/security/)
 - **Tags** — on keys
 - **Real ECDH** — DeriveSharedSecret performs actual Elliptic Curve Diffie-Hellman
 - **Key import** — GetParametersForImport, ImportKeyMaterial with real key material handling

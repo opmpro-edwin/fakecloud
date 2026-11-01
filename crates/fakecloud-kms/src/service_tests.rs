@@ -4438,3 +4438,117 @@ fn key_usage_source_counts_customer_keys_per_region() {
         Some(0.0)
     );
 }
+
+/// The encryption context of a request gives `kms:EncryptionContext:<key>`
+/// (name lowercase, AWS treats it case-insensitively; value as given) and
+/// the multi-valued `kms:EncryptionContextKeys`; no context gives neither.
+#[test]
+fn encryption_context_condition_keys_from_the_context() {
+    let keys = encryption_context_condition_keys(&json!({
+        "connection": "tenant-a",
+        "Department": "Finance"
+    }));
+    assert_eq!(
+        keys.get("kms:encryptioncontext:connection"),
+        Some(&vec!["tenant-a".to_string()])
+    );
+    assert_eq!(
+        keys.get("kms:encryptioncontext:department"),
+        Some(&vec!["Finance".to_string()])
+    );
+    let mut context_keys = keys["kms:encryptioncontextkeys"].clone();
+    context_keys.sort();
+    assert_eq!(context_keys, vec!["Department", "connection"]);
+    assert!(encryption_context_condition_keys(&json!({})).is_empty());
+    assert!(encryption_context_condition_keys(&Value::Null).is_empty());
+}
+
+/// The cryptographic operations carry their encryption context as condition
+/// keys; Decrypt without a KeyId is authorized on the key the ciphertext
+/// records; ReEncrypt is `ReEncryptFrom` (source key, source context) plus
+/// `ReEncryptTo` (destination key, destination context); every request
+/// carries `kms:CallerAccount`.
+#[test]
+fn crypto_operations_expose_encryption_context_condition_keys() {
+    let svc = make_service();
+    let key = create_key(&svc);
+    let other = create_key(&svc);
+    let key_arn = format!("arn:aws:kms:us-east-1:123456789012:key/{key}");
+    let other_arn = format!("arn:aws:kms:us-east-1:123456789012:key/{other}");
+    let context = json!({"connection": "tenant-a"});
+
+    let encrypt = make_request(
+        "Encrypt",
+        json!({"KeyId": key, "Plaintext": "aGVsbG8=", "EncryptionContext": context}),
+    );
+    let actions = svc.iam_actions_for(&encrypt);
+    assert_eq!(actions.len(), 1);
+    let keys = svc.iam_condition_keys_for(&encrypt, &actions[0]);
+    assert_eq!(
+        keys.get("kms:encryptioncontext:connection"),
+        Some(&vec!["tenant-a".to_string()])
+    );
+    assert_eq!(
+        keys.get("kms:calleraccount"),
+        Some(&vec!["123456789012".to_string()])
+    );
+    let blob: Value =
+        serde_json::from_slice(svc.encrypt(&encrypt).unwrap().body.expect_bytes()).unwrap();
+    let blob = blob["CiphertextBlob"].as_str().unwrap().to_string();
+
+    // Decrypt without KeyId: the ciphertext's key is the resource.
+    let decrypt = make_request(
+        "Decrypt",
+        json!({"CiphertextBlob": blob, "EncryptionContext": context}),
+    );
+    let actions = svc.iam_actions_for(&decrypt);
+    assert_eq!(actions[0].action, "Decrypt");
+    assert_eq!(actions[0].resource, key_arn);
+    let keys = svc.iam_condition_keys_for(&decrypt, &actions[0]);
+    assert_eq!(
+        keys.get("kms:encryptioncontextkeys"),
+        Some(&vec!["connection".to_string()])
+    );
+    // No context: no context keys.
+    let bare = make_request("Decrypt", json!({"CiphertextBlob": blob}));
+    let keys = svc.iam_condition_keys_for(&bare, &svc.iam_actions_for(&bare)[0]);
+    assert!(!keys.contains_key("kms:encryptioncontext:connection"));
+    assert!(!keys.contains_key("kms:encryptioncontextkeys"));
+
+    let reencrypt = make_request(
+        "ReEncrypt",
+        json!({
+            "CiphertextBlob": blob,
+            "SourceEncryptionContext": context,
+            "DestinationKeyId": other,
+            "DestinationEncryptionContext": {"connection": "tenant-b"}
+        }),
+    );
+    let actions = svc.iam_actions_for(&reencrypt);
+    let names: Vec<(&str, &str)> = actions
+        .iter()
+        .map(|a| (a.action, a.resource.as_str()))
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            ("ReEncryptFrom", key_arn.as_str()),
+            ("ReEncryptTo", other_arn.as_str())
+        ]
+    );
+    let from = svc.iam_condition_keys_for(&reencrypt, &actions[0]);
+    let to = svc.iam_condition_keys_for(&reencrypt, &actions[1]);
+    assert_eq!(
+        from.get("kms:encryptioncontext:connection"),
+        Some(&vec!["tenant-a".to_string()])
+    );
+    assert_eq!(
+        to.get("kms:encryptioncontext:connection"),
+        Some(&vec!["tenant-b".to_string()])
+    );
+
+    // Operations without an encryption context get only kms:CallerAccount.
+    let describe = make_request("DescribeKey", json!({"KeyId": key}));
+    let keys = svc.iam_condition_keys_for(&describe, &svc.iam_actions_for(&describe)[0]);
+    assert_eq!(keys.keys().collect::<Vec<_>>(), vec!["kms:calleraccount"]);
+}

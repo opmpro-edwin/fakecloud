@@ -117,6 +117,25 @@ pub fn decode(master_key_bytes: &[u8], blob: &[u8]) -> Option<Decoded> {
 }
 
 /// Variant of [`decode`] that mixes additional bytes into the AEAD AAD
+/// The key id recorded in a blob's header, read without decrypting it, or
+/// `None` for bytes that aren't a fakecloud blob. Authorization uses it: AWS
+/// authorizes `Decrypt` / `ReEncrypt` against the key that produced the
+/// ciphertext.
+pub fn peek_key_id(blob: &[u8]) -> Option<String> {
+    let header = VERSION_HEADER.len();
+    if blob.len() < header + 8 || blob[..header] != VERSION_HEADER {
+        return None;
+    }
+    let key_len = u64::from_be_bytes(blob[header..header + 8].try_into().ok()?) as usize;
+    let start = header + 8;
+    if key_len > blob.len().saturating_sub(start) {
+        return None;
+    }
+    std::str::from_utf8(&blob[start..start + key_len])
+        .ok()
+        .map(str::to_string)
+}
+
 /// during verification. Returns `None` when the supplied `extra_aad`
 /// doesn't match what was passed to [`encode_with_context`] at encrypt
 /// time — the caller surfaces this as `InvalidCiphertextException`,
@@ -208,6 +227,16 @@ mod tests {
         let decoded = decode(&mk, &blob).unwrap();
         assert_eq!(decoded.plaintext, plaintext);
         assert_eq!(decoded.key_id, "alias/my-key");
+    }
+
+    #[test]
+    fn peek_key_id_reads_the_header_only() {
+        let blob = encode_with_context(&fixed_master(), "key-123", b"pt", b"{\"a\":\"b\"}");
+        assert_eq!(peek_key_id(&blob).as_deref(), Some("key-123"));
+        assert_eq!(peek_key_id(b"not a blob at all"), None);
+        let mut hostile = VERSION_HEADER.to_vec();
+        hostile.extend_from_slice(&u64::MAX.to_be_bytes());
+        assert_eq!(peek_key_id(&hostile), None);
     }
 
     #[test]

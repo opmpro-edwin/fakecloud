@@ -317,13 +317,85 @@ impl AwsService for KmsService {
     }
 
     fn iam_action_for(&self, request: &AwsRequest) -> Option<fakecloud_core::auth::IamAction> {
-        let action = KMS_ACTIONS.iter().copied().find(|a| *a == request.action)?;
-        let resource = kms_resource_for(action, &self.state, request);
-        Some(fakecloud_core::auth::IamAction {
+        self.iam_actions_for(request).into_iter().next()
+    }
+
+    /// One authorization per operation, except `ReEncrypt`, which AWS
+    /// authorizes as two IAM actions: `kms:ReEncryptFrom` on the key that
+    /// produced the ciphertext (`SourceKeyId`, else the one recorded in
+    /// `CiphertextBlob`) and `kms:ReEncryptTo` on `DestinationKeyId`.
+    fn iam_actions_for(&self, request: &AwsRequest) -> Vec<fakecloud_core::auth::IamAction> {
+        let Some(action) = KMS_ACTIONS.iter().copied().find(|a| *a == request.action) else {
+            return Vec::new();
+        };
+        if action == "ReEncrypt" {
+            let body = request.json_body();
+            let source = body["SourceKeyId"]
+                .as_str()
+                .filter(|k| !k.is_empty())
+                .and_then(|k| named_key_arn(&self.state, request, k))
+                .or_else(|| {
+                    body["CiphertextBlob"]
+                        .as_str()
+                        .and_then(|blob| ciphertext_key_arn(&self.state, request, blob))
+                })
+                .unwrap_or_else(|| "*".to_string());
+            let destination = body["DestinationKeyId"]
+                .as_str()
+                .and_then(|k| named_key_arn(&self.state, request, k))
+                .unwrap_or_else(|| "*".to_string());
+            return vec![
+                fakecloud_core::auth::IamAction {
+                    service: "kms",
+                    action: "ReEncryptFrom",
+                    resource: source,
+                },
+                fakecloud_core::auth::IamAction {
+                    service: "kms",
+                    action: "ReEncryptTo",
+                    resource: destination,
+                },
+            ];
+        }
+        vec![fakecloud_core::auth::IamAction {
             service: "kms",
             action,
-            resource,
-        })
+            resource: kms_resource_for(action, &self.state, request),
+        }]
+    }
+
+    /// `kms:CallerAccount` on every request, and for the cryptographic
+    /// operations the encryption-context keys (see
+    /// [`encryption_context_condition_keys`]): `ReEncryptFrom` is evaluated
+    /// against the source context and `ReEncryptTo` against the destination
+    /// context, as on AWS.
+    fn iam_condition_keys_for(
+        &self,
+        request: &AwsRequest,
+        action: &fakecloud_core::auth::IamAction,
+    ) -> BTreeMap<String, Vec<String>> {
+        let context_field = match action.action {
+            "Encrypt"
+            | "Decrypt"
+            | "GenerateDataKey"
+            | "GenerateDataKeyWithoutPlaintext"
+            | "GenerateDataKeyPair"
+            | "GenerateDataKeyPairWithoutPlaintext" => Some("EncryptionContext"),
+            "ReEncryptFrom" => Some("SourceEncryptionContext"),
+            "ReEncryptTo" => Some("DestinationEncryptionContext"),
+            _ => None,
+        };
+        let mut keys = match context_field {
+            Some(field) => encryption_context_condition_keys(&request.json_body()[field]),
+            None => BTreeMap::new(),
+        };
+        let caller_account = request
+            .principal
+            .as_ref()
+            .map(|p| p.account_id.clone())
+            .unwrap_or_else(|| request.account_id.clone());
+        keys.insert("kms:calleraccount".to_string(), vec![caller_account]);
+        keys
     }
 
     fn resource_tags_for(

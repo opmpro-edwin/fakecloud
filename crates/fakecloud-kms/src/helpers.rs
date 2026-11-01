@@ -269,8 +269,18 @@ pub(crate) fn kms_resource_for(
         return "*".to_string();
     }
 
-    // All remaining operations carry a KeyId parameter.
+    // All remaining operations carry a KeyId parameter, except Decrypt,
+    // where it is optional: AWS authorizes a Decrypt against the key that
+    // produced the ciphertext.
     let body = request.json_body();
+    if action == "Decrypt" && body["KeyId"].as_str().is_none_or(str::is_empty) {
+        if let Some(arn) = body["CiphertextBlob"]
+            .as_str()
+            .and_then(|blob| ciphertext_key_arn(state, request, blob))
+        {
+            return arn;
+        }
+    }
     if let Some(key_id_input) = body["KeyId"].as_str() {
         let accts = state.read();
         let empty = KmsState::new(&request.account_id, &request.region);
@@ -287,6 +297,85 @@ pub(crate) fn kms_resource_for(
     // will return NotFoundException anyway; this avoids blocking the
     // request at the IAM layer with a confusing error.
     "*".to_string()
+}
+
+/// The ARN of the key `key_id_input` (key id, key ARN, alias name or alias
+/// ARN) names in the caller's account, if it exists.
+pub(crate) fn named_key_arn(
+    state: &SharedKmsState,
+    request: &AwsRequest,
+    key_id_input: &str,
+) -> Option<String> {
+    let accts = state.read();
+    let s = accts.get(&request.account_id)?;
+    let key_id = KmsService::resolve_key_id_with_state(s, &request.region, key_id_input)?;
+    s.keys.get(&key_id).map(|k| k.arn.clone())
+}
+
+/// The ARN of the key that produced `ciphertext_b64`, read from the
+/// ciphertext's header (or a legacy textual envelope) without decrypting
+/// it. The key is looked up in the caller's account first, then in any
+/// account (key ids are unique). `None` when the ciphertext names no known
+/// key.
+pub(crate) fn ciphertext_key_arn(
+    state: &SharedKmsState,
+    request: &AwsRequest,
+    ciphertext_b64: &str,
+) -> Option<String> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(ciphertext_b64)
+        .ok()?;
+    let key_id = crate::blob::peek_key_id(&bytes).or_else(|| {
+        let text = std::str::from_utf8(&bytes).ok()?;
+        let rest = text
+            .strip_prefix(FAKE_ENVELOPE_PREFIX)
+            .or_else(|| text.strip_prefix(IMPORTED_ENVELOPE_PREFIX))?;
+        rest.split_once(':').map(|(key, _)| key.to_string())
+    })?;
+    let accts = state.read();
+    if let Some(key) = accts
+        .get(&request.account_id)
+        .and_then(|s| s.keys.get(&key_id))
+    {
+        return Some(key.arn.clone());
+    }
+    let other = accts
+        .iter()
+        .find_map(|(_, s)| s.keys.get(&key_id).map(|k| k.arn.clone()));
+    other
+}
+
+/// IAM condition keys of a request's encryption context (`value`, the
+/// request's `EncryptionContext` / `SourceEncryptionContext` /
+/// `DestinationEncryptionContext` map):
+///
+/// - `kms:EncryptionContext:<context-key>` per pair. AWS treats the whole
+///   condition key name as case-insensitive, the context-key part included,
+///   so it is emitted lowercase; the value keeps its case (the condition
+///   operator decides how it compares).
+/// - `kms:EncryptionContextKeys`, the context keys as given (multi-valued).
+///
+/// A request without an encryption context gets neither key, so a
+/// condition on them does not match it.
+pub(crate) fn encryption_context_condition_keys(
+    value: &serde_json::Value,
+) -> BTreeMap<String, Vec<String>> {
+    let mut keys: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let Some(context) = value.as_object().filter(|c| !c.is_empty()) else {
+        return keys;
+    };
+    let mut context_keys = Vec::with_capacity(context.len());
+    for (k, v) in context {
+        let Some(v) = v.as_str() else { continue };
+        keys.entry(format!("kms:encryptioncontext:{}", k.to_lowercase()))
+            .or_default()
+            .push(v.to_string());
+        context_keys.push(k.clone());
+    }
+    if !context_keys.is_empty() {
+        keys.insert("kms:encryptioncontextkeys".to_string(), context_keys);
+    }
+    keys
 }
 
 /// The policy a key gets when created without one; `key_arn` supplies the
