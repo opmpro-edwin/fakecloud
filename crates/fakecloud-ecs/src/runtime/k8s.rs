@@ -769,20 +769,14 @@ impl EcsRuntime {
             }
         }
 
-        // A StopTask sets stopCode=UserInitiated + a reason before the
-        // runtime observes the Pod deletion. Preserve that user-initiated
-        // stop instead of overwriting it with EssentialContainerExited.
+        // A StopTask (UserInitiated) or a service scheduler stop
+        // (ServiceSchedulerInitiated) sets the stop code + a reason before the
+        // runtime observes the Pod deletion. Preserve that requested stop
+        // instead of overwriting it with EssentialContainerExited.
         let (final_stop_code, final_reason): (&str, Option<String>) = if stopped_externally {
-            let existing = {
-                let accounts = state.read();
-                accounts
-                    .get(account_id)
-                    .and_then(|s| s.tasks.get(task_id))
-                    .map(|t| (t.stop_code.clone(), t.stopped_reason.clone()))
-            };
-            match existing {
-                Some((Some(sc), reason)) if sc == "UserInitiated" => ("UserInitiated", reason),
-                _ => (stop_code, None),
+            match super::requested_stop(state, account_id, task_id) {
+                Some((code, reason)) => (code, reason),
+                None => (stop_code, None),
             }
         } else {
             (stop_code, None)

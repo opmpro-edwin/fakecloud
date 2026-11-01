@@ -339,6 +339,27 @@ pub trait Elbv2TargetRegistration: Send + Sync {
         target_group_arn: &str,
         targets: Vec<(String, Option<i64>)>,
     );
+    /// Health of a registered target as the target group's health checks
+    /// last reported it, or `None` when the target group or the target is
+    /// unknown. The ECS service scheduler reads it to decide whether a task
+    /// counts as healthy during a deployment.
+    fn target_health(
+        &self,
+        account_id: &str,
+        target_group_arn: &str,
+        target_id: &str,
+        port: Option<i64>,
+    ) -> Option<TargetHealthView>;
+}
+
+/// The health of one target in a target group, in DescribeTargetHealth terms.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetHealthView {
+    /// `initial`, `healthy`, `unhealthy`, `unused`, `draining` or
+    /// `unavailable` (health checks are turned off for the target group).
+    pub state: String,
+    pub reason: Option<String>,
+    pub description: Option<String>,
 }
 
 /// A requester-managed network interface EC2 created for a task.
@@ -812,6 +833,29 @@ impl DeliveryBus {
         if let Some(ref reg) = self.elbv2_target_registration {
             reg.deregister_targets(account_id, target_group_arn, targets);
         }
+    }
+
+    /// Whether an ELBv2 target registration hook is wired, i.e. whether
+    /// [`Self::elbv2_target_health`] can answer at all.
+    pub fn has_elbv2_target_registration(&self) -> bool {
+        self.elbv2_target_registration.is_some()
+    }
+
+    /// Health of a target in an ELBv2 target group. `None` when no ELBv2
+    /// hook is wired or the target group or target is unknown.
+    pub fn elbv2_target_health(
+        &self,
+        account_id: &str,
+        target_group_arn: &str,
+        target_id: &str,
+        port: Option<i64>,
+    ) -> Option<TargetHealthView> {
+        self.elbv2_target_registration.as_ref()?.target_health(
+            account_id,
+            target_group_arn,
+            target_id,
+            port,
+        )
     }
 
     /// Send an email via SES. Returns `Err` when no SES dispatcher is

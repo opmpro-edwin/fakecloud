@@ -1,5 +1,6 @@
 pub mod cfn_provision;
 pub(crate) mod placement;
+pub(crate) mod rollout;
 pub mod runtime;
 pub(crate) mod service;
 pub(crate) mod state;

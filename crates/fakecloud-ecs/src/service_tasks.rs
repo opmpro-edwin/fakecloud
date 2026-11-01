@@ -372,6 +372,9 @@ impl EcsService {
                 ),
                 volume_configurations: volume_configurations.clone(),
                 task_set_arn: None,
+                deployment_id: None,
+                healthy_at: None,
+                stop_accounted: false,
             };
             // Placement. StartTask targets the caller's explicit container
             // instances (one per task); RunTask picks by strategy. Either way we
@@ -989,6 +992,9 @@ pub(super) mod multi_container_tests {
             attachments: Vec::new(),
             volume_configurations: Vec::new(),
             task_set_arn: None,
+            deployment_id: None,
+            healthy_at: None,
+            stop_accounted: false,
         };
         acct.tasks.insert(id.into(), task);
     }
@@ -1365,6 +1371,9 @@ pub(super) mod multi_container_tests {
             attachments: Vec::new(),
             volume_configurations: Vec::new(),
             task_set_arn: None,
+            deployment_id: None,
+            healthy_at: None,
+            stop_accounted: false,
         };
         for name in ["app", "sidecar"] {
             task.containers.push(Container {
@@ -1685,6 +1694,9 @@ mod port_mapping_tests {
             attachments: Vec::new(),
             volume_configurations: Vec::new(),
             task_set_arn: None,
+            deployment_id: None,
+            healthy_at: None,
+            stop_accounted: false,
         };
         task.last_status = "PENDING".into();
         acct.tasks.insert("abc".into(), task);

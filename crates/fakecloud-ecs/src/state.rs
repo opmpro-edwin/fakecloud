@@ -102,6 +102,10 @@ pub struct EcsState {
     /// real configuration snapshot instead of an empty stub.
     #[serde(default)]
     pub service_revisions: BTreeMap<String, ServiceRevision>,
+    /// Service scheduler events (DescribeServices `events`) keyed by
+    /// service ARN.
+    #[serde(default)]
+    pub service_events: BTreeMap<String, ServiceEventLog>,
 }
 
 /// A point-in-time snapshot of a service's configuration, addressable by
@@ -159,6 +163,7 @@ impl EcsState {
             daemon_deployments: BTreeMap::new(),
             express_gateway_services: BTreeMap::new(),
             service_revisions: BTreeMap::new(),
+            service_events: BTreeMap::new(),
         }
     }
 
@@ -181,6 +186,25 @@ impl EcsState {
         self.daemon_deployments.clear();
         self.express_gateway_services.clear();
         self.service_revisions.clear();
+        self.service_events.clear();
+    }
+
+    /// Append a service event, dropping the oldest past
+    /// [`MAX_SERVICE_EVENTS`].
+    pub fn push_service_event(&mut self, service_arn: &str, at: DateTime<Utc>, message: String) {
+        let log = self
+            .service_events
+            .entry(service_arn.to_string())
+            .or_default();
+        log.events.push(ServiceEvent {
+            id: uuid::Uuid::new_v4().to_string(),
+            created_at: at,
+            message,
+        });
+        if log.events.len() > MAX_SERVICE_EVENTS {
+            let excess = log.events.len() - MAX_SERVICE_EVENTS;
+            log.events.drain(0..excess);
+        }
     }
 
     /// Mint and store a new service revision for `service`, numbered by how
@@ -553,6 +577,18 @@ pub struct Task {
     /// by a service using the CODE_DEPLOY deployment controller.
     #[serde(default)]
     pub task_set_arn: Option<String>,
+    /// Service deployment (`ecs-svc/...`) that launched this task, for a
+    /// service using the rolling-update (`ECS`) deployment controller.
+    #[serde(default)]
+    pub deployment_id: Option<String>,
+    /// When the service scheduler first saw this task healthy: RUNNING and
+    /// passing its container and load-balancer health checks.
+    #[serde(default)]
+    pub healthy_at: Option<DateTime<Utc>>,
+    /// The service scheduler has accounted for this task stopping (counted
+    /// a deployment failure or not). Keeps a stop from being counted twice.
+    #[serde(default)]
+    pub stop_accounted: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -749,6 +785,30 @@ pub struct Deployment {
     /// paused on a hook.
     #[serde(default)]
     pub lifecycle_stage: Option<String>,
+    /// Started by the deployment circuit breaker to roll back a failed
+    /// deployment. A rollback that fails in turn is not rolled back again.
+    #[serde(default)]
+    pub is_rollback: bool,
+    /// Consecutive tasks of this deployment that stopped before they were
+    /// ever healthy. Drives the launch back-off (service throttle logic).
+    #[serde(default)]
+    pub throttle_failures: i32,
+    /// No new task is launched for this deployment before this instant
+    /// while its launches are throttled.
+    #[serde(default)]
+    pub next_launch_at: Option<DateTime<Utc>>,
+    /// The "unable to consistently start tasks" service event was sent for
+    /// the current run of failures.
+    #[serde(default)]
+    pub throttle_reported: bool,
+    /// The last failure counted in `failed_tasks` was a health check
+    /// replacement rather than a task that failed to start.
+    #[serde(default)]
+    pub last_failure_health_check: bool,
+    /// The "unable to stop or start tasks ... because of the service
+    /// deployment configuration" service event was sent.
+    #[serde(default)]
+    pub config_stuck_reported: bool,
 }
 
 impl Deployment {
@@ -765,6 +825,10 @@ impl Deployment {
         let pause_hook = lifecycle_hooks
             .iter()
             .find(|h| h.get("targetType").and_then(|v| v.as_str()) == Some("PAUSE"));
+        let deployment_id = format!(
+            "ecs-svc/{}",
+            uuid::Uuid::new_v4().as_u128() & 0xffff_ffff_ffff_ffff
+        );
         let (pending_hook_id, lifecycle_stage, rollout_reason) = match pause_hook {
             Some(hook) => {
                 let hook_id = format!("hook-{}", uuid::Uuid::new_v4().simple());
@@ -781,14 +845,15 @@ impl Deployment {
                         .to_string(),
                 )
             }
-            None => (None, None, "ECS deployment in progress.".to_string()),
+            None => (
+                None,
+                None,
+                format!("ECS deployment {deployment_id} in progress."),
+            ),
         };
         let now = Utc::now();
         Deployment {
-            deployment_id: format!(
-                "ecs-svc/{}",
-                uuid::Uuid::new_v4().as_u128() & 0xffff_ffff_ffff_ffff
-            ),
+            deployment_id,
             status: "PRIMARY".into(),
             task_definition_arn: task_definition_arn.to_string(),
             desired_count,
@@ -803,9 +868,37 @@ impl Deployment {
             lifecycle_hooks: lifecycle_hooks.to_vec(),
             pending_hook_id,
             lifecycle_stage,
+            is_rollback: false,
+            throttle_failures: 0,
+            next_launch_at: None,
+            throttle_reported: false,
+            last_failure_health_check: false,
+            config_stuck_reported: false,
         }
     }
 }
+
+/// One entry of a service's `events` list on DescribeServices.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ServiceEvent {
+    pub id: String,
+    pub created_at: DateTime<Utc>,
+    pub message: String,
+}
+
+/// The service scheduler's event log for one service, oldest first.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ServiceEventLog {
+    pub events: Vec<ServiceEvent>,
+    /// The service was at steady state the last time the scheduler looked,
+    /// so "has reached a steady state" is sent once per transition.
+    #[serde(default)]
+    pub steady: bool,
+}
+
+/// DescribeServices returns at most this many of a service's most recent
+/// events; older ones are dropped.
+pub const MAX_SERVICE_EVENTS: usize = 100;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ContainerInstance {

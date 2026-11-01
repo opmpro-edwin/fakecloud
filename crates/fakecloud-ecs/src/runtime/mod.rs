@@ -1969,6 +1969,28 @@ fn finalize_stopped_multi(
     });
 }
 
+/// The stop code and reason an explicit stop left on a task: StopTask
+/// (`UserInitiated`) or the service scheduler (`ServiceSchedulerInitiated`).
+/// The STOPPED transition keeps them, as ECS does, instead of reporting the
+/// container exit the stop caused.
+pub(crate) fn requested_stop(
+    state: &SharedEcsState,
+    account_id: &str,
+    task_id: &str,
+) -> Option<(&'static str, Option<String>)> {
+    let accounts = state.read();
+    let task = accounts.get(account_id)?.tasks.get(task_id)?;
+    if task.desired_status != "STOPPED" {
+        return None;
+    }
+    let code = match task.stop_code.as_deref()? {
+        "UserInitiated" => "UserInitiated",
+        "ServiceSchedulerInitiated" => "ServiceSchedulerInitiated",
+        _ => return None,
+    };
+    Some((code, task.stopped_reason.clone()))
+}
+
 fn finalize_failure(state: &SharedEcsState, account_id: &str, task_id: &str, reason: &str) {
     let mut accounts = state.write();
     let Some(s) = accounts.get_mut(account_id) else {
@@ -2280,6 +2302,9 @@ mod tests {
             attachments: Vec::new(),
             volume_configurations: Vec::new(),
             task_set_arn: None,
+            deployment_id: None,
+            healthy_at: None,
+            stop_accounted: false,
         }
     }
 

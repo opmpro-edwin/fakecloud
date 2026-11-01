@@ -260,10 +260,13 @@ impl fakecloud_core::delivery::Elbv2TargetRegistration for Elbv2TargetRegistrati
                 id,
                 port: port.map(|p| p as i32),
                 availability_zone: None,
-                health: fakecloud_elbv2::TargetHealth {
-                    state: "initial".into(),
-                    reason: None,
-                    description: None,
+                // Same as RegisterTargets: `initial` until the prober has
+                // seen enough passing checks, or healthy outright when health
+                // probes are turned off (nothing would ever move it on).
+                health: if fakecloud_elbv2::prober::probes_enabled() {
+                    fakecloud_elbv2::TargetHealth::initial()
+                } else {
+                    fakecloud_elbv2::TargetHealth::default()
                 },
                 consecutive_success: 0,
                 consecutive_failure: 0,
@@ -286,6 +289,37 @@ impl fakecloud_core::delivery::Elbv2TargetRegistration for Elbv2TargetRegistrati
         for (id, _port) in targets {
             tg.targets.retain(|t| t.id != id);
         }
+    }
+
+    fn target_health(
+        &self,
+        account_id: &str,
+        target_group_arn: &str,
+        target_id: &str,
+        port: Option<i64>,
+    ) -> Option<fakecloud_core::delivery::TargetHealthView> {
+        let accounts = self.state.read();
+        let tg = accounts
+            .get(account_id)?
+            .target_groups
+            .get(target_group_arn)?;
+        let port = port.map(|p| p as i32);
+        let target = tg
+            .targets
+            .iter()
+            .find(|t| t.id == target_id && (port.is_none() || t.port == port))?;
+        if !tg.health_check_enabled {
+            return Some(fakecloud_core::delivery::TargetHealthView {
+                state: "unavailable".into(),
+                reason: Some("Target.HealthCheckDisabled".into()),
+                description: Some("Health checks disabled".into()),
+            });
+        }
+        Some(fakecloud_core::delivery::TargetHealthView {
+            state: target.health.state.clone(),
+            reason: target.health.reason.clone(),
+            description: target.health.description.clone(),
+        })
     }
 }
 

@@ -409,6 +409,11 @@ impl EcsRuntime {
                     ..rc.clone()
                 })
                 .collect();
+            let (stop_code, reason) = match requested_stop(state, account_id, task_id) {
+                Some((code, Some(reason))) => (code, reason),
+                Some((code, None)) => (code, "Task stopped during launch".to_string()),
+                None => ("UserInitiated", "Task stopped during launch".to_string()),
+            };
             finalize_stopped_multi(
                 state,
                 account_id,
@@ -416,8 +421,8 @@ impl EcsRuntime {
                 &stopped,
                 137,
                 "",
-                "UserInitiated",
-                Some("Task stopped during launch".into()),
+                stop_code,
+                Some(reason.clone()),
             );
             self.deregister_lb_targets(state, account_id, task_id);
             self.emit_state_change(
@@ -425,7 +430,7 @@ impl EcsRuntime {
                 account_id,
                 task_id,
                 "STOPPED",
-                Some(("UserInitiated", "Task stopped during launch".into())),
+                Some((stop_code, reason)),
             );
             self.persist_snapshot().await;
             return Ok(());
@@ -562,6 +567,13 @@ impl EcsRuntime {
         // the awslogs group/stream has been materialised.
         self.forward_awslogs_if_configured(state, account_id, task_id, &captured);
         let exit_code = wait_outcome.exit_code;
+        // A task stopped by StopTask or the service scheduler keeps that stop
+        // code and reason; one whose essential container exited on its own
+        // reports the exit.
+        let (stop_code, stopped_reason) = match requested_stop(state, account_id, task_id) {
+            Some((code, reason)) => (code, reason),
+            None => (wait_outcome.stop_code, None),
+        };
         finalize_stopped_multi(
             state,
             account_id,
@@ -569,8 +581,8 @@ impl EcsRuntime {
             &final_containers,
             exit_code,
             &captured,
-            wait_outcome.stop_code,
-            None,
+            stop_code,
+            stopped_reason.clone(),
         );
         self.deregister_lb_targets(state, account_id, task_id);
         self.emit_state_change(
@@ -578,7 +590,10 @@ impl EcsRuntime {
             account_id,
             task_id,
             "STOPPED",
-            Some((wait_outcome.stop_code, format!("Exit code {}", exit_code))),
+            Some((
+                stop_code,
+                stopped_reason.unwrap_or_else(|| format!("Exit code {}", exit_code)),
+            )),
         );
         // Persist the terminal STOPPED transition + captured exit codes so a
         // restart reflects the completed task instead of a stale RUNNING row.

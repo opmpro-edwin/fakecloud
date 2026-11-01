@@ -627,6 +627,154 @@ mod scheduler_reconcile {
             .unwrap_or(false));
     }
 
+    fn json_of(resp: AwsResponse) -> Value {
+        serde_json::from_slice(resp.body.expect_bytes()).unwrap()
+    }
+
+    fn service_with_breaker(svc: &EcsService, desired: i32) {
+        svc.create_cluster(&ecs_request("CreateCluster", json!({"clusterName": "c1"})))
+            .unwrap();
+        for _ in 0..2 {
+            svc.register_task_definition(&ecs_request(
+                "RegisterTaskDefinition",
+                json!({
+                    "family": "web",
+                    "containerDefinitions": [{"name": "app", "image": "nginx", "essential": true}]
+                }),
+            ))
+            .unwrap();
+        }
+        svc.create_service(&ecs_request(
+            "CreateService",
+            json!({
+                "cluster": "c1",
+                "serviceName": "api",
+                "taskDefinition": "web:1",
+                "desiredCount": desired,
+                "deploymentConfiguration": {
+                    "minimumHealthyPercent": 100,
+                    "maximumPercent": 200,
+                    "deploymentCircuitBreaker": {"enable": true, "rollback": true}
+                }
+            }),
+        ))
+        .unwrap();
+    }
+
+    fn describe_api(svc: &EcsService) -> Value {
+        let v = json_of(
+            svc.describe_services(&ecs_request(
+                "DescribeServices",
+                json!({"cluster": "c1", "services": ["api"]}),
+            ))
+            .unwrap(),
+        );
+        v["services"][0].clone()
+    }
+
+    /// UpdateService with a new task definition or forceNewDeployment starts
+    /// a new PRIMARY deployment; the previous one stays listed as ACTIVE.
+    #[tokio::test]
+    async fn update_service_starts_deployments_for_new_revisions_and_forced_ones() {
+        let svc = EcsService::new(empty_state());
+        service_with_breaker(&svc, 1);
+        let created = describe_api(&svc);
+        assert_eq!(created["deployments"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            created["deployments"][0]["rolloutState"],
+            json!("IN_PROGRESS")
+        );
+
+        let updated = json_of(
+            svc.update_service(&ecs_request(
+                "UpdateService",
+                json!({"cluster": "c1", "service": "api", "taskDefinition": "web:2"}),
+            ))
+            .unwrap(),
+        );
+        let deployments = updated["service"]["deployments"].as_array().unwrap();
+        assert_eq!(deployments.len(), 2);
+        assert_eq!(deployments[0]["status"], json!("PRIMARY"));
+        assert!(deployments[0]["taskDefinition"]
+            .as_str()
+            .unwrap()
+            .ends_with("web:2"));
+        assert_eq!(deployments[1]["status"], json!("ACTIVE"));
+
+        let forced = json_of(
+            svc.update_service(&ecs_request(
+                "UpdateService",
+                json!({"cluster": "c1", "service": "api", "forceNewDeployment": true}),
+            ))
+            .unwrap(),
+        );
+        let deployments = forced["service"]["deployments"].as_array().unwrap();
+        assert_eq!(deployments.len(), 3);
+        assert_eq!(
+            deployments[0]["taskDefinition"], deployments[1]["taskDefinition"],
+            "a forced deployment keeps the task definition"
+        );
+        assert_ne!(deployments[0]["id"], deployments[1]["id"]);
+    }
+
+    /// Without a container runtime no task can start, so the scheduler ticker
+    /// counts the failures and the circuit breaker fails the deployment. With
+    /// no COMPLETED deployment to roll back to, the service stalls.
+    #[tokio::test]
+    async fn ticker_fails_a_deployment_whose_tasks_cannot_start() {
+        let state = empty_state();
+        let svc = EcsService::new(state.clone());
+        service_with_breaker(&svc, 1);
+        for _ in 0..5 {
+            svc.reconcile_service_desired_counts().await;
+        }
+        let described = describe_api(&svc);
+        let deployments = described["deployments"].as_array().unwrap();
+        assert_eq!(deployments.len(), 1);
+        assert_eq!(deployments[0]["rolloutState"], json!("FAILED"));
+        assert_eq!(deployments[0]["failedTasks"], json!(3));
+        assert_eq!(
+            deployments[0]["rolloutStateReason"],
+            json!("ECS deployment circuit breaker: tasks failed to start.")
+        );
+        let messages: Vec<&str> = described["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["message"].as_str().unwrap())
+            .collect();
+        assert!(messages
+            .iter()
+            .any(|m| m.ends_with("deployment failed: tasks failed to start.")));
+        // Three tasks were launched, and none after the deployment failed.
+        let g = state.read();
+        let tasks = g.get(ACCOUNT).unwrap().tasks.len();
+        assert_eq!(tasks, 3);
+    }
+
+    /// Tasks that stopped before a restart (or were lost to it) are not
+    /// counted as failures of the deployment in progress.
+    #[tokio::test]
+    async fn stops_from_before_a_restart_are_not_deployment_failures() {
+        let state = empty_state();
+        let svc = EcsService::new(state.clone());
+        service_with_breaker(&svc, 2);
+        {
+            let mut g = state.write();
+            let st = g.get_mut(ACCOUNT).unwrap();
+            // As persisted by an earlier build: stopped on their own, never
+            // accounted for.
+            for t in st.tasks.values_mut() {
+                t.stop_code = Some("EssentialContainerExited".into());
+                t.stop_accounted = false;
+            }
+        }
+        svc.reconcile_persisted_tasks().await;
+        svc.reconcile_service_desired_counts().await;
+        let described = describe_api(&svc);
+        assert_eq!(described["deployments"][0]["failedTasks"], json!(0));
+    }
+
     /// No snapshot store (memory mode) -> no persist hook for the CFN provisioner.
     #[test]
     fn snapshot_hook_is_none_without_store() {

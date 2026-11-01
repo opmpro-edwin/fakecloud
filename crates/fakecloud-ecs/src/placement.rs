@@ -400,6 +400,9 @@ mod tests {
                 attachments: Vec::new(),
                 volume_configurations: Vec::new(),
                 task_set_arn: None,
+                deployment_id: None,
+                healthy_at: None,
+                stop_accounted: false,
             },
         );
         let c = vec![json!({"type": "distinctInstance"})];
@@ -462,6 +465,9 @@ mod tests {
                 attachments: Vec::new(),
                 volume_configurations: Vec::new(),
                 task_set_arn: None,
+                deployment_id: None,
+                healthy_at: None,
+                stop_accounted: false,
             },
         );
         let strat = vec![json!({"type": "spread", "field": "attribute:ecs.availability-zone"})];
@@ -525,6 +531,9 @@ mod tests {
                 attachments: Vec::new(),
                 volume_configurations: Vec::new(),
                 task_set_arn: None,
+                deployment_id: None,
+                healthy_at: None,
+                stop_accounted: false,
             },
         );
         let strat = vec![json!({"type": "binpack", "field": "instanceId"})];

@@ -144,6 +144,47 @@ impl EcsRuntime {
         }
     }
 
+    /// Emit an `ECS Deployment State Change` EventBridge event
+    /// (`SERVICE_DEPLOYMENT_IN_PROGRESS` / `_COMPLETED` / `_FAILED`) for a
+    /// service deployment. No-op when no delivery bus is wired.
+    pub(crate) fn emit_deployment_state_change(
+        &self,
+        account_id: &str,
+        change: &crate::rollout::DeploymentStateChange,
+    ) {
+        let Some(ref bus) = self.delivery_bus else {
+            return;
+        };
+        let detail = serde_json::json!({
+            "eventType": change.event_type,
+            "eventName": change.event_name,
+            "deploymentId": change.deployment_id,
+            "updatedAt": change.at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            "reason": change.reason,
+        })
+        .to_string();
+        // The service ARN names the region the service runs in.
+        let region = change.service_arn.split(':').nth(3).unwrap_or("");
+        if let Err(err) =
+            bus.put_event_to_eventbridge(&fakecloud_core::delivery::CrossServiceEvent {
+                source: "aws.ecs",
+                detail_type: "ECS Deployment State Change",
+                detail: &detail,
+                event_bus: "default",
+                account_id,
+                region,
+                resources: std::slice::from_ref(&change.service_arn),
+                principal_arn: None,
+            })
+        {
+            tracing::warn!(
+                deployment = %change.deployment_id,
+                %err,
+                "ECS deployment state change event refused"
+            );
+        }
+    }
+
     /// Forward captured stdout/stderr to CloudWatch Logs when the task's
     /// container definition declares the `awslogs` log driver. No-op when
     /// logs_state isn't wired or the task has no awslogs config.

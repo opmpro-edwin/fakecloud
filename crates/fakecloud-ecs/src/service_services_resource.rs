@@ -10,6 +10,33 @@ use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 use super::*;
 
 impl EcsService {
+    /// The service's JSON as Create/UpdateService return it, with live task
+    /// counts and events, plus its PRIMARY deployment (for the deployment
+    /// state change event an API call that started one emits).
+    fn service_view(
+        &self,
+        account: &str,
+        key: &str,
+        service_name: &str,
+    ) -> Result<(Value, Option<(String, Deployment)>), AwsServiceError> {
+        let accounts = self.state.read();
+        let state = accounts
+            .get(account)
+            .ok_or_else(|| service_not_found(service_name))?;
+        let svc = state
+            .services
+            .get(key)
+            .ok_or_else(|| service_not_found(service_name))?;
+        let mut service_json = service_to_json(svc);
+        refresh_service_json(state, svc, &mut service_json);
+        let primary = svc
+            .deployments
+            .iter()
+            .find(|d| d.status == "PRIMARY")
+            .map(|d| (svc.service_arn.clone(), d.clone()));
+        Ok((service_json, primary))
+    }
+
     pub(super) fn create_service(
         &self,
         request: &AwsRequest,
@@ -122,6 +149,11 @@ impl EcsService {
                 Arn::global_in(&request.region, "iam", &request.account_id, "root").to_string()
             });
 
+        // REPLICA services under the rolling-update controller get their
+        // tasks from the service scheduler.
+        let rolling = crate::rollout::is_rolling_update_controller(&deployment_controller)
+            && scheduling != "DAEMON";
+        let key = EcsState::service_key(&cluster_name, &service_name);
         let (service_json, spawn_task_ids) = {
             let mut accounts = self.state.write();
             let state = accounts.get_or_create(&account);
@@ -152,7 +184,6 @@ impl EcsService {
             // the frozen server default.
             let service_arn =
                 state.service_arn(request.region.as_str(), &cluster_name, &service_name);
-            let key = EcsState::service_key(&cluster_name, &service_name);
             if let Some(existing) = state.services.get(&key) {
                 if existing.status != "INACTIVE" {
                     return Err(service_already_exists());
@@ -212,6 +243,9 @@ impl EcsService {
                 vpc_lattice_configurations: vpc_lattice_configurations.clone(),
             };
             state.services.insert(key.clone(), service.clone());
+            // A service re-created under an INACTIVE one's name starts with
+            // a fresh event log.
+            state.service_events.remove(&service_arn);
             state.record_service_revision(&service);
             if let Some(cluster) = state.clusters.get_mut(&cluster_name) {
                 cluster.active_services_count += 1;
@@ -224,15 +258,22 @@ impl EcsService {
                 last_status: Some("ACTIVE".into()),
                 detail: json!({"serviceArn": service_arn, "desiredCount": desired_count}),
             });
-            let ids = spawn_service_tasks(
-                state,
-                request.region.as_str(),
-                &service,
-                desired_count,
-                &principal_arn,
-                &launch_type,
-                None,
-            );
+            // Under the rolling-update controller the service scheduler
+            // launches the first deployment's tasks (below, once the lock is
+            // released). Task-set controllers start them here.
+            let ids = if rolling {
+                Vec::new()
+            } else {
+                spawn_service_tasks(
+                    state,
+                    request.region.as_str(),
+                    &service,
+                    desired_count,
+                    &principal_arn,
+                    &launch_type,
+                    None,
+                )
+            };
             if is_code_deploy {
                 let ts_id = uuid::Uuid::new_v4().to_string().replace('-', "");
                 let ts_arn = crate::state::ecs_arn(
@@ -275,6 +316,15 @@ impl EcsService {
             }
             (service_json, ids)
         };
+
+        if rolling {
+            self.schedule_services(Some((&account, &key)), false);
+            let (service_json, started) = self.service_view(&account, &key, &service_name)?;
+            if let Some((service_arn, deployment)) = started {
+                self.emit_deployment_started(&account, &service_arn, &deployment);
+            }
+            return Ok(AwsResponse::ok_json(json!({ "service": service_json })));
+        }
 
         if let Some(rt) = runtime {
             for id in spawn_task_ids {
@@ -331,6 +381,10 @@ impl EcsService {
             .map(validate_desired_count)
             .transpose()?;
         let new_td_ref = opt_str(&body, "taskDefinition");
+        let force_new_deployment = body
+            .get("forceNewDeployment")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let update_lifecycle_hooks: Vec<Value> = body
             .get("deploymentConfiguration")
             .and_then(|d| d.get("lifecycleHooks"))
@@ -347,12 +401,12 @@ impl EcsService {
             });
         let runtime = self.runtime.clone();
 
-        let (service_json, spawn_ids, stop_ids) = {
+        let key = EcsState::service_key(&cluster_name, &service_name);
+        let (service_json, spawn_ids, stop_ids, rolling, new_deployment_triggered) = {
             let mut accounts = self.state.write();
             let state = accounts
                 .get_mut(&account)
                 .ok_or_else(|| service_not_found(&service_name))?;
-            let key = EcsState::service_key(&cluster_name, &service_name);
             // A deleted service transitions to DRAINING then INACTIVE but stays
             // describable. UpdateService must not respawn one: AWS returns
             // ServiceNotActiveException for any non-ACTIVE service.
@@ -496,23 +550,32 @@ impl EcsService {
                     svc.family = new_family;
                     svc.revision = new_revision;
                     new_deployment_triggered = true;
-                    if svc.deployment_controller != "CODE_DEPLOY" {
-                        // Roll a new PRIMARY deployment; mark the previous one ACTIVE
-                        // so it's eligible for drain once the new deployment ramps.
-                        for d in svc.deployments.iter_mut() {
-                            if d.status == "PRIMARY" {
-                                d.status = "ACTIVE".into();
-                                old_deployments_drained.push(d.deployment_id.clone());
-                            }
+                }
+                // forceNewDeployment starts a deployment of the same task
+                // definition (rolling update only; task sets are replaced
+                // through their own APIs).
+                if force_new_deployment
+                    && crate::rollout::is_rolling_update_controller(&svc.deployment_controller)
+                {
+                    new_deployment_triggered = true;
+                }
+                if new_deployment_triggered && svc.deployment_controller != "CODE_DEPLOY" {
+                    // Roll a new PRIMARY deployment; mark the previous one ACTIVE
+                    // so it's eligible for drain once the new deployment ramps.
+                    for d in svc.deployments.iter_mut() {
+                        if d.status == "PRIMARY" {
+                            d.status = "ACTIVE".into();
+                            d.updated_at = Utc::now();
+                            old_deployments_drained.push(d.deployment_id.clone());
                         }
-                        let primary = Deployment::new_primary(
-                            &svc.task_definition_arn,
-                            svc.desired_count,
-                            &svc.launch_type,
-                            &update_lifecycle_hooks,
-                        );
-                        svc.deployments.insert(0, primary);
                     }
+                    let primary = Deployment::new_primary(
+                        &svc.task_definition_arn,
+                        svc.desired_count,
+                        &svc.launch_type,
+                        &update_lifecycle_hooks,
+                    );
+                    svc.deployments.insert(0, primary);
                 }
 
                 effective_desired = svc.desired_count;
@@ -544,8 +607,14 @@ impl EcsService {
 
             let service_tag = format!("ecs-svc/{}", service_name);
             let now = Utc::now();
+            let rolling = crate::rollout::is_rolling_update_controller(&controller)
+                && state.services.get(&key).unwrap().scheduling_strategy != "DAEMON";
 
-            if new_deployment_triggered && controller == "CODE_DEPLOY" {
+            if rolling {
+                // The service scheduler launches and drains the tasks
+                // (below, once the lock is released), within the
+                // minimum healthy / maximum percent bounds.
+            } else if new_deployment_triggered && controller == "CODE_DEPLOY" {
                 let new_td_arn_match = state
                     .services
                     .get(&key)
@@ -777,8 +846,19 @@ impl EcsService {
             if controller == "CODE_DEPLOY" {
                 inject_service_task_sets(state, &service_name, &cluster_name, &mut service_json);
             }
-            (service_json, spawn, stop)
+            (service_json, spawn, stop, rolling, new_deployment_triggered)
         };
+
+        if rolling {
+            self.schedule_services(Some((&account, &key)), false);
+            let (service_json, started) = self.service_view(&account, &key, &service_name)?;
+            if new_deployment_triggered {
+                if let Some((service_arn, deployment)) = started {
+                    self.emit_deployment_started(&account, &service_arn, &deployment);
+                }
+            }
+            return Ok(AwsResponse::ok_json(json!({ "service": service_json })));
+        }
 
         // Always flip desired_status for tasks we plan to stop.
         for id in &stop_ids {
@@ -1005,8 +1085,9 @@ impl EcsService {
             match state.services.get(&key) {
                 Some(svc) => {
                     let mut v = service_to_json(svc);
-                    // Update derived running/pending counts from current tasks.
-                    recompute_service_counts(state, &name, &cluster_name, &mut v);
+                    // Running / pending counts (service and per deployment)
+                    // from current tasks, and the scheduler's events.
+                    refresh_service_json(state, svc, &mut v);
                     inject_service_task_sets(state, &name, &cluster_name, &mut v);
                     found.push(v);
                 }

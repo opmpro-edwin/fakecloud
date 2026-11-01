@@ -30,7 +30,7 @@ pub async fn cfn_launch_service_tasks(
     service_name: String,
     account_id: String,
 ) {
-    let spawn_task_ids = {
+    let (spawn_task_ids, stop_task_ids) = {
         let mut accounts = state.write();
         let Some(st) = accounts.get_mut(&account_id) else {
             return;
@@ -39,55 +39,80 @@ pub async fn cfn_launch_service_tasks(
         let Some(service) = st.services.get(&key).cloned() else {
             return;
         };
-        if service.desired_count <= 0 {
-            return;
-        }
-        // No request region on the CFN drain path; keep the new tasks in the
-        // region the service's stored ARN already carries.
-        let svc_region = service
-            .cluster_arn
-            .split(':')
-            .nth(3)
-            .map(str::to_string)
-            .unwrap_or_else(|| st.region.clone());
-        let principal_arn = service.created_by.clone().unwrap_or_else(|| {
-            fakecloud_aws::arn::Arn::global_in(&svc_region, "iam", &account_id, "root").to_string()
-        });
-        let launch_type = service.launch_type.clone();
-        // Launch only the shortfall: the scheduler ticker reconciles every
-        // ACTIVE service toward its desired count too, and may already have
-        // started some (or all) of these tasks before this drain ran.
-        // Spawning the full desired count regardless would double the
-        // service's tasks.
-        let shortfall =
-            service.desired_count - st.active_service_task_count(&cluster_name, &service_name);
-        if shortfall <= 0 {
-            return;
-        }
-        let ids = crate::service::spawn_service_tasks(
-            st,
-            &svc_region,
-            &service,
-            shortfall,
-            &principal_arn,
-            &launch_type,
-            None,
-        );
-        // Reflect the new PENDING tasks in the stored counts, as the
-        // scheduler ticker does.
-        if let Some(svc) = st.services.get_mut(&key) {
-            svc.pending_count = svc.pending_count.saturating_add(ids.len() as i32);
-            for d in svc.deployments.iter_mut().filter(|d| d.status == "PRIMARY") {
-                d.pending_count = d.pending_count.saturating_add(ids.len() as i32);
+        // A rolling-update service gets its tasks from the service
+        // scheduler, which attributes them to the PRIMARY deployment and
+        // keeps the deployment bounds. Target health is not read here, so a
+        // task behind a load balancer does not yet count as healthy.
+        if crate::rollout::is_rolling_update_controller(&service.deployment_controller)
+            && service.scheduling_strategy != "DAEMON"
+        {
+            let no_health = std::collections::BTreeMap::new();
+            let out = crate::rollout::step_service(
+                st,
+                &key,
+                &crate::rollout::StepContext {
+                    now: chrono::Utc::now(),
+                    lb_health: &no_health,
+                    evaluate_lb: runtime.evaluates_target_health(),
+                    full_pass: false,
+                },
+            );
+            (out.launched, out.stopped)
+        } else {
+            if service.desired_count <= 0 {
+                return;
             }
+            // No request region on the CFN drain path; keep the new tasks in the
+            // region the service's stored ARN already carries.
+            let svc_region = service
+                .cluster_arn
+                .split(':')
+                .nth(3)
+                .map(str::to_string)
+                .unwrap_or_else(|| st.region.clone());
+            let principal_arn = service.created_by.clone().unwrap_or_else(|| {
+                fakecloud_aws::arn::Arn::global_in(&svc_region, "iam", &account_id, "root")
+                    .to_string()
+            });
+            let launch_type = service.launch_type.clone();
+            // Launch only the shortfall: the scheduler ticker reconciles every
+            // ACTIVE service toward its desired count too, and may already have
+            // started some (or all) of these tasks before this drain ran.
+            // Spawning the full desired count regardless would double the
+            // service's tasks.
+            let shortfall =
+                service.desired_count - st.active_service_task_count(&cluster_name, &service_name);
+            if shortfall <= 0 {
+                return;
+            }
+            let ids = crate::service::spawn_service_tasks(
+                st,
+                &svc_region,
+                &service,
+                shortfall,
+                &principal_arn,
+                &launch_type,
+                None,
+            );
+            // Reflect the new PENDING tasks in the stored counts, as the
+            // scheduler ticker does.
+            if let Some(svc) = st.services.get_mut(&key) {
+                svc.pending_count = svc.pending_count.saturating_add(ids.len() as i32);
+                for d in svc.deployments.iter_mut().filter(|d| d.status == "PRIMARY") {
+                    d.pending_count = d.pending_count.saturating_add(ids.len() as i32);
+                }
+            }
+            (ids, Vec::new())
         }
-        ids
     };
 
     for id in spawn_task_ids {
         runtime
             .clone()
             .run_task(state.clone(), id, account_id.clone());
+    }
+    for (id, reason) in stop_task_ids {
+        runtime.stop_task(&id, &reason).await;
     }
 }
 

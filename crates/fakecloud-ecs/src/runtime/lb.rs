@@ -56,4 +56,29 @@ impl EcsRuntime {
             bus.deregister_elbv2_targets(account_id, &tg_arn, tg_targets);
         }
     }
+
+    /// Whether target-group health can be read for this runtime's tasks.
+    /// Without it the service scheduler counts a RUNNING task as healthy in
+    /// its load balancers.
+    pub(crate) fn evaluates_target_health(&self) -> bool {
+        self.delivery_bus
+            .as_ref()
+            .is_some_and(|bus| bus.has_elbv2_target_registration())
+    }
+
+    /// Health of one task target in an ELBv2 target group.
+    pub(crate) fn target_health(
+        &self,
+        account_id: &str,
+        target_group_arn: &str,
+        target_id: &str,
+        port: Option<i64>,
+    ) -> Option<fakecloud_core::delivery::TargetHealthView> {
+        self.delivery_bus.as_ref()?.elbv2_target_health(
+            account_id,
+            target_group_arn,
+            target_id,
+            port,
+        )
+    }
 }

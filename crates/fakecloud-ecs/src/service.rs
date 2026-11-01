@@ -259,6 +259,9 @@ impl EcsService {
             let now = chrono::Utc::now();
             for (_, state) in accounts.iter_mut() {
                 for task in state.tasks.values_mut() {
+                    // Stops from before the restart are history, never
+                    // deployment failures for the scheduler to count.
+                    task.stop_accounted = true;
                     if task.last_status != "STOPPED" {
                         task.last_status = "STOPPED".to_string();
                         task.desired_status = "STOPPED".to_string();
@@ -301,20 +304,28 @@ impl EcsService {
         }
     }
 
-    /// Converge every ACTIVE service toward its `desiredCount`, launching
-    /// replacement tasks for any shortfall. Real ECS maintains `desiredCount`
-    /// autonomously; `reconcile_persisted_tasks` STOPs all tasks and zeroes
-    /// counts on restart "trusting a scheduler ticker," but no such ticker
-    /// existed, so services with `desiredCount=N` stayed at `runningCount=0`
-    /// forever. This is that ticker. It also re-launches tasks lost to crashed
-    /// containers during normal operation. bug-audit 2026-06-15, 4.7.
-    ///
-    /// One pass: for each service, count its non-STOPPED tasks (matched by the
-    /// `ecs-svc/<name>` `started_by` tag, same as `recompute_service_counts`);
-    /// if that count is below `desiredCount`, spawn the difference via the
-    /// shared `spawn_service_tasks` path and hand the new task IDs to the
-    /// runtime. Persist only when something was launched.
+    /// One round of the service scheduler over every ACTIVE service. Real ECS
+    /// maintains `desiredCount` autonomously; `reconcile_persisted_tasks`
+    /// STOPs all tasks and zeroes counts on restart and this ticker brings
+    /// each service back (bug-audit 2026-06-15, 4.7). Services under the
+    /// rolling-update (`ECS`) controller go through [`crate::rollout`]:
+    /// deployments, the minimum healthy / maximum percent bounds, health
+    /// check replacement and the deployment circuit breaker. Services whose
+    /// tasks belong to task sets (`CODE_DEPLOY`, `EXTERNAL`) are only kept
+    /// at their desired count. Persists when anything changed.
     pub async fn reconcile_service_desired_counts(&self) {
+        let rolled = self.schedule_services(None, true);
+        let converged = self.converge_task_set_services();
+        if rolled || converged {
+            self.save_snapshot().await;
+        }
+    }
+
+    /// Launch the shortfall of every ACTIVE service under the `CODE_DEPLOY`
+    /// or `EXTERNAL` deployment controller: count its non-STOPPED tasks
+    /// (matched by the `ecs-svc/<name>` `started_by` tag) and spawn the
+    /// difference to `desiredCount`. Returns whether anything was launched.
+    fn converge_task_set_services(&self) -> bool {
         // Phase 1 (write lock): find shortfalls, spawn PENDING task rows,
         // and refresh each service's running/pending counts so DescribeServices
         // is accurate immediately. Collect the new task IDs to launch after the
@@ -332,6 +343,9 @@ impl EcsService {
                         s.status == "ACTIVE"
                             && s.scheduling_strategy != "DAEMON"
                             && s.desired_count > 0
+                            && !crate::rollout::is_rolling_update_controller(
+                                &s.deployment_controller,
+                            )
                     })
                     .cloned()
                     .collect();
@@ -400,7 +414,7 @@ impl EcsService {
         }
 
         if to_launch.is_empty() {
-            return;
+            return false;
         }
 
         // Phase 2 (no lock): hand new tasks to the runtime, which advances them
@@ -431,8 +445,7 @@ impl EcsService {
                 }
             }
         }
-
-        self.save_snapshot().await;
+        true
     }
 }
 
@@ -644,6 +657,9 @@ mod service_daemons;
 
 #[path = "service_express_gateway.rs"]
 mod service_express_gateway;
+
+#[path = "service_scheduler.rs"]
+mod service_scheduler;
 
 #[path = "helpers.rs"]
 mod helpers;

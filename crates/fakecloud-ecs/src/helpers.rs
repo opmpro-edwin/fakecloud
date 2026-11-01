@@ -983,6 +983,9 @@ pub(crate) fn spawn_service_tasks(
             ),
             volume_configurations: Vec::new(),
             task_set_arn: task_set_arn.clone(),
+            deployment_id: None,
+            healthy_at: None,
+            stop_accounted: false,
         };
         if launch_type != "FARGATE" {
             if let Some(arn) = crate::placement::select_container_instance(
@@ -1173,6 +1176,9 @@ pub(crate) fn spawn_daemon_tasks(
             attachments: Vec::new(),
             volume_configurations: Vec::new(),
             task_set_arn: None,
+            deployment_id: None,
+            healthy_at: None,
+            stop_accounted: false,
         };
         state.tasks.insert(task_id.clone(), task);
         if let Some(cluster) = state.clusters.get_mut(&cluster_name) {
@@ -1191,27 +1197,60 @@ fn parse_daemon_td_arn(arn: &str) -> Option<(String, i32)> {
     Some((family.to_string(), revision))
 }
 
-pub(crate) fn recompute_service_counts(
-    state: &EcsState,
-    service_name: &str,
-    cluster_name: &str,
-    service_json: &mut Value,
-) {
-    let service_tag = format!("ecs-svc/{}", service_name);
+/// Bring the parts of a service's JSON that follow its tasks and its
+/// scheduler up to date: the running / pending counts of the service and of
+/// each listed deployment, and the `events` list (newest first).
+pub(crate) fn refresh_service_json(state: &EcsState, svc: &Service, service_json: &mut Value) {
     let mut running = 0i32;
     let mut pending = 0i32;
-    for t in state.tasks.values() {
-        if t.started_by.as_deref() == Some(service_tag.as_str()) && t.cluster_name == cluster_name {
-            match t.last_status.as_str() {
-                "RUNNING" => running += 1,
-                "PENDING" | "PROVISIONING" => pending += 1,
-                _ => {}
-            }
+    let mut per_deployment: std::collections::BTreeMap<&str, (i32, i32)> =
+        std::collections::BTreeMap::new();
+    for t in crate::rollout::service_tasks(state, svc) {
+        let (r, p) = match t.last_status.as_str() {
+            "RUNNING" => (1, 0),
+            "PENDING" | "PROVISIONING" | "ACTIVATING" => (0, 1),
+            _ => continue,
+        };
+        running += r;
+        pending += p;
+        if let Some(d) = crate::rollout::owning_deployment(svc, t) {
+            let entry = per_deployment.entry(d.deployment_id.as_str()).or_default();
+            entry.0 += r;
+            entry.1 += p;
         }
     }
-    if let Some(map) = service_json.as_object_mut() {
-        map.insert("runningCount".into(), json!(running));
-        map.insert("pendingCount".into(), json!(pending));
+    let events: Vec<Value> = state
+        .service_events
+        .get(&svc.service_arn)
+        .map(|log| {
+            log.events
+                .iter()
+                .rev()
+                .map(|e| {
+                    json!({
+                        "id": e.id,
+                        "createdAt": e.created_at.timestamp(),
+                        "message": e.message,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let Some(map) = service_json.as_object_mut() else {
+        return;
+    };
+    map.insert("runningCount".into(), json!(running));
+    map.insert("pendingCount".into(), json!(pending));
+    map.insert("events".into(), Value::Array(events));
+    if let Some(deployments) = map.get_mut("deployments").and_then(|v| v.as_array_mut()) {
+        for dv in deployments.iter_mut() {
+            let id = dv.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+            let (r, p) = per_deployment.get(id).copied().unwrap_or_default();
+            if let Some(obj) = dv.as_object_mut() {
+                obj.insert("runningCount".into(), json!(r));
+                obj.insert("pendingCount".into(), json!(p));
+            }
+        }
     }
 }
 
@@ -1306,13 +1345,19 @@ pub(crate) fn service_to_json(svc: &Service) -> Value {
             Value::Object(deployment_cfg),
         );
     }
-    let mut deployment_values: Vec<Value> =
-        svc.deployments.iter().map(deployment_to_json).collect();
+    // A deployment that has been completely replaced (INACTIVE) is no longer
+    // listed.
+    let listed: Vec<&Deployment> = svc
+        .deployments
+        .iter()
+        .filter(|d| d.status != "INACTIVE")
+        .collect();
+    let mut deployment_values: Vec<Value> = listed.iter().map(|d| deployment_to_json(d)).collect();
     // AWS carries serviceConnectConfiguration on each deployment. Echo the
     // service's stored config onto the PRIMARY deployment so a Create/Update
     // that supplied one round-trips on DescribeServices instead of vanishing.
     // VPC Lattice configurations ride on the deployment the same way.
-    for (dv, dep) in deployment_values.iter_mut().zip(svc.deployments.iter()) {
+    for (dv, dep) in deployment_values.iter_mut().zip(listed.iter()) {
         if dep.status != "PRIMARY" {
             continue;
         }
