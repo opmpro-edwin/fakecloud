@@ -146,6 +146,7 @@ pub struct EcsRuntime {
 
 mod aws_env;
 mod config;
+mod container_watch;
 pub(crate) mod eni;
 mod extra_ca;
 mod k8s;

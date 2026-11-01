@@ -3,62 +3,6 @@
 use super::*;
 
 impl EcsRuntime {
-    /// Inspect each running container's `.State.Health.Status` and push
-    /// the mapped ECS healthStatus onto the task's container list.
-    /// Best-effort: a failed inspect (e.g. container already removed)
-    /// leaves the previous status untouched.
-    pub(super) async fn refresh_health_status(
-        &self,
-        state: &SharedEcsState,
-        account_id: &str,
-        task_id: &str,
-        started: &[RunningContainer],
-    ) {
-        let mut updates: Vec<(String, String)> = Vec::with_capacity(started.len());
-        for rc in started {
-            let out = self
-                .cli_output(
-                    [
-                        "inspect",
-                        "-f",
-                        "{{if .State.Health}}{{.State.Health.Status}}{{else}}{{end}}",
-                        &rc.container_id,
-                    ],
-                    CLI_CALL_TIMEOUT,
-                )
-                .await;
-            let status = match out {
-                Ok(o) if o.status.success() => {
-                    let raw = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                    if raw.is_empty() {
-                        // No HEALTHCHECK on this container — leave the
-                        // ECS-side status as UNKNOWN (matches AWS).
-                        "UNKNOWN".to_string()
-                    } else {
-                        docker_health_to_ecs(&raw).to_string()
-                    }
-                }
-                _ => continue,
-            };
-            updates.push((rc.name.clone(), status));
-        }
-        if updates.is_empty() {
-            return;
-        }
-        let mut accounts = state.write();
-        let Some(s) = accounts.get_mut(account_id) else {
-            return;
-        };
-        let Some(task) = s.tasks.get_mut(task_id) else {
-            return;
-        };
-        for (name, status) in updates {
-            if let Some(c) = task.containers.iter_mut().find(|c| c.name == name) {
-                c.health_status = Some(status);
-            }
-        }
-    }
-
     /// Best-effort image digest lookup via `docker image inspect` after a
     /// pull. Returns the first `RepoDigests[0]` entry's `sha256:...` tail
     /// when present, matching what AWS ECS returns on `DescribeTasks`.
