@@ -13,7 +13,7 @@ fakecloud implements **11 of 11** STS operations at 100% Smithy conformance.
 - **AssumeRoleWithSAML** — SAML federation; the named provider must exist, audience is matched against the provider metadata's `entityID`, and the trust policy is enforced with `saml:aud` / `saml:iss` context keys
 - **GetSessionToken** — temporary credentials
 - **GetFederationToken** — federated user credentials
-- **GetCallerIdentity** — account ID, user ARN, user ID
+- **GetCallerIdentity** — account ID, user ARN, user ID. As on AWS it needs no permission: under `--iam strict` any caller whose credential resolves gets its identity, even with a policy that explicitly denies `sts:GetCallerIdentity`
 - **DecodeAuthorizationMessage** — encoded message decoding
 - **GetAccessKeyInfo** — access key metadata
 

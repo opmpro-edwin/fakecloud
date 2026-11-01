@@ -3737,8 +3737,14 @@ async fn iam_deny_includes_encoded_auth_failure_message() {
     let sts = aws_sdk_sts::Client::new(&cfg);
 
     // No identity policy → implicit deny → AccessDeniedException with
-    // encoded suffix.
-    let err = sts.get_caller_identity().send().await.unwrap_err();
+    // encoded suffix. (GetCallerIdentity needs no permission, so probe with
+    // GetAccessKeyInfo.)
+    let err = sts
+        .get_access_key_info()
+        .access_key_id(access_key.access_key_id())
+        .send()
+        .await
+        .unwrap_err();
     let raw = format!("{err:?}");
     let marker = "Encoded authorization failure message:";
     let idx = raw
@@ -3761,7 +3767,7 @@ async fn iam_deny_includes_encoded_auth_failure_message() {
         .await
         .unwrap();
     let body = decoded.decoded_message().unwrap();
-    assert!(body.contains("sts:GetCallerIdentity"), "body={body}");
+    assert!(body.contains("sts:GetAccessKeyInfo"), "body={body}");
     assert!(body.contains("enc-deny-user"), "body={body}");
 }
 

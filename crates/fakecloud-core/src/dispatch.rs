@@ -825,6 +825,9 @@ async fn dispatch_inner(
                     ) {
                         return denied;
                     }
+                } else if service.iam_authorization_exempt(&aws_request) {
+                    // Needs no permission on AWS (sts:GetCallerIdentity): no
+                    // policy, not even an explicit deny, can refuse it.
                 } else {
                     // A request can need several authorizations -- one per
                     // table in a batch, say -- and every one must allow it.

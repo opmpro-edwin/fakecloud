@@ -80,7 +80,7 @@ Opt-in enforcement covers the services most commonly subject to real IAM policie
 | Service | Covered actions | Resource ARN shape |
 | --- | --- | --- |
 | **IAM** | All 128 supported actions | `arn:aws:iam::<account>:{user,role,group,policy,instance-profile,mfa,server-certificate,saml-provider,oidc-provider}/<name>` |
-| **STS** | All 8 supported actions | `*` (or `RoleArn` for `AssumeRole*`) |
+| **STS** | All 8 supported actions; `GetCallerIdentity` needs no permission and is never denied, as on AWS (not even by an explicit `Deny`), though its credential must still resolve | `*` (or `RoleArn` for `AssumeRole*`) |
 | **SQS** | All 20 supported actions | `arn:aws:sqs:<region>:<account>:<queue-name>` |
 | **SNS** | All 34 supported actions | Topic / subscription / platform-app / endpoint ARNs |
 | **S3** | All 74 supported actions | `arn:aws:s3:::<bucket>[/<key>]` (object actions include the key; bucket actions don't) |

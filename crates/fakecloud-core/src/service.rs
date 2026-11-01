@@ -840,6 +840,17 @@ pub trait AwsService: Send + Sync {
         None
     }
 
+    /// Whether the request needs no IAM authorization at all. AWS documents a
+    /// few operations every authenticated caller may perform without any
+    /// permission, even when a policy explicitly denies them:
+    /// `sts:GetCallerIdentity` is one. Dispatch serves such a request for a
+    /// signed caller whose credential resolves without evaluating identity
+    /// policies, boundaries, session policies or SCPs. A request whose
+    /// credential does not resolve is still rejected. Default `false`.
+    fn iam_authorization_exempt(&self, _request: &AwsRequest) -> bool {
+        false
+    }
+
     /// Every IAM authorization an incoming request needs.
     ///
     /// Most operations act on one resource and need one action, which is

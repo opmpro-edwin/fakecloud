@@ -110,9 +110,9 @@ async fn assume_role_with_policy(
 #[tokio::test]
 async fn session_policy_caps_assumed_role_permissions() {
     // Role has Allow-all identity policy. AssumeRole with a session
-    // policy that only allows sts:GetCallerIdentity. The returned
+    // policy that only allows sts:GetAccessKeyInfo. The returned
     // credentials should be denied on iam:ListUsers but allowed on
-    // sts:GetCallerIdentity.
+    // sts:GetAccessKeyInfo.
     let server = start_strict().await;
     setup_role(&server, "wide-role").await;
 
@@ -120,7 +120,7 @@ async fn session_policy_caps_assumed_role_permissions() {
         &server,
         "wide-role",
         "narrow-session",
-        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"sts:GetCallerIdentity","Resource":"*"}]}"#,
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"sts:GetAccessKeyInfo","Resource":"*"}]}"#,
     )
     .await;
 
@@ -128,6 +128,14 @@ async fn session_policy_caps_assumed_role_permissions() {
 
     // Allowed by both role policy and session policy.
     let sts = StsClient::new(&cfg);
+    let info = sts
+        .get_access_key_info()
+        .access_key_id(&akid)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(info.account(), Some("123456789012"));
+    // GetCallerIdentity needs no permission at all.
     let identity = sts.get_caller_identity().send().await.unwrap();
     assert!(identity
         .arn()
@@ -157,7 +165,7 @@ async fn session_policy_explicit_deny_wins() {
             "Version":"2012-10-17",
             "Statement":[
                 {"Effect":"Allow","Action":"*","Resource":"*"},
-                {"Effect":"Deny","Action":"sts:GetCallerIdentity","Resource":"*"}
+                {"Effect":"Deny","Action":"sts:GetAccessKeyInfo","Resource":"*"}
             ]
         }"#,
     )
@@ -165,7 +173,12 @@ async fn session_policy_explicit_deny_wins() {
 
     let cfg = sdk_config_with_session(&server, &akid, &secret, &token).await;
     let sts = StsClient::new(&cfg);
-    let err = sts.get_caller_identity().send().await.unwrap_err();
+    let err = sts
+        .get_access_key_info()
+        .access_key_id(&akid)
+        .send()
+        .await
+        .unwrap_err();
     let msg = format!("{err:?}");
     assert!(
         msg.contains("AccessDeniedException"),

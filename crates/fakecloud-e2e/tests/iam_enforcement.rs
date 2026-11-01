@@ -77,20 +77,93 @@ async fn attach_inline_policy(server: &TestServer, user: &str, name: &str, docum
 // ======================================================================
 
 #[tokio::test]
-async fn sts_get_caller_identity_denied_without_policy() {
+async fn sts_actions_denied_without_policy_except_get_caller_identity() {
     // A user with no attached policies has implicit-deny on STS actions
-    // in strict mode. GetCallerIdentity with their credentials must fail.
+    // in strict mode, but GetCallerIdentity needs no permission on AWS.
     let server = start_strict().await;
     let (akid, secret) = bootstrap_user(&server, "alice").await;
 
     let cfg = sdk_config_with(&server, &akid, &secret).await;
     let sts = StsClient::new(&cfg);
-    let err = sts.get_caller_identity().send().await.unwrap_err();
+    let err = sts
+        .get_access_key_info()
+        .access_key_id(&akid)
+        .send()
+        .await
+        .unwrap_err();
     let msg = format!("{err:?}");
     assert!(
         msg.contains("AccessDeniedException"),
         "expected AccessDeniedException, got {msg}"
     );
+    let identity = sts.get_caller_identity().send().await.unwrap();
+    assert!(identity.arn().unwrap().contains("user/alice"));
+}
+
+/// `sts:GetCallerIdentity` needs no permission: an assumed-role session
+/// whose role grants nothing, and a user whose policy explicitly denies it,
+/// both get their identity.
+#[tokio::test]
+async fn sts_get_caller_identity_needs_no_permission() {
+    let server = start_strict().await;
+    let boot = sdk_config_with(&server, "test", "test").await;
+    let iam = IamClient::new(&boot);
+    let role = iam
+        .create_role()
+        .role_name("nothing-role")
+        .assume_role_policy_document(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::123456789012:root"},"Action":"sts:AssumeRole"}]}"#,
+        )
+        .send()
+        .await
+        .unwrap();
+    let creds = StsClient::new(&boot)
+        .assume_role()
+        .role_arn(role.role().unwrap().arn())
+        .role_session_name("bare")
+        .send()
+        .await
+        .unwrap()
+        .credentials()
+        .unwrap()
+        .clone();
+    let session = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .endpoint_url(server.endpoint())
+        .region(aws_config::Region::new("us-east-1"))
+        .credentials_provider(Credentials::new(
+            creds.access_key_id(),
+            creds.secret_access_key(),
+            Some(creds.session_token().to_string()),
+            None,
+            "bare-session",
+        ))
+        .load()
+        .await;
+    let identity = StsClient::new(&session)
+        .get_caller_identity()
+        .send()
+        .await
+        .expect("GetCallerIdentity needs no permission");
+    assert_eq!(
+        identity.arn(),
+        Some("arn:aws:sts::123456789012:assumed-role/nothing-role/bare")
+    );
+
+    let (akid, secret) = bootstrap_user(&server, "denied-user").await;
+    attach_inline_policy(
+        &server,
+        "denied-user",
+        "DenyEverything",
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"*","Resource":"*"}]}"#,
+    )
+    .await;
+    let cfg = sdk_config_with(&server, &akid, &secret).await;
+    let identity = StsClient::new(&cfg)
+        .get_caller_identity()
+        .send()
+        .await
+        .expect("an explicit deny does not apply to GetCallerIdentity");
+    assert!(identity.arn().unwrap().contains("user/denied-user"));
 }
 
 /// bug-hunt 2026-06-13, finding 5.1: enabling `--verify-sigv4` alongside
@@ -368,13 +441,18 @@ async fn sts_explicit_deny_beats_allow_all() {
         &server,
         "carol",
         "DenySts",
-        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"sts:GetCallerIdentity","Resource":"*"}]}"#,
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"sts:GetAccessKeyInfo","Resource":"*"}]}"#,
     )
     .await;
 
     let cfg = sdk_config_with(&server, &akid, &secret).await;
     let sts = StsClient::new(&cfg);
-    let err = sts.get_caller_identity().send().await.unwrap_err();
+    let err = sts
+        .get_access_key_info()
+        .access_key_id(&akid)
+        .send()
+        .await
+        .unwrap_err();
     let msg = format!("{err:?}");
     assert!(msg.contains("AccessDeniedException"), "got {msg}");
 }
@@ -1417,7 +1495,7 @@ async fn condition_string_equals_username_allows_owner() {
         "AllowIfDana",
         r#"{"Version":"2012-10-17","Statement":[{
             "Effect":"Allow",
-            "Action":"sts:GetCallerIdentity",
+            "Action":"sts:GetAccessKeyInfo",
             "Resource":"*",
             "Condition":{"StringEquals":{"aws:username":"dana"}}
         }]}"#,
@@ -1425,8 +1503,13 @@ async fn condition_string_equals_username_allows_owner() {
     .await;
     let cfg = sdk_config_with(&server, &akid, &secret).await;
     let sts = StsClient::new(&cfg);
-    let identity = sts.get_caller_identity().send().await.unwrap();
-    assert!(identity.arn().unwrap().contains("user/dana"));
+    let info = sts
+        .get_access_key_info()
+        .access_key_id(&akid)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(info.account(), Some("123456789012"));
 }
 
 #[tokio::test]
@@ -1441,7 +1524,7 @@ async fn condition_string_equals_username_denies_other_user() {
         "AllowIfDana",
         r#"{"Version":"2012-10-17","Statement":[{
             "Effect":"Allow",
-            "Action":"sts:GetCallerIdentity",
+            "Action":"sts:GetAccessKeyInfo",
             "Resource":"*",
             "Condition":{"StringEquals":{"aws:username":"dana"}}
         }]}"#,
@@ -1449,7 +1532,12 @@ async fn condition_string_equals_username_denies_other_user() {
     .await;
     let cfg = sdk_config_with(&server, &akid, &secret).await;
     let sts = StsClient::new(&cfg);
-    let err = sts.get_caller_identity().send().await.unwrap_err();
+    let err = sts
+        .get_access_key_info()
+        .access_key_id(&akid)
+        .send()
+        .await
+        .unwrap_err();
     assert!(format!("{err:?}").contains("AccessDeniedException"));
 }
 
@@ -1466,7 +1554,7 @@ async fn condition_ip_address_loopback_allows() {
         "AllowFromLoopback",
         r#"{"Version":"2012-10-17","Statement":[{
             "Effect":"Allow",
-            "Action":"sts:GetCallerIdentity",
+            "Action":"sts:GetAccessKeyInfo",
             "Resource":"*",
             "Condition":{"IpAddress":{"aws:SourceIp":"127.0.0.0/8"}}
         }]}"#,
@@ -1474,8 +1562,13 @@ async fn condition_ip_address_loopback_allows() {
     .await;
     let cfg = sdk_config_with(&server, &akid, &secret).await;
     let sts = StsClient::new(&cfg);
-    let identity = sts.get_caller_identity().send().await.unwrap();
-    assert!(identity.arn().unwrap().contains("user/frank"));
+    let info = sts
+        .get_access_key_info()
+        .access_key_id(&akid)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(info.account(), Some("123456789012"));
 }
 
 #[tokio::test]
@@ -1491,7 +1584,7 @@ async fn condition_ip_address_non_matching_cidr_denies() {
         "AllowFromExternal",
         r#"{"Version":"2012-10-17","Statement":[{
             "Effect":"Allow",
-            "Action":"sts:GetCallerIdentity",
+            "Action":"sts:GetAccessKeyInfo",
             "Resource":"*",
             "Condition":{"IpAddress":{"aws:SourceIp":"203.0.113.0/24"}}
         }]}"#,
@@ -1499,7 +1592,12 @@ async fn condition_ip_address_non_matching_cidr_denies() {
     .await;
     let cfg = sdk_config_with(&server, &akid, &secret).await;
     let sts = StsClient::new(&cfg);
-    let err = sts.get_caller_identity().send().await.unwrap_err();
+    let err = sts
+        .get_access_key_info()
+        .access_key_id(&akid)
+        .send()
+        .await
+        .unwrap_err();
     assert!(format!("{err:?}").contains("AccessDeniedException"));
 }
 
@@ -1515,7 +1613,7 @@ async fn condition_date_less_than_past_deadline_denies() {
         "AllowBefore2020",
         r#"{"Version":"2012-10-17","Statement":[{
             "Effect":"Allow",
-            "Action":"sts:GetCallerIdentity",
+            "Action":"sts:GetAccessKeyInfo",
             "Resource":"*",
             "Condition":{"DateLessThan":{"aws:CurrentTime":"2020-01-01T00:00:00Z"}}
         }]}"#,
@@ -1523,7 +1621,12 @@ async fn condition_date_less_than_past_deadline_denies() {
     .await;
     let cfg = sdk_config_with(&server, &akid, &secret).await;
     let sts = StsClient::new(&cfg);
-    let err = sts.get_caller_identity().send().await.unwrap_err();
+    let err = sts
+        .get_access_key_info()
+        .access_key_id(&akid)
+        .send()
+        .await
+        .unwrap_err();
     assert!(format!("{err:?}").contains("AccessDeniedException"));
 }
 
@@ -1547,7 +1650,12 @@ async fn condition_bool_secure_transport_deny_fires_over_http() {
     .await;
     let cfg = sdk_config_with(&server, &akid, &secret).await;
     let sts = StsClient::new(&cfg);
-    let err = sts.get_caller_identity().send().await.unwrap_err();
+    let err = sts
+        .get_access_key_info()
+        .access_key_id(&akid)
+        .send()
+        .await
+        .unwrap_err();
     assert!(format!("{err:?}").contains("AccessDeniedException"));
 }
 

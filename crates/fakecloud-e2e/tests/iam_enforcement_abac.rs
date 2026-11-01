@@ -82,14 +82,14 @@ async fn principal_tag_condition_allows_matching_user() {
     let server = start_strict().await;
     let (akid, secret) = bootstrap_tagged_user(&server, "alice", &[("Team", "platform")]).await;
 
-    // Policy: allow sts:GetCallerIdentity only if PrincipalTag/Team == platform
+    // Policy: allow sts:GetAccessKeyInfo only if PrincipalTag/Team == platform
     attach_inline_policy(
         &server,
         "alice",
         "AllowIfPlatform",
         r#"{"Version":"2012-10-17","Statement":[{
             "Effect":"Allow",
-            "Action":"sts:GetCallerIdentity",
+            "Action":"sts:GetAccessKeyInfo",
             "Resource":"*",
             "Condition":{"StringEquals":{"aws:PrincipalTag/Team":"platform"}}
         }]}"#,
@@ -98,8 +98,13 @@ async fn principal_tag_condition_allows_matching_user() {
 
     let cfg = sdk_config_with(&server, &akid, &secret).await;
     let sts = StsClient::new(&cfg);
-    let identity = sts.get_caller_identity().send().await.unwrap();
-    assert!(identity.arn().unwrap().contains("user/alice"));
+    let info = sts
+        .get_access_key_info()
+        .access_key_id(&akid)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(info.account(), Some("123456789012"));
 }
 
 #[tokio::test]
@@ -107,14 +112,14 @@ async fn principal_tag_condition_denies_non_matching_user() {
     let server = start_strict().await;
     let (akid, secret) = bootstrap_tagged_user(&server, "bob", &[("Team", "backend")]).await;
 
-    // Policy: allow sts:GetCallerIdentity only if PrincipalTag/Team == platform
+    // Policy: allow sts:GetAccessKeyInfo only if PrincipalTag/Team == platform
     attach_inline_policy(
         &server,
         "bob",
         "AllowIfPlatform",
         r#"{"Version":"2012-10-17","Statement":[{
             "Effect":"Allow",
-            "Action":"sts:GetCallerIdentity",
+            "Action":"sts:GetAccessKeyInfo",
             "Resource":"*",
             "Condition":{"StringEquals":{"aws:PrincipalTag/Team":"platform"}}
         }]}"#,
@@ -123,7 +128,12 @@ async fn principal_tag_condition_denies_non_matching_user() {
 
     let cfg = sdk_config_with(&server, &akid, &secret).await;
     let sts = StsClient::new(&cfg);
-    let err = sts.get_caller_identity().send().await.unwrap_err();
+    let err = sts
+        .get_access_key_info()
+        .access_key_id(&akid)
+        .send()
+        .await
+        .unwrap_err();
     assert!(
         format!("{err:?}").contains("AccessDeniedException"),
         "expected AccessDeniedException"
@@ -142,7 +152,7 @@ async fn principal_tag_condition_denies_user_with_no_tags() {
         "AllowIfPlatform",
         r#"{"Version":"2012-10-17","Statement":[{
             "Effect":"Allow",
-            "Action":"sts:GetCallerIdentity",
+            "Action":"sts:GetAccessKeyInfo",
             "Resource":"*",
             "Condition":{"StringEquals":{"aws:PrincipalTag/Team":"platform"}}
         }]}"#,
@@ -151,7 +161,12 @@ async fn principal_tag_condition_denies_user_with_no_tags() {
 
     let cfg = sdk_config_with(&server, &akid, &secret).await;
     let sts = StsClient::new(&cfg);
-    let err = sts.get_caller_identity().send().await.unwrap_err();
+    let err = sts
+        .get_access_key_info()
+        .access_key_id(&akid)
+        .send()
+        .await
+        .unwrap_err();
     assert!(
         format!("{err:?}").contains("AccessDeniedException"),
         "expected AccessDeniedException"
@@ -170,7 +185,7 @@ async fn principal_tag_case_sensitive_key() {
         "AllowIfPlatform",
         r#"{"Version":"2012-10-17","Statement":[{
             "Effect":"Allow",
-            "Action":"sts:GetCallerIdentity",
+            "Action":"sts:GetAccessKeyInfo",
             "Resource":"*",
             "Condition":{"StringEquals":{"aws:PrincipalTag/Team":"platform"}}
         }]}"#,
@@ -180,7 +195,12 @@ async fn principal_tag_case_sensitive_key() {
     let cfg = sdk_config_with(&server, &akid, &secret).await;
     let sts = StsClient::new(&cfg);
     // Tag key mismatch: "team" != "Team" -> condition fails -> denied
-    let err = sts.get_caller_identity().send().await.unwrap_err();
+    let err = sts
+        .get_access_key_info()
+        .access_key_id(&akid)
+        .send()
+        .await
+        .unwrap_err();
     assert!(
         format!("{err:?}").contains("AccessDeniedException"),
         "expected AccessDeniedException — tag keys are case-sensitive"

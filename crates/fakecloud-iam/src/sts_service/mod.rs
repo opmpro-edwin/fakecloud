@@ -311,6 +311,12 @@ impl AwsService for StsService {
         true
     }
 
+    /// `GetCallerIdentity` needs no permission: AWS serves it even when a
+    /// policy explicitly denies `sts:GetCallerIdentity`.
+    fn iam_authorization_exempt(&self, request: &fakecloud_core::service::AwsRequest) -> bool {
+        request.action == "GetCallerIdentity"
+    }
+
     /// STS actions operate on `*` per AWS — see
     /// <https://docs.aws.amazon.com/service-authorization/latest/reference/list_awssecuritytokenservice.html>.
     /// `AssumeRole*` variants additionally carry a role ARN as the
@@ -1764,6 +1770,20 @@ mod tests {
         let body = std::str::from_utf8(resp.body.expect_bytes()).unwrap();
         assert!(body.contains("<AccessKeyId>"));
         assert!(body.contains("<FederatedUserId>"));
+    }
+
+    /// `GetCallerIdentity` needs no permission on AWS, so it is exempt from
+    /// IAM authorization; every other STS operation is authorized.
+    #[test]
+    fn only_get_caller_identity_is_exempt_from_authorization() {
+        let (svc, _) = make_sts_service();
+        assert!(svc.iam_authorization_exempt(&sts_request("GetCallerIdentity", vec![])));
+        for action in ["GetAccessKeyInfo", "AssumeRole", "GetSessionToken"] {
+            assert!(
+                !svc.iam_authorization_exempt(&sts_request(action, vec![])),
+                "{action}"
+            );
+        }
     }
 
     // ── GetAccessKeyInfo ──
