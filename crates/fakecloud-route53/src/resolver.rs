@@ -69,6 +69,31 @@ pub fn dedup_answers(answers: &[AnswerRecord]) -> Vec<&AnswerRecord> {
 
 /// Default TTL (seconds) applied when a record set omits `TTL`.
 const DEFAULT_TTL: u32 = 300;
+/// TTL of an answer synthesized from an alias record or an AWS service name.
+/// AWS answers an alias with the target's TTL; Elastic Load Balancing names
+/// use 60 seconds.
+const ALIAS_TTL: u32 = 60;
+/// Cap on alias-to-alias hops.
+const MAX_ALIAS_HOPS: usize = 4;
+
+/// DNS names AWS serves outside Route 53 hosted zones, which alias records
+/// point at: load balancer names (`internal-<name>-<id>.<region>.elb.amazonaws.com`).
+/// The server supplies them from the services that own those names.
+pub trait ExternalNames {
+    /// The values of the `rtype` records of `name` (normalized: lowercase,
+    /// trailing dot), `Some(empty)` when the name exists without records of
+    /// that type, `None` when the name is not one of these.
+    fn records(&self, name: &str, rtype: &str) -> Option<Vec<String>>;
+}
+
+/// No names outside the hosted zones.
+pub struct NoExternalNames;
+
+impl ExternalNames for NoExternalNames {
+    fn records(&self, _name: &str, _rtype: &str) -> Option<Vec<String>> {
+        None
+    }
+}
 /// Cap on CNAME-chase hops, so a record pointing at itself (or a cycle) can't
 /// loop forever.
 const MAX_CNAME_HOPS: usize = 8;
@@ -210,6 +235,60 @@ fn records_of_type(
     }
 }
 
+/// The alias record sets of type `rtype` owned by `name_norm`: exact owner,
+/// else the single-level wildcard when the name is not itself a node.
+fn alias_targets(
+    records: &[&crate::model::ResourceRecordSet],
+    name_norm: &str,
+    rtype: &str,
+) -> Vec<String> {
+    let at = |owner: &str| -> Vec<String> {
+        records
+            .iter()
+            .filter(|rr| normalize(&rr.name) == owner && rr.record_type.eq_ignore_ascii_case(rtype))
+            .filter_map(|rr| rr.alias_target.as_ref())
+            .map(|a| normalize(&a.dns_name))
+            .collect()
+    };
+    let exact = at(name_norm);
+    if !exact.is_empty() || name_is_node(records, name_norm) {
+        return exact;
+    }
+    wildcard_of(name_norm).map(|w| at(&w)).unwrap_or_default()
+}
+
+/// Answers for an alias of type `rtype` at `name_norm`: the records of each
+/// alias target -- an AWS service name from `external`, or a name in the
+/// local zones (resolved recursively) -- under the queried name.
+fn alias_answers(
+    accounts: &Route53Accounts,
+    records: &[&crate::model::ResourceRecordSet],
+    name_norm: &str,
+    rtype: &str,
+    external: &dyn ExternalNames,
+    alias_depth: usize,
+) -> Vec<AnswerRecord> {
+    let mut out = Vec::new();
+    for target in alias_targets(records, name_norm, rtype) {
+        let values: Vec<(u32, String)> = match external.records(&target, rtype) {
+            Some(values) => values.into_iter().map(|v| (ALIAS_TTL, v)).collect(),
+            None => resolve_depth(accounts, &target, rtype, external, alias_depth + 1)
+                .answers
+                .into_iter()
+                .filter(|a| a.rtype.eq_ignore_ascii_case(rtype))
+                .map(|a| (a.ttl, a.value))
+                .collect(),
+        };
+        out.extend(values.into_iter().map(|(ttl, value)| AnswerRecord {
+            name: name_norm.to_string(),
+            rtype: rtype.to_string(),
+            ttl,
+            value,
+        }));
+    }
+    out
+}
+
 /// True when `name_norm` is covered (NODATA rather than NXDOMAIN): it is a node
 /// in the tree (exact owner or empty non-terminal) or a single-level wildcard
 /// applies to it.
@@ -231,17 +310,59 @@ fn name_exists(records: &[&crate::model::ResourceRecordSet], name_norm: &str) ->
 /// CNAME is returned and, when its target is itself in a local zone, the chased
 /// address records are appended.
 pub fn resolve(accounts: &Route53Accounts, qname: &str, qtype: &str) -> Resolution {
+    resolve_with(accounts, qname, qtype, &NoExternalNames)
+}
+
+/// [`resolve`], also answering the AWS service names in `external` and alias
+/// records that point at them (or at other records in the local zones).
+pub fn resolve_with(
+    accounts: &Route53Accounts,
+    qname: &str,
+    qtype: &str,
+    external: &dyn ExternalNames,
+) -> Resolution {
+    resolve_depth(accounts, qname, qtype, external, 0)
+}
+
+fn resolve_depth(
+    accounts: &Route53Accounts,
+    qname: &str,
+    qtype: &str,
+    external: &dyn ExternalNames,
+    alias_depth: usize,
+) -> Resolution {
     let qname_norm = normalize(qname);
     let qtype_uc = qtype.to_ascii_uppercase();
 
     let records = match authoritative_records(accounts, &qname_norm) {
         Some(r) => r,
         None => {
-            return Resolution {
-                answers: Vec::new(),
-                status: ResolveStatus::NotAuthoritative,
-                external_cname: None,
-            }
+            // An AWS service name (a load balancer's DNSName) lives in no
+            // hosted zone here but is answered locally.
+            return match external.records(&qname_norm, &qtype_uc) {
+                Some(values) => Resolution {
+                    status: if values.is_empty() {
+                        ResolveStatus::NoData
+                    } else {
+                        ResolveStatus::Answered
+                    },
+                    answers: values
+                        .into_iter()
+                        .map(|value| AnswerRecord {
+                            name: qname_norm.clone(),
+                            rtype: qtype_uc.clone(),
+                            ttl: ALIAS_TTL,
+                            value,
+                        })
+                        .collect(),
+                    external_cname: None,
+                },
+                None => Resolution {
+                    answers: Vec::new(),
+                    status: ResolveStatus::NotAuthoritative,
+                    external_cname: None,
+                },
+            };
         }
     };
 
@@ -292,6 +413,26 @@ pub fn resolve(accounts: &Route53Accounts, qname: &str, qtype: &str) -> Resoluti
             status: ResolveStatus::Answered,
             external_cname: None,
         };
+    }
+
+    // An alias record of the requested type: answered with the target's
+    // records under the queried name, as Route 53 does.
+    if alias_depth < MAX_ALIAS_HOPS {
+        let aliased = alias_answers(
+            accounts,
+            &records,
+            &qname_norm,
+            &qtype_uc,
+            external,
+            alias_depth,
+        );
+        if !aliased.is_empty() {
+            return Resolution {
+                answers: aliased,
+                status: ResolveStatus::Answered,
+                external_cname: None,
+            };
+        }
     }
 
     // A query for any type other than CNAME that lands on a CNAME: return the
@@ -910,5 +1051,116 @@ mod tests {
             )],
         );
         assert!(zone_soa(&acc, "elsewhere.org").is_none());
+    }
+
+    fn alias(name: &str, rtype: &str, target: &str) -> ResourceRecordSet {
+        ResourceRecordSet {
+            name: name.to_string(),
+            record_type: rtype.to_string(),
+            alias_target: Some(crate::model::AliasTarget {
+                hosted_zone_id: "Z1LMS91P8CMLE5".to_string(),
+                dns_name: target.to_string(),
+                evaluate_target_health: false,
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Load balancer names, as the server supplies them from ELBv2.
+    struct Elb;
+    impl ExternalNames for Elb {
+        fn records(&self, name: &str, rtype: &str) -> Option<Vec<String>> {
+            if name != "internal-alb-1234.ap-southeast-1.elb.amazonaws.com." {
+                return None;
+            }
+            Some(if rtype == "A" {
+                vec!["10.40.4.10".to_string(), "10.40.5.10".to_string()]
+            } else {
+                Vec::new()
+            })
+        }
+    }
+
+    #[test]
+    fn alias_to_a_load_balancer_answers_its_addresses() {
+        let acc = accounts_with(
+            "000000000000",
+            vec![zone(
+                "int.example.test.",
+                vec![
+                    alias(
+                        "app.int.example.test.",
+                        "A",
+                        "dualstack.internal-alb-1234.ap-southeast-1.elb.amazonaws.com.",
+                    ),
+                    alias(
+                        "api.int.example.test.",
+                        "A",
+                        "Internal-ALB-1234.ap-southeast-1.elb.amazonaws.com",
+                    ),
+                ],
+            )],
+        );
+        // An unknown target (the `dualstack.` form here) answers nothing.
+        let r = resolve_with(&acc, "app.int.example.test", "A", &Elb);
+        assert_eq!(r.status, ResolveStatus::NoData);
+        let r = resolve_with(&acc, "api.int.example.test", "A", &Elb);
+        assert_eq!(r.status, ResolveStatus::Answered);
+        let values: Vec<&str> = r.answers.iter().map(|a| a.value.as_str()).collect();
+        assert_eq!(values, vec!["10.40.4.10", "10.40.5.10"]);
+        assert!(r
+            .answers
+            .iter()
+            .all(|a| a.name == "api.int.example.test." && a.rtype == "A" && a.ttl == ALIAS_TTL));
+        // Without external names the alias resolves to nothing, as before.
+        assert_eq!(
+            resolve(&acc, "api.int.example.test", "A").status,
+            ResolveStatus::NoData
+        );
+    }
+
+    #[test]
+    fn load_balancer_name_itself_is_answered() {
+        let acc = accounts_with("000000000000", Vec::new());
+        let r = resolve_with(
+            &acc,
+            "internal-alb-1234.ap-southeast-1.elb.amazonaws.com",
+            "A",
+            &Elb,
+        );
+        assert_eq!(r.status, ResolveStatus::Answered);
+        assert_eq!(r.answers.len(), 2);
+        let r = resolve_with(
+            &acc,
+            "internal-alb-1234.ap-southeast-1.elb.amazonaws.com",
+            "AAAA",
+            &Elb,
+        );
+        assert_eq!(r.status, ResolveStatus::NoData);
+        let r = resolve_with(&acc, "example.org", "A", &Elb);
+        assert_eq!(r.status, ResolveStatus::NotAuthoritative);
+    }
+
+    #[test]
+    fn alias_to_a_local_record_and_alias_loops_are_bounded() {
+        let acc = accounts_with(
+            "000000000000",
+            vec![zone(
+                "example.com.",
+                vec![
+                    rrset("www.example.com.", "A", 30, &["192.0.2.7"]),
+                    alias("example.com.", "A", "www.example.com."),
+                    alias("loop-a.example.com.", "A", "loop-b.example.com."),
+                    alias("loop-b.example.com.", "A", "loop-a.example.com."),
+                ],
+            )],
+        );
+        let r = resolve(&acc, "example.com", "A");
+        assert_eq!(r.status, ResolveStatus::Answered);
+        assert_eq!(r.answers[0].value, "192.0.2.7");
+        assert_eq!(r.answers[0].name, "example.com.");
+        assert_eq!(r.answers[0].ttl, 30);
+        let r = resolve(&acc, "loop-a.example.com", "A");
+        assert_eq!(r.status, ResolveStatus::NoData);
     }
 }

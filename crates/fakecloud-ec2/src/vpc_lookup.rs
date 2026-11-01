@@ -33,6 +33,19 @@ pub fn with_account<R>(
     f(accounts.get_or_create(account_id))
 }
 
+/// Subnet-to-VPC lookups for the ECS runtime, which gives a task its VPC's
+/// DNS server (see `fakecloud_core::vpc_network`) without depending on EC2.
+pub struct Ec2VpcDirectory(pub SharedEc2State);
+
+impl fakecloud_core::vpc_network::VpcDirectory for Ec2VpcDirectory {
+    fn subnet_vpc_cidr(&self, account_id: &str, subnet_id: &str) -> Option<String> {
+        let accounts = self.0.read();
+        let state = accounts.get(account_id)?;
+        let subnet = state.subnets.get(subnet_id)?;
+        state.vpcs.get(&subnet.vpc_id).map(|v| v.cidr_block.clone())
+    }
+}
+
 /// The facts about a subnet other services report back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubnetInfo {

@@ -1404,6 +1404,7 @@ mod tests {
                     attributes: std::collections::BTreeMap::new(),
                     minimum_capacity_units: None,
                     bound_port: None,
+                    interfaces: Vec::new(),
                 },
             );
         }

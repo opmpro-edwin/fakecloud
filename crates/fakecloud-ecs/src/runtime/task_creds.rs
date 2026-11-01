@@ -62,8 +62,14 @@ pub(crate) const K8S_INIT_CONTAINER: &str = "fakecloud-ecs-creds";
 /// owns the namespace) or `once` to exit (the Kubernetes initContainer).
 /// Without `nft`/`iptables` on an Alpine image it installs `nftables` first.
 /// It tries `nft`, then `iptables` if `nft` is missing or its rule is refused.
+///
+/// The optional `$4`..`$6` give the namespace its VPC (see `vpc_net`, nft
+/// only): DNS (UDP and TCP 53) to the addresses in `$5` goes to `$1:$4`, and
+/// with `$6` = `lb` TCP connections follow the `lb` map, which fakecloud
+/// fills with the load balancer addresses afterwards.
 pub(crate) const SETUP_SCRIPT: &str = r#"set -eu
 host="$1"; port="$2"; mode="$3"
+dns_port="${4:-}"; dns_addrs="${5:-}"; lb="${6:-}"
 have() { command -v "$1" >/dev/null 2>&1; }
 if ! have nft && ! have iptables && have apk; then
   apk add --no-cache -q nftables >/dev/null
@@ -73,13 +79,25 @@ if [ -z "$ip" ]; then
   echo "fakecloud-ecs-creds: cannot resolve $host" >&2
   exit 1
 fi
+nl='
+'
+vpc=""; lbmap=""
+if [ -n "$dns_port" ]; then
+  for proto in udp tcp; do
+    vpc="$vpc  ip daddr { $dns_addrs } $proto dport 53 dnat to $ip:$dns_port$nl"
+  done
+fi
+if [ "$lb" = lb ]; then
+  lbmap=" map lb {$nl  type ipv4_addr . inet_service : ipv4_addr . inet_service$nl }$nl"
+  vpc="$vpc  meta l4proto tcp dnat ip to ip daddr . tcp dport map @lb$nl"
+fi
 # nft first; iptables when nft is missing or the kernel refuses its rule.
 # Both are idempotent: a re-run in the same namespace replaces the rule.
-if have nft && printf 'table ip fakecloud_ecs_creds\ndelete table ip fakecloud_ecs_creds\ntable ip fakecloud_ecs_creds {\n chain output {\n  type nat hook output priority -100; policy accept;\n  ip daddr 169.254.170.2 tcp dport 80 dnat to %s:%s\n }\n}\n' "$ip" "$port" | nft -f -; then
+if have nft && printf 'table ip fakecloud_ecs_creds\ndelete table ip fakecloud_ecs_creds\ntable ip fakecloud_ecs_creds {\n%s chain output {\n  type nat hook output priority -100; policy accept;\n  ip daddr 169.254.170.2 tcp dport 80 dnat to %s:%s\n%s }\n}\n' "$lbmap" "$ip" "$port" "$vpc" | nft -f -; then
   :
 elif have iptables && rule="-d 169.254.170.2/32 -p tcp --dport 80 -j DNAT --to-destination $ip:$port" \
   && { iptables -t nat -C OUTPUT $rule 2>/dev/null || iptables -t nat -A OUTPUT $rule; }; then
-  :
+  [ -z "$vpc" ] || echo "fakecloud-ecs-creds: no nft; VPC DNS and load balancer addresses are not routed" >&2
 else
   echo "fakecloud-ecs-creds: could not install the NAT rule with nft or iptables" >&2
   exit 1
@@ -245,12 +263,13 @@ pub(crate) fn is_none_network(plan: &ContainerPlan) -> bool {
     plan.network_mode.as_deref() == Some("none")
 }
 
-/// Whether a container gets a namespace holder routing `169.254.170.2`.
-/// Only task-role containers need one, and a `none`-mode container has no
-/// network to route over: as on ECS, it gets the relative URI with nothing
-/// answering it.
+/// Whether a container gets a namespace holder routing `169.254.170.2` (and,
+/// with VPC networking, the VPC's DNS server and load balancer addresses; see
+/// `vpc_net`). Task-role containers need one, every container does under VPC
+/// networking, and a `none`-mode container has no network to route over: as
+/// on ECS, it gets the relative URI with nothing answering it.
 pub(crate) fn wants_netns_holder(plan: &ContainerPlan) -> bool {
-    plan.has_task_role && !is_none_network(plan)
+    (plan.has_task_role || super::vpc_net::enabled()) && !is_none_network(plan)
 }
 
 /// The network flags of the container that owns a task container's network
@@ -310,7 +329,13 @@ pub(crate) fn namespace_network_argv(
     argv
 }
 
-/// `docker run` argv for the holder of `plan`'s network namespace.
+/// Docker's host alias. Podman's (`host.containers.internal`) is written to
+/// the hosts file by podman itself.
+const DOCKER_HOST_ALIAS: &str = "host.docker.internal";
+
+/// `docker run` argv for the holder of `plan`'s network namespace. With
+/// `vpc_dns` the namespace resolves through the VPC's DNS server and the
+/// setup script routes it and the load balancer addresses (see `vpc_net`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_holder_argv(
     plan: &ContainerPlan,
@@ -320,6 +345,7 @@ pub(crate) fn build_holder_argv(
     helper_image: &str,
     fakecloud_host: &str,
     fakecloud_port: u16,
+    vpc_dns: Option<&super::vpc_net::VpcDns>,
 ) -> Vec<String> {
     let app_name = format!("{}-{}", task_id, plan.container_name);
     let mut argv: Vec<String> = vec![
@@ -337,10 +363,17 @@ pub(crate) fn build_holder_argv(
         "--cap-add".into(),
         "NET_ADMIN".into(),
     ];
+    // The VPC resolver replaces the engine's, which is what resolves
+    // `host.docker.internal` on Docker Desktop when fakecloud runs in a
+    // container (no `--add-host` then): pin the alias in the namespace's
+    // hosts file instead, so the setup script and the app still resolve it.
+    let pinned_alias =
+        (add_host_arg.is_none() && vpc_dns.is_some() && fakecloud_host == DOCKER_HOST_ALIAS)
+            .then(|| format!("{DOCKER_HOST_ALIAS}:host-gateway"));
     argv.extend(namespace_network_argv(
         plan,
         task_id,
-        add_host_arg,
+        add_host_arg.or(pinned_alias.as_deref()),
         awsvpc_network_ready,
         Some(&app_name),
     ));
@@ -349,6 +382,13 @@ pub(crate) fn build_holder_argv(
             argv.push("--sysctl".into());
             argv.push(format!("{}={}", sys.name, sys.value));
         }
+    }
+    // The namespace's resolv.conf (or, on a per-task network, the engine's
+    // embedded DNS, which forwards from inside the namespace) names the VPC
+    // DNS server; the setup script sends it to fakecloud.
+    if let Some(vpc) = vpc_dns {
+        argv.push("--dns".into());
+        argv.push(vpc.server.to_string());
     }
     argv.extend([
         "--entrypoint".into(),
@@ -361,6 +401,9 @@ pub(crate) fn build_holder_argv(
         fakecloud_port.to_string(),
         "hold".into(),
     ]);
+    if let Some(vpc) = vpc_dns {
+        argv.extend(vpc.script_args());
+    }
     argv
 }
 
@@ -502,6 +545,7 @@ impl EcsRuntime {
         task_id: &str,
         awsvpc_network_ready: bool,
         helper_image: &str,
+        vpc_dns: Option<&super::vpc_net::VpcDns>,
     ) -> Result<String, String> {
         let name = holder_name(task_id, &plan.container_name);
         // A holder left by an earlier attempt of this task would block the name.
@@ -514,6 +558,7 @@ impl EcsRuntime {
             helper_image,
             &self.net.host_alias,
             self.server_port,
+            vpc_dns,
         );
         let out = match self.cli_output(&argv, CONTAINER_RUN_TIMEOUT).await {
             Ok(out) if out.status.success() => out,
@@ -530,6 +575,10 @@ impl EcsRuntime {
         if let Err(e) = self.wait_for_holder_ready(&id).await {
             let _ = self.cli_output(["rm", "-f", &id], CLI_CALL_TIMEOUT).await;
             return Err(e);
+        }
+        // Load balancer addresses route before the task's container starts.
+        if vpc_dns.is_some() {
+            super::vpc_net::attach_holder(self.container_cli(), &id, &self.net.host_alias).await;
         }
         self.netns_holders
             .write()
@@ -588,6 +637,7 @@ impl EcsRuntime {
     /// its per-task network is removed (the holders are attached to it).
     pub(crate) async fn remove_netns_holders(&self, task_id: &str) {
         let ids = self.netns_holders.write().remove(task_id);
+        super::vpc_net::detach_holders(ids.as_deref().unwrap_or_default());
         for id in ids.into_iter().flatten() {
             let _ = self.cli_output(["rm", "-f", &id], CLI_CALL_TIMEOUT).await;
         }
@@ -668,6 +718,7 @@ mod tests {
             "helper:1",
             "host.docker.internal",
             4566,
+            None,
         );
         let joined = argv.join(" ");
         assert!(joined.starts_with("run -d --name fakecloud-ecs-netns-t1-web "));
@@ -716,6 +767,7 @@ mod tests {
             "helper:1",
             "host.containers.internal",
             4566,
+            None,
         );
         let joined = argv.join(" ");
         assert!(
@@ -794,6 +846,111 @@ mod tests {
         );
         let (ok, _, calls) = run(None);
         assert!(ok && calls.starts_with("iptables"), "{calls}");
+    }
+
+    /// With the VPC arguments the nft ruleset also sends DNS for the VPC
+    /// resolver addresses to fakecloud's DNS port and declares the load
+    /// balancer map; the holder gets the VPC DNS server as its resolver.
+    #[test]
+    fn setup_script_routes_vpc_dns_and_load_balancer_addresses() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let ruleset = dir.path().join("ruleset");
+        let tool = |name: &str, body: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        for util in ["awk", "cat"] {
+            let real = ["/usr/bin", "/bin"]
+                .iter()
+                .map(|d| std::path::Path::new(d).join(util))
+                .find(|p| p.exists())
+                .unwrap_or_else(|| panic!("{util} not found"));
+            std::os::unix::fs::symlink(real, dir.path().join(util)).unwrap();
+        }
+        tool("getent", "echo '10.1.2.3 STREAM host'");
+        tool("nft", &format!("cat > {}", ruleset.display()));
+        let vpc = super::super::vpc_net::VpcDns {
+            server: std::net::Ipv4Addr::new(10, 40, 0, 2),
+            port: 15353,
+        };
+        let mut args = vec![
+            "-c".to_string(),
+            SETUP_SCRIPT.to_string(),
+            "t".to_string(),
+            "host".to_string(),
+            "4566".to_string(),
+            "once".to_string(),
+        ];
+        args.extend(vpc.script_args());
+        let out = std::process::Command::new("/bin/sh")
+            .args(&args)
+            .env("PATH", dir.path())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let rules = std::fs::read_to_string(&ruleset).unwrap();
+        for line in [
+            "ip daddr 169.254.170.2 tcp dport 80 dnat to 10.1.2.3:4566",
+            "ip daddr { 10.40.0.2, 169.254.169.253 } udp dport 53 dnat to 10.1.2.3:15353",
+            "ip daddr { 10.40.0.2, 169.254.169.253 } tcp dport 53 dnat to 10.1.2.3:15353",
+            "type ipv4_addr . inet_service : ipv4_addr . inet_service",
+            "meta l4proto tcp dnat ip to ip daddr . tcp dport map @lb",
+        ] {
+            assert!(rules.contains(line), "{line} missing from:\n{rules}");
+        }
+        // Without them the ruleset is the credentials rule alone.
+        let out = std::process::Command::new("/bin/sh")
+            .args(&args[..6])
+            .env("PATH", dir.path())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let rules = std::fs::read_to_string(&ruleset).unwrap();
+        assert!(
+            !rules.contains("dport 53") && !rules.contains("map"),
+            "{rules}"
+        );
+
+        let argv = build_holder_argv(
+            &plan(Some("awsvpc")),
+            "t1",
+            None,
+            true,
+            "helper:1",
+            "host.docker.internal",
+            4566,
+            Some(&vpc),
+        );
+        let joined = argv.join(" ");
+        assert!(
+            joined.contains("--dns 10.40.0.2 --entrypoint sh"),
+            "{joined}"
+        );
+        assert!(
+            joined.ends_with("hold 15353 10.40.0.2, 169.254.169.253 lb"),
+            "{joined}"
+        );
+        // No `--add-host` from the runtime (a containerized fakecloud on
+        // Docker Desktop): the alias is pinned, since the VPC resolver
+        // replaces the engine's.
+        assert!(
+            joined.contains("--add-host host.docker.internal:host-gateway"),
+            "{joined}"
+        );
+        let podman = build_holder_argv(
+            &plan(Some("awsvpc")),
+            "t1",
+            None,
+            true,
+            "helper:1",
+            "host.containers.internal",
+            4566,
+            Some(&vpc),
+        )
+        .join(" ");
+        assert!(!podman.contains("--add-host"), "{podman}");
     }
 
     #[test]

@@ -147,6 +147,7 @@ pub struct EcsRuntime {
 mod aws_env;
 mod config;
 pub(crate) mod eni;
+mod extra_ca;
 mod k8s;
 mod lb;
 mod monitoring;
@@ -154,6 +155,7 @@ mod secrets;
 mod task_creds;
 pub use task_creds::{task_credentials_token, AUTHORIZATION_TOKEN_ENV};
 mod task_lifecycle;
+mod vpc_net;
 
 /// The initContainer the Kubernetes backend puts first in a task-role Pod:
 /// it NATs the ECS agent's `169.254.170.2:80` to `host:port` in the Pod's

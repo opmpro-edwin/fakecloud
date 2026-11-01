@@ -455,6 +455,7 @@ mod tests {
                     attributes: Default::default(),
                     minimum_capacity_units: None,
                     bound_port: None,
+                    interfaces: Vec::new(),
                 },
             );
         assert_eq!(restore_canonical_hosted_zone_ids(&mut accounts), 1);

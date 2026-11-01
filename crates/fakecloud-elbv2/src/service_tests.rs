@@ -1282,3 +1282,152 @@ async fn describe_account_limits_pages() {
     assert_eq!(body.matches("<member>").count(), 2, "{body}");
     assert!(body.contains("<NextMarker>2</NextMarker>"), "{body}");
 }
+
+#[tokio::test]
+async fn alb_gets_an_interface_per_subnet_that_its_dns_name_resolves_to() {
+    let (svc, ec2) = ec2_svc();
+    let subnets = fakecloud_ec2::vpc_lookup::default_vpc_subnets(&ec2, "123456789012");
+    let resp = svc
+        .handle(req(
+            "CreateLoadBalancer",
+            &[
+                ("Name", "edge"),
+                ("Scheme", "internal"),
+                ("Subnets.member.1", &subnets[0].subnet_id),
+                ("Subnets.member.2", &subnets[1].subnet_id),
+            ],
+        ))
+        .await
+        .unwrap();
+    let body = body_string(&resp);
+    let arn = xml_field(&body, "LoadBalancerArn");
+    let dns_name = xml_field(&body, "DNSName");
+    assert!(dns_name.starts_with("internal-edge-"), "{dns_name}");
+    let suffix = arn.rsplit('/').next().unwrap().to_string();
+
+    let enis = |ec2: &fakecloud_ec2::SharedEc2State| -> Vec<(String, String, String)> {
+        let accounts = ec2.read();
+        let mut v: Vec<_> = accounts
+            .get("123456789012")
+            .unwrap()
+            .network_interfaces
+            .values()
+            .filter(|e| e.description.starts_with("ELB "))
+            .map(|e| {
+                assert!(e.requester_managed);
+                (
+                    e.subnet_id.clone(),
+                    e.private_ip_address.clone(),
+                    e.description.clone(),
+                )
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    let first = enis(&ec2);
+    assert_eq!(first.len(), 2);
+    assert!(first
+        .iter()
+        .all(|(_, _, d)| d == &format!("ELB app/edge/{suffix}")));
+    assert_ne!(first[0].1, first[1].1);
+
+    // The DNS name (any case, `dualstack.` or not, trailing dot or not)
+    // answers the interfaces' addresses; AAAA answers nothing.
+    let mut ips = crate::addresses::dns_records(&svc.state, &dns_name, "A").unwrap();
+    ips.sort();
+    let mut want: Vec<String> = first.iter().map(|(_, ip, _)| ip.clone()).collect();
+    want.sort();
+    assert_eq!(ips, want);
+    let upper = format!("dualstack.{}.", dns_name.to_uppercase());
+    assert_eq!(
+        crate::addresses::dns_records(&svc.state, &upper, "A")
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        crate::addresses::dns_records(&svc.state, &dns_name, "AAAA"),
+        Some(Vec::new())
+    );
+    assert_eq!(
+        crate::addresses::dns_records(&svc.state, "other.elb.amazonaws.com", "A"),
+        None
+    );
+
+    // Leaving a subnet gives its address back; the other one is kept.
+    svc.handle(req(
+        "SetSubnets",
+        &[
+            ("LoadBalancerArn", &arn),
+            ("Subnets.member.1", &subnets[1].subnet_id),
+        ],
+    ))
+    .await
+    .unwrap();
+    let after = enis(&ec2);
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].0, subnets[1].subnet_id);
+    assert!(first.contains(&after[0]));
+
+    // Listener routes: a frontend when configured, else the data plane port.
+    let tg = body_string(
+        &svc.handle(req(
+            "CreateTargetGroup",
+            &[("Name", "tg"), ("Protocol", "HTTP"), ("Port", "80")],
+        ))
+        .await
+        .unwrap(),
+    );
+    let tg_arn = xml_field(&tg, "TargetGroupArn");
+    for (port, protocol) in [("80", "HTTP"), ("443", "HTTPS")] {
+        let mut params = vec![
+            ("LoadBalancerArn", arn.as_str()),
+            ("Protocol", protocol),
+            ("Port", port),
+            ("DefaultActions.member.1.Type", "forward"),
+            ("DefaultActions.member.1.TargetGroupArn", tg_arn.as_str()),
+        ];
+        if protocol == "HTTPS" {
+            params.push((
+                "Certificates.member.1.CertificateArn",
+                "arn:aws:acm:us-east-1:123456789012:certificate/abc",
+            ));
+        }
+        svc.handle(req("CreateListener", &params)).await.unwrap();
+    }
+    let routes = crate::addresses::Routes::new(svc.state.clone());
+    // Data plane not bound and no frontend: nothing to route to.
+    assert!(routes.routes_with(None, None).is_empty());
+    svc.state
+        .write()
+        .get_mut("123456789012")
+        .unwrap()
+        .load_balancers
+        .get_mut(&arn)
+        .unwrap()
+        .bound_port = Some(41000);
+    let edge = ("host.docker.internal".to_string(), 24443);
+    let mut got: Vec<(u16, Option<String>, u16)> = routes
+        .routes_with(Some(&edge), None)
+        .into_iter()
+        .map(|r| {
+            assert_eq!(r.address.to_string(), after[0].1);
+            (r.port, r.target_host, r.target_port)
+        })
+        .collect();
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            (80, None, 41000),
+            (443, Some("host.docker.internal".to_string()), 24443),
+        ]
+    );
+
+    // Deleting the load balancer deletes its interfaces.
+    svc.handle(req("DeleteLoadBalancer", &[("LoadBalancerArn", &arn)]))
+        .await
+        .unwrap();
+    assert!(enis(&ec2).is_empty());
+}

@@ -54,9 +54,22 @@ const TYPE_OPT: u16 = 41;
 #[derive(Clone)]
 pub struct DnsConfig {
     pub route53: SharedRoute53State,
+    /// AWS service names answered outside the hosted zones (load balancer DNS
+    /// names), which alias records point at.
+    pub external: Arc<dyn resolver::ExternalNames + Send + Sync>,
     /// Upstream resolver for names in no local zone. `None` disables forwarding
     /// (non-authoritative names then get SERVFAIL).
     pub upstream: Option<SocketAddr>,
+}
+
+/// Load balancer DNS names, answered with the private IPs of the load
+/// balancers' network interfaces (see `fakecloud_elbv2::addresses`).
+pub struct LoadBalancerNames(pub fakecloud_elbv2::SharedElbv2State);
+
+impl resolver::ExternalNames for LoadBalancerNames {
+    fn records(&self, name: &str, rtype: &str) -> Option<Vec<String>> {
+        fakecloud_elbv2::addresses::dns_records(&self.0, name, rtype)
+    }
 }
 
 /// A parsed single-question DNS query.
@@ -197,7 +210,8 @@ async fn handle_query(cfg: &DnsConfig, raw: &[u8], udp: bool) -> Option<Vec<u8>>
     let qtype_str = qtype_to_str(query.qtype);
     let (resolution, soa) = {
         let accounts = cfg.route53.read();
-        let resolution = resolver::resolve(&accounts, &query.qname, qtype_str);
+        let resolution =
+            resolver::resolve_with(&accounts, &query.qname, qtype_str, cfg.external.as_ref());
         // Fetch the zone SOA for the negative-response authority section while
         // we still hold the read guard (RFC 2308 negative caching).
         let soa = match resolution.status {

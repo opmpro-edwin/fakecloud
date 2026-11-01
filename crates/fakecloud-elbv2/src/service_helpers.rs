@@ -308,6 +308,11 @@ pub(crate) fn lb_not_found(arn: &str) -> AwsServiceError {
     )
 }
 
+/// A load balancer's DNSName in AWS's format: `[internal-]<name>-<id>.<region>.elb.amazonaws.com`.
+pub fn lb_dns_name(name: &str, scheme: &str, region: &str, suffix: &str) -> String {
+    build_dns_name(name, "", scheme, region, suffix)
+}
+
 pub(crate) fn build_dns_name(
     name: &str,
     _lb_type: &str,

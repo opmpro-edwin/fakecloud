@@ -26,3 +26,4 @@ pub mod tags;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 pub mod validation;
+pub mod vpc_network;

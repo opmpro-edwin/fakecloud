@@ -504,6 +504,7 @@ mod tests {
             attributes: attrs,
             minimum_capacity_units: None,
             bound_port: None,
+            interfaces: Vec::new(),
         }
     }
 

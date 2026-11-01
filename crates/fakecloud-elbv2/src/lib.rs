@@ -1,4 +1,5 @@
 pub mod accesslogs;
+pub mod addresses;
 pub mod dataplane;
 pub mod network;
 pub mod prober;
@@ -8,6 +9,7 @@ pub(crate) mod state;
 
 pub const ELBV2_NAMESPACE: &str = "http://elasticloadbalancing.amazonaws.com/doc/2015-12-01/";
 
+pub use service::lb_dns_name;
 pub use service::normalize_action_config;
 pub use service::Elbv2Service;
 pub use state::{

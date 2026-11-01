@@ -120,12 +120,28 @@ const DNS_INTROSPECTION_TYPES: &[&str] = &[
 /// Handler for `GET /_fakecloud/dns/resolve?name=<n>&type=<A|...>`. Returns what
 /// the DNS resolver would answer for the name+type straight from the Route 53
 /// records, so a test can assert resolution without opening a socket.
+#[cfg(test)]
 fn dns_resolve_introspection(
     route53: &fakecloud_route53::SharedRoute53State,
     params: &std::collections::HashMap<String, String>,
 ) -> axum::response::Response {
+    dns_resolve_introspection_with(
+        route53,
+        &fakecloud_route53::resolver::NoExternalNames,
+        params,
+    )
+}
+
+/// [`dns_resolve_introspection`], also answering the load balancer names in
+/// `external` and alias records pointing at them, as the `--dns` resolver
+/// does.
+fn dns_resolve_introspection_with(
+    route53: &fakecloud_route53::SharedRoute53State,
+    external: &dyn fakecloud_route53::resolver::ExternalNames,
+    params: &std::collections::HashMap<String, String>,
+) -> axum::response::Response {
     use axum::response::IntoResponse;
-    use fakecloud_route53::resolver::{resolve, ResolveStatus};
+    use fakecloud_route53::resolver::{resolve_with, ResolveStatus};
 
     let name = match params.get("name").map(|n| n.trim()) {
         Some(n) if !n.is_empty() => n,
@@ -157,7 +173,7 @@ fn dns_resolve_introspection(
 
     let resolution = {
         let accounts = route53.read();
-        resolve(&accounts, name, &qtype)
+        resolve_with(&accounts, name, &qtype, external)
     };
     let status = match resolution.status {
         ResolveStatus::Answered => "ANSWERED",
@@ -580,6 +596,10 @@ async fn main() {
     // `/_fakecloud/reset/ec2` (which also tears down the backing containers).
     let ec2_state: SharedEc2State = Arc::new(parking_lot::RwLock::new(
         fakecloud_core::multi_account::MultiAccountState::new("000000000000", "us-east-1", ""),
+    ));
+    // ECS tasks get their VPC's DNS server from the subnet they run in.
+    fakecloud_core::vpc_network::set_vpc_directory(Arc::new(
+        fakecloud_ec2::vpc_lookup::Ec2VpcDirectory(ec2_state.clone()),
     ));
     let route53_state: fakecloud_route53::SharedRoute53State = Arc::new(parking_lot::RwLock::new(
         fakecloud_route53::Route53Accounts::new(),
@@ -3704,6 +3724,19 @@ async fn main() {
                                     );
                                 }
                                 *elbv2_state.write() = accounts;
+                                let fixed = fakecloud_elbv2::addresses::restore_interfaces(
+                                    &elbv2_state,
+                                    &ec2_state,
+                                );
+                                if fixed > 0 {
+                                    tracing::info!(
+                                        fixed,
+                                        "gave restored load balancers their network interfaces"
+                                    );
+                                    if let Some(hook) = cfn_snapshot_hooks.get("ec2") {
+                                        hook().await;
+                                    }
+                                }
                                 tracing::info!("loaded elbv2 persistence snapshot");
                             }
                         }
@@ -3725,6 +3758,7 @@ async fn main() {
         };
     let mut elbv2_inner = Elbv2Service::new_without_dataplane(elbv2_state.clone())
         .with_ec2_state(ec2_state.clone())
+        .with_ec2_snapshot_hook(cfn_snapshot_hooks.get("ec2").cloned())
         .with_waf_state(wafv2_state.clone())
         .with_delivery_bus(elbv2_delivery_bus);
     if let Some(store) = elbv2_snapshot_store.clone() {
@@ -7850,11 +7884,15 @@ async fn main() {
             "/_fakecloud/dns/resolve",
             axum::routing::get({
                 let route53 = route53_state.clone();
+                let names = Arc::new(dns::LoadBalancerNames(elbv2_state.clone()));
                 move |axum::extract::Query(params): axum::extract::Query<
                     std::collections::HashMap<String, String>,
                 >| {
                     let route53 = route53.clone();
-                    async move { dns_resolve_introspection(&route53, &params) }
+                    let names = names.clone();
+                    async move {
+                        dns_resolve_introspection_with(&route53, names.as_ref(), &params)
+                    }
                 }
             }),
         )
@@ -12805,8 +12843,12 @@ async fn main() {
     if cli.dns {
         let dns_cfg = dns::DnsConfig {
             route53: route53_state.clone(),
+            external: Arc::new(dns::LoadBalancerNames(elbv2_state.clone())),
             upstream: cli.dns_upstream(),
         };
+        // ECS tasks reach this listener as their VPC's DNS server (see
+        // `fakecloud_core::vpc_network`).
+        fakecloud_core::vpc_network::set_dns_port(Some(cli.dns_addr().port()));
         tokio::spawn(dns::run(dns_cfg, cli.dns_addr()));
     }
     axum::serve(

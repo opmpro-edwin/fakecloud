@@ -246,6 +246,10 @@ impl EcsRuntime {
         } else {
             None
         };
+        // The VPC's DNS server and load balancer addresses (see `vpc_net`),
+        // and the opt-in extra CA (see `extra_ca`), read once per task.
+        let vpc_dns = super::vpc_net::task_vpc_dns(state, account_id, task_id);
+        let extra_ca = super::extra_ca::extra_ca();
 
         // Launch every container detached, in topological order. Before
         // each `docker run` we honour the dependent's `dependsOn[]` by
@@ -296,23 +300,27 @@ impl EcsRuntime {
             }
             let mut env = rp.env.clone();
             let mut holder: Option<String> = None;
-            if rp.plan.has_task_role {
-                let wants_holder = super::task_creds::wants_netns_holder(&rp.plan);
-                if let Some(image) = creds_helper_image.as_deref().filter(|_| wants_holder) {
-                    match self
-                        .start_netns_holder(&rp.plan, task_id, network_created, image)
-                        .await
-                    {
-                        Ok(id) => holder = Some(id),
-                        Err(err) => tracing::warn!(
-                            task = %task_id,
-                            container = %rp.plan.container_name,
-                            error = %err,
-                            "could not route 169.254.170.2 into the container's network; \
-                             it gets AWS_CONTAINER_CREDENTIALS_FULL_URI instead"
-                        ),
-                    }
+            let wants_holder = super::task_creds::wants_netns_holder(&rp.plan);
+            if let Some(image) = creds_helper_image.as_deref().filter(|_| wants_holder) {
+                match self
+                    .start_netns_holder(&rp.plan, task_id, network_created, image, vpc_dns.as_ref())
+                    .await
+                {
+                    Ok(id) => holder = Some(id),
+                    Err(err) => tracing::warn!(
+                        task = %task_id,
+                        container = %rp.plan.container_name,
+                        error = %err,
+                        "could not route 169.254.170.2 (or the VPC's DNS server) into the \
+                         container's network; a task-role container gets \
+                         AWS_CONTAINER_CREDENTIALS_FULL_URI instead"
+                    ),
                 }
+            }
+            if extra_ca.is_some() {
+                super::extra_ca::push_ssl_cert_file(&mut env);
+            }
+            if rp.plan.has_task_role {
                 // A `none`-mode container gets the agent's relative URI with
                 // nothing behind it, as on ECS (it has no network).
                 env.extend(super::task_creds::credentials_env(
@@ -336,7 +344,7 @@ impl EcsRuntime {
                 network,
                 run_image,
             );
-            let run_out = match self.cli_output(&argv, CONTAINER_RUN_TIMEOUT).await {
+            let run_out = match self.run_task_container(&argv, extra_ca.as_deref()).await {
                 Ok(out) => out,
                 Err(e) => {
                     // A timed-out `run` may still have created the container,

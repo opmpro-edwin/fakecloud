@@ -96,6 +96,19 @@ A background prober walks every target group with `HealthCheckEnabled=true` and 
 
 Set `FAKECLOUD_ELBV2_DISABLE_HEALTH_PROBES=true` to turn the prober off and revert to the historical default of synthetic `healthy` for every registered target — useful when targets are placeholder IPs that don't actually answer.
 
+## Addresses and DNS names
+
+An Application Load Balancer gets one requester-managed network interface per subnet, created through EC2's own address allocator, as on AWS: `DescribeNetworkInterfaces` lists them with the description `ELB app/<name>/<id>`, the load balancer's security groups, and a private IP from the subnet that no task ENI or other interface in the subnet shares. `SetSubnets` adds and removes interfaces with the subnets, `SetSecurityGroups` updates their groups, and `DeleteLoadBalancer` deletes them. CloudFormation-created ALBs get them too, and load balancers restored from a snapshot without them get them on start.
+
+The `DNSName` has AWS's format, `internal-<name>-<id>.<region>.elb.amazonaws.com` for an internal scheme and `<name>-<id>.<region>.elb.amazonaws.com` for an internet-facing one. With `--dns`, that name, and a Route 53 alias record pointing at it, resolve to the private IPs of the load balancer's interfaces (see [Route 53](/docs/services/route53/#real-dns-resolver-dns)). An internet-facing ALB resolves to its private IPs too: locally there are no public addresses (a deliberate deviation).
+
+Inside an ECS task's network (Docker / Podman, with `--dns`; see [ECS VPC networking](/docs/services/ecs/#vpc-networking-dns-and-load-balancers)) a TCP connection to one of those IPs on a listener port goes to a frontend that serves the listener:
+
+- `HTTPS` / `TLS` listener ports go to `FAKECLOUD_ELBV2_FRONTEND_HTTPS` (`host:port`, resolved inside the task's network), and `HTTP` listener ports to `FAKECLOUD_ELBV2_FRONTEND_HTTP`. The intended frontend is a TLS edge (Caddy, nginx, Traefik) that picks the ALB by SNI / `Host` and proxies to fakecloud's data plane below. The client's `Host` header and SNI are untouched, since only the destination address is rewritten.
+- Without a frontend for the protocol, the connection goes to fakecloud's own data plane for the ALB, which serves plain HTTP on the host's loopback. Containers reach that where the host alias reaches the host's loopback: Docker Desktop, OrbStack and Podman machine, with fakecloud running natively. A containerized fakecloud, or native Linux Docker, needs the frontend variables.
+
+Network Load Balancers and Gateway Load Balancers get no interfaces yet.
+
 ## Data plane (in-process HTTP routing)
 
 For every ALB whose `state_code == "active"`, fakecloud binds a TCP listener on `127.0.0.1:0` (OS-allocated) and serves HTTP/1.1 requests through the listener-rule chain you configured. Connections are parsed, routed against your rules in priority order (first non-default match wins; otherwise the listener default actions), and dispatched to the action:

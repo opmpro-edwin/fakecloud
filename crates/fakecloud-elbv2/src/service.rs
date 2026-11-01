@@ -109,6 +109,8 @@ pub struct Elbv2Service {
     /// EC2 state: a load balancer's subnets, security groups and Elastic IPs
     /// resolve there. `None` (memory-only unit tests) takes them as given.
     ec2_state: Option<fakecloud_ec2::SharedEc2State>,
+    /// Persists EC2 state after an ALB's network interfaces change.
+    ec2_snapshot_hook: Option<fakecloud_persistence::SnapshotHook>,
 }
 
 impl Elbv2Service {
@@ -135,6 +137,7 @@ impl Elbv2Service {
             snapshot_store: None,
             snapshot_lock: Arc::new(AsyncMutex::new(())),
             ec2_state: None,
+            ec2_snapshot_hook: None,
         }
     }
 
@@ -153,6 +156,7 @@ impl Elbv2Service {
             snapshot_store: None,
             snapshot_lock: Arc::new(AsyncMutex::new(())),
             ec2_state: None,
+            ec2_snapshot_hook: None,
         }
     }
 
@@ -202,6 +206,32 @@ impl Elbv2Service {
         self
     }
 
+    /// Persist EC2 state when an ALB's network interfaces change.
+    pub fn with_ec2_snapshot_hook(
+        mut self,
+        hook: Option<fakecloud_persistence::SnapshotHook>,
+    ) -> Self {
+        self.ec2_snapshot_hook = hook;
+        self
+    }
+
+    /// Bring load balancer `arn`'s network interfaces in line with its
+    /// subnets and security groups (see `crate::addresses`).
+    fn sync_lb_interfaces(&self, account_id: &str, arn: &str) {
+        let Some(ec2) = &self.ec2_state else {
+            return;
+        };
+        if crate::addresses::sync_interfaces(&self.state, ec2, account_id, arn) {
+            self.persist_ec2();
+        }
+    }
+
+    fn persist_ec2(&self) {
+        if let Some(hook) = self.ec2_snapshot_hook.clone() {
+            tokio::spawn(async move { hook().await });
+        }
+    }
+
     pub fn with_waf_state(mut self, waf_state: SharedWafv2State) -> Self {
         self.waf_state = Some(waf_state);
         self
@@ -217,6 +247,11 @@ impl Elbv2Service {
     /// Spawn the dataplane supervisor. Only needed when the service
     /// was built with [`Elbv2Service::new_without_dataplane`].
     pub fn start_dataplane(&self) {
+        // Tasks' connections to ALB addresses go where `addresses::Routes`
+        // says (a configured frontend, else this data plane).
+        fakecloud_core::vpc_network::set_lb_route_source(Arc::new(crate::addresses::Routes::new(
+            Arc::clone(&self.state),
+        )));
         let logger = crate::dataplane::spawn_dataplane_with_delivery(
             Arc::clone(&self.state),
             self.waf_state.as_ref().map(Arc::clone),
@@ -526,9 +561,12 @@ impl Elbv2Service {
             )
             .and_then(|s| s.parse().ok()),
             bound_port: None,
+            interfaces: Vec::new(),
         };
         let lb_xml = render_lb_xml(&lb);
-        st.load_balancers.insert(arn, lb);
+        st.load_balancers.insert(arn.clone(), lb);
+        drop(accounts);
+        self.sync_lb_interfaces(&req.account_id, &arn);
 
         Ok(xml_resp(
             "CreateLoadBalancer",
@@ -614,7 +652,11 @@ impl Elbv2Service {
                 ));
             }
         }
-        st.load_balancers.remove(&arn);
+        let interfaces = st
+            .load_balancers
+            .remove(&arn)
+            .map(|lb| lb.interfaces)
+            .unwrap_or_default();
         let listener_arns: Vec<String> = st
             .listeners
             .iter()
@@ -627,6 +669,11 @@ impl Elbv2Service {
         }
         for tg in st.target_groups.values_mut() {
             tg.load_balancer_arns.retain(|a| a != &arn);
+        }
+        drop(accounts);
+        if let (Some(ec2), false) = (&self.ec2_state, interfaces.is_empty()) {
+            crate::addresses::release_interfaces(ec2, &req.account_id, &interfaces);
+            self.persist_ec2();
         }
         Ok(xml_metadata_only("DeleteLoadBalancer", &req.request_id))
     }
@@ -662,6 +709,8 @@ impl Elbv2Service {
             .map(render_az_xml)
             .collect::<String>();
         let ip_type = xml_escape(&lb.ip_address_type);
+        drop(accounts);
+        self.sync_lb_interfaces(&req.account_id, &arn);
         Ok(xml_resp(
             "SetSubnets",
             format!(
@@ -725,6 +774,8 @@ impl Elbv2Service {
                 )
             })
             .unwrap_or_default();
+        drop(accounts);
+        self.sync_lb_interfaces(&req.account_id, &arn);
         Ok(xml_resp(
             "SetSecurityGroups",
             format!("<SecurityGroupIds>{sg_xml}</SecurityGroupIds>{enforce_xml}"),
@@ -2372,8 +2423,8 @@ impl Elbv2Service {
 
 #[path = "service_helpers.rs"]
 mod service_helpers;
-pub use service_helpers::normalize_action_config;
 pub(crate) use service_helpers::*;
+pub use service_helpers::{lb_dns_name, normalize_action_config};
 
 #[cfg(test)]
 #[path = "service_tests.rs"]

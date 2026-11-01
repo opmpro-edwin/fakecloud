@@ -111,6 +111,10 @@ pub struct LoadBalancer {
     /// only — restarts get fresh ports.
     #[serde(skip)]
     pub bound_port: Option<u16>,
+    /// The ALB's network interfaces, one per subnet, whose private IPs its
+    /// DNS name resolves to (see `crate::addresses`).
+    #[serde(default)]
+    pub interfaces: Vec<crate::addresses::LbInterface>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

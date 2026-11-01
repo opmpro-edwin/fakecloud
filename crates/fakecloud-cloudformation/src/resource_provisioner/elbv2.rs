@@ -73,13 +73,7 @@ impl ResourceProvisioner {
             &name,
             &lb_id[..16],
         );
-        let dns_name = format!(
-            "{}-{}.{}.elb.{}.amazonaws.com",
-            name,
-            &lb_id[..16],
-            self.region,
-            self.region
-        );
+        let dns_name = fakecloud_elbv2::lb_dns_name(&name, &scheme, &self.region, &lb_id[..16]);
 
         state.load_balancers.insert(
             arn.clone(),
@@ -105,7 +99,16 @@ impl ResourceProvisioner {
                 attributes: BTreeMap::new(),
                 minimum_capacity_units: None,
                 bound_port: None,
+                interfaces: Vec::new(),
             },
+        );
+        drop(accounts);
+        // An ALB's private addresses, as the API's CreateLoadBalancer gives it.
+        fakecloud_elbv2::addresses::sync_interfaces(
+            &self.elbv2_state,
+            &self.ec2_state,
+            &self.account_id,
+            &arn,
         );
 
         Ok(ProvisionResult::new(arn.clone())
@@ -122,7 +125,11 @@ impl ResourceProvisioner {
     pub(crate) fn delete_elbv2_load_balancer(&self, physical_id: &str) -> Result<(), String> {
         let mut accounts = self.elbv2_state.write();
         let state = accounts.get_or_create(&self.account_id);
-        state.load_balancers.remove(physical_id);
+        let interfaces = state
+            .load_balancers
+            .remove(physical_id)
+            .map(|lb| lb.interfaces)
+            .unwrap_or_default();
         // Cascade-delete listeners and rules attached to this LB.
         let listeners: Vec<String> = state
             .listeners
@@ -145,6 +152,12 @@ impl ResourceProvisioner {
         for tg in state.target_groups.values_mut() {
             tg.load_balancer_arns.retain(|a| a != physical_id);
         }
+        drop(accounts);
+        fakecloud_elbv2::addresses::release_interfaces(
+            &self.ec2_state,
+            &self.account_id,
+            &interfaces,
+        );
         Ok(())
     }
 
@@ -658,6 +671,14 @@ impl ResourceProvisioner {
         let dns_name = lb.dns_name.clone();
         let canonical = lb.canonical_hosted_zone_id.clone();
         let lb_full = arn.rsplit("loadbalancer/").next().unwrap_or("").to_string();
+        drop(accounts);
+        // New subnets or groups move the ALB's network interfaces with them.
+        fakecloud_elbv2::addresses::sync_interfaces(
+            &self.elbv2_state,
+            &self.ec2_state,
+            &self.account_id,
+            &arn,
+        );
         Ok(ProvisionResult::new(arn.clone())
             .with("LoadBalancerArn", arn)
             .with("LoadBalancerFullName", lb_full)
