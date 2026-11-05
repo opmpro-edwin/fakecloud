@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod auth_message;
+pub mod ca_bundle;
 pub mod cbor;
 pub mod cfn_template;
 pub mod container_image;
@@ -26,4 +27,5 @@ pub mod tags;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 pub mod validation;
+pub mod vpc_netns;
 pub mod vpc_network;

@@ -22,6 +22,13 @@
 //! instance gets `AWS_EC2_METADATA_SERVICE_ENDPOINT` pointing at fakecloud
 //! instead, which SDK credential chains honour.
 //!
+//! **VPC DNS and load balancers.** With `--dns`, the Docker sidecar also
+//! makes the namespace the inside of the instance's VPC (see `super::vpc`):
+//! DNS to the VPC resolver addresses goes to fakecloud's DNS listener, and the
+//! `lb` map in its nftables table sends connections to load balancer addresses
+//! where [`fakecloud_core::vpc_netns`] keeps them pointed. The rules are in
+//! place before user-data runs.
+//!
 //! **Load balancer targets.** An instance's listening ports are not known
 //! when it boots, so nothing is published then. When an ELBv2 target group
 //! first routes to `i-...:<port>`, a forwarder container (socat on the
@@ -48,6 +55,9 @@ pub(crate) const PROXY_PORT: u16 = 61169;
 
 /// Line the IMDS setup script prints once the rule and proxy are up.
 pub(crate) const READY_MARKER: &str = "FAKECLOUD_EC2_IMDS_READY";
+
+/// The sidecar's nftables table, which carries the load balancer map.
+pub(crate) const NFT_TABLE: &str = "fakecloud_ec2_imds";
 
 /// Directory, inside the instance, holding the IMDS readiness marker.
 pub(crate) const READY_DIR: &str = "/run/fakecloud";
@@ -108,8 +118,14 @@ pub(crate) enum HelperImage {
 /// the proxy, which forwards to `http://$1:$2/_fakecloud/ec2/imds/$3/`.
 /// `$READY_FILE`, when set, is created once IMDS answers -- or when setup
 /// fails, so a boot waiting on it never waits out its whole bound for nothing.
+///
+/// The optional `$5`..`$7` give the namespace its VPC (nft only, see
+/// [`fakecloud_core::vpc_netns::VpcDns::script_args`]): DNS (UDP and TCP 53)
+/// to the addresses in `$6` goes to `$1:$5`, and with `$7` = `lb` TCP
+/// connections follow the `lb` map, which fakecloud fills afterwards.
 pub(crate) const SETUP_SCRIPT: &str = r#"set -eu
 host="$1"; port="$2"; instance="$3"; proxy_port="$4"
+dns_port="${5:-}"; dns_addrs="${6:-}"; lb="${7:-}"
 ready() { if [ -n "${READY_FILE:-}" ]; then mkdir -p "$(dirname "$READY_FILE")" && : > "$READY_FILE"; fi; }
 trap ready EXIT
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -143,12 +159,24 @@ http {
 }
 EOF
 nginx -c "$conf"
+nl='
+'
+vpc=""; lbmap=""
+if [ -n "$dns_port" ]; then
+  for proto in udp tcp; do
+    vpc="$vpc  ip daddr { $dns_addrs } $proto dport 53 dnat to $ip:$dns_port$nl"
+  done
+fi
+if [ "$lb" = lb ]; then
+  lbmap=" map lb {$nl  type ipv4_addr . inet_service : ipv4_addr . inet_service$nl }$nl"
+  vpc="$vpc  meta l4proto tcp dnat ip to ip daddr . tcp dport map @lb$nl"
+fi
 # nft first; iptables when nft is missing or the kernel refuses its rule.
-if have nft && printf 'table ip fakecloud_ec2_imds\ndelete table ip fakecloud_ec2_imds\ntable ip fakecloud_ec2_imds {\n chain output {\n  type nat hook output priority -100; policy accept;\n  ip daddr 169.254.169.254 tcp dport 80 redirect to :%s\n }\n}\n' "$proxy_port" | nft -f -; then
+if have nft && printf 'table ip fakecloud_ec2_imds\ndelete table ip fakecloud_ec2_imds\ntable ip fakecloud_ec2_imds {\n%s chain output {\n  type nat hook output priority -100; policy accept;\n  ip daddr 169.254.169.254 tcp dport 80 redirect to :%s\n%s }\n}\n' "$lbmap" "$proxy_port" "$vpc" | nft -f -; then
   :
 elif have iptables && rule="-d 169.254.169.254/32 -p tcp --dport 80 -j REDIRECT --to-ports $proxy_port" \
   && { iptables -t nat -C OUTPUT $rule 2>/dev/null || iptables -t nat -A OUTPUT $rule; }; then
-  :
+  [ -z "$vpc" ] || echo "fakecloud-ec2-imds: no nft; VPC DNS and load balancer addresses are not routed" >&2
 else
   echo "fakecloud-ec2-imds: could not install the NAT rule with nft or iptables" >&2
   exit 1
@@ -172,7 +200,8 @@ pub(crate) fn forwarder_name(instance_id: &str, port: u16) -> String {
 
 /// `docker run` argv for an instance's IMDS sidecar, joined to the instance
 /// container's network namespace. It inherits that container's `/etc/hosts`,
-/// which carries the host alias.
+/// which carries the host alias. With `vpc_dns` it also installs the VPC's
+/// DNS and load balancer rules (see [`SETUP_SCRIPT`]).
 pub(crate) fn sidecar_argv(
     instance_id: &str,
     instance_container: &str,
@@ -180,8 +209,9 @@ pub(crate) fn sidecar_argv(
     helper_image: &str,
     fakecloud_host: &str,
     fakecloud_port: u16,
+    vpc_dns: Option<&fakecloud_core::vpc_netns::VpcDns>,
 ) -> Vec<String> {
-    vec![
+    let mut argv = vec![
         "run".into(),
         "-d".into(),
         "--name".into(),
@@ -204,7 +234,11 @@ pub(crate) fn sidecar_argv(
         fakecloud_port.to_string(),
         instance_id.to_string(),
         PROXY_PORT.to_string(),
-    ]
+    ];
+    if let Some(vpc) = vpc_dns {
+        argv.extend(vpc.script_args());
+    }
+    argv
 }
 
 /// `docker run` argv for a forwarder publishing `port` of an instance at
@@ -263,6 +297,7 @@ mod tests {
             "helper:1",
             "host.docker.internal",
             4566,
+            None,
         );
         let joined = argv.join(" ");
         assert!(joined.starts_with("run -d --name fakecloud-ec2-imds-i-0abc "));
@@ -277,6 +312,100 @@ mod tests {
         assert!(!joined.contains("--publish"), "{joined}");
         let tail = &argv[argv.len() - 4..];
         assert_eq!(tail, ["host.docker.internal", "4566", "i-0abc", "61169"]);
+    }
+
+    #[test]
+    fn sidecar_carries_the_vpc_arguments_after_the_imds_ones() {
+        let vpc = fakecloud_core::vpc_netns::VpcDns::with_port(Some("10.40.0.0/16"), 15353);
+        let argv = sidecar_argv(
+            "i-0abc",
+            "cid123",
+            "fakecloud-42",
+            "helper:1",
+            "host.docker.internal",
+            4566,
+            Some(&vpc),
+        );
+        assert_eq!(
+            argv[argv.len() - 7..],
+            [
+                "host.docker.internal",
+                "4566",
+                "i-0abc",
+                "61169",
+                "15353",
+                "10.40.0.2, 169.254.169.253",
+                "lb"
+            ]
+        );
+    }
+
+    /// With the VPC arguments the nft ruleset also sends DNS for the VPC
+    /// resolver addresses to fakecloud's DNS port and declares the load
+    /// balancer map, in the table the map script fills; without them it is
+    /// the IMDS redirect alone. Run from the test below: the script writes
+    /// its proxy config to one fixed path, so the two runs must not overlap.
+    #[cfg(unix)]
+    fn setup_script_routes_vpc_dns_and_load_balancer_addresses() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let ruleset = dir.path().join("ruleset");
+        let tool = |name: &str, body: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        tool("getent", "echo '10.1.2.3 STREAM host'");
+        tool("nginx", "exit 0");
+        tool("nft", &format!("cat > {}", ruleset.display()));
+        tool("sleep", "kill -TERM $PPID");
+        let path = format!("{}:/usr/bin:/bin", dir.path().display());
+        let run = |vpc: bool| {
+            let mut args = vec![
+                "-c".to_string(),
+                SETUP_SCRIPT.to_string(),
+                "x".to_string(),
+                "host".to_string(),
+                "4566".to_string(),
+                "i-0abc".to_string(),
+                "61169".to_string(),
+            ];
+            if vpc {
+                args.extend(
+                    fakecloud_core::vpc_netns::VpcDns::with_port(Some("10.40.0.0/16"), 15353)
+                        .script_args(),
+                );
+            }
+            let out = std::process::Command::new("sh")
+                .args(&args)
+                .env("PATH", &path)
+                .output()
+                .unwrap();
+            assert!(
+                String::from_utf8_lossy(&out.stdout).contains(READY_MARKER),
+                "{out:?}"
+            );
+            std::fs::read_to_string(&ruleset).unwrap()
+        };
+        let rules = run(true);
+        for line in [
+            "ip daddr 169.254.169.254 tcp dport 80 redirect to :61169",
+            "ip daddr { 10.40.0.2, 169.254.169.253 } udp dport 53 dnat to 10.1.2.3:15353",
+            "ip daddr { 10.40.0.2, 169.254.169.253 } tcp dport 53 dnat to 10.1.2.3:15353",
+            "type ipv4_addr . inet_service : ipv4_addr . inet_service",
+            "meta l4proto tcp dnat ip to ip daddr . tcp dport map @lb",
+        ] {
+            assert!(rules.contains(line), "{line} missing from:\n{rules}");
+        }
+        assert!(
+            rules.contains(&format!("table ip {NFT_TABLE} {{")),
+            "{rules}"
+        );
+        let rules = run(false);
+        assert!(
+            !rules.contains("dport 53") && !rules.contains("map"),
+            "{rules}"
+        );
     }
 
     #[test]
@@ -377,5 +506,6 @@ mod tests {
             conf.contains("proxy_pass http://192.168.65.254:4566/_fakecloud/ec2/imds/i-0abc/"),
             "{conf}"
         );
+        setup_script_routes_vpc_dns_and_load_balancer_addresses();
     }
 }

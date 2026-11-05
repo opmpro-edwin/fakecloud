@@ -158,6 +158,11 @@ impl EcsRuntime {
 pub(crate) struct ContainerCli(Arc<str>);
 
 impl ContainerCli {
+    /// The CLI program itself.
+    pub(crate) fn program(&self) -> &str {
+        &self.0
+    }
+
     /// Run the CLI with `args`, killed (with its process group) once it
     /// outruns `timeout` or the call is dropped. A daemon or registry that
     /// stops answering leaves the CLI blocked with no deadline of its own,

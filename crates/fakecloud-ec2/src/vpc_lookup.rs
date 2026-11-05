@@ -342,15 +342,53 @@ fn used_ips(state: &Ec2State, subnet_id: &str) -> std::collections::HashSet<Stri
 /// four addresses and the last address of every subnet CIDR, so allocation
 /// starts at `.4` of the block and never hands out the broadcast address.
 pub fn allocate_private_ip(state: &Ec2State, subnet: &SubnetInfo) -> Option<String> {
-    let (net, len) = parse_ipv4_cidr(&subnet.cidr_block)?;
+    lowest_free_ip(&subnet.cidr_block, &used_ips(state, &subnet.subnet_id), &[])
+}
+
+/// The lowest address EC2 hands out in `cidr` (from `.4`, never the
+/// broadcast address) that is neither in `used` nor in `reserved`.
+fn lowest_free_ip(
+    cidr: &str,
+    used: &std::collections::HashSet<String>,
+    reserved: &[String],
+) -> Option<String> {
+    let (net, len) = parse_ipv4_cidr(cidr)?;
     let size: u64 = 1u64 << (32 - len);
     if size < 8 {
         return None;
     }
-    let used = used_ips(state, &subnet.subnet_id);
     (4..size - 1)
         .map(|offset| Ipv4Addr::from(net + offset as u32).to_string())
-        .find(|ip| !used.contains(ip))
+        .find(|ip| !used.contains(ip) && !reserved.contains(ip))
+}
+
+/// The private IP for a new instance in `subnet_id`: the lowest free address,
+/// skipping `reserved` (addresses the same launch already claimed). Unlike a
+/// network interface's, an address a terminated instance held is free again,
+/// as on AWS. `None` when the subnet is unknown or full.
+pub fn allocate_instance_ip(
+    state: &Ec2State,
+    subnet_id: &str,
+    reserved: &[String],
+) -> Option<String> {
+    let subnet = state.subnets.get(subnet_id)?;
+    let mut used = std::collections::HashSet::new();
+    for eni in state
+        .network_interfaces
+        .values()
+        .filter(|e| e.subnet_id == subnet_id)
+    {
+        used.insert(eni.private_ip_address.clone());
+        used.extend(eni.private_ips.iter().cloned());
+    }
+    used.extend(
+        state
+            .instances
+            .values()
+            .filter(|i| i.state_code != 48 && i.subnet_id.as_deref() == Some(subnet_id))
+            .map(|i| i.private_ip.clone()),
+    );
+    lowest_free_ip(&subnet.cidr_block, &used, reserved)
 }
 
 /// Why a service-managed network interface could not be created.

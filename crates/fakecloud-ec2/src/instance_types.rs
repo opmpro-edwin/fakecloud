@@ -1452,9 +1452,53 @@ pub(crate) fn default_vcpus(instance_type: &str) -> Option<u32> {
         .map(|i| INSTANCE_TYPE_VCPUS[i].1)
 }
 
+/// The architecture of `instance_type`, as `DescribeInstanceTypes` reports it
+/// in `ProcessorInfo.SupportedArchitectures`: `arm64` for AWS Graviton
+/// families (`a1`, and a family whose generation digit is followed by `g`:
+/// `t4g`, `c7g`, `m6gd`, `im4gn`, `is4gen`, `x2gd`, ...), else `x86_64`.
+pub(crate) fn architecture(instance_type: &str) -> &'static str {
+    let family = instance_type.split('.').next().unwrap_or(instance_type);
+    let after_letters = family.trim_start_matches(|c: char| c.is_ascii_lowercase());
+    let after_generation = after_letters.trim_start_matches(|c: char| c.is_ascii_digit());
+    let graviton = family == "a1"
+        || (after_generation.len() < after_letters.len() && after_generation.starts_with('g'));
+    if graviton {
+        "arm64"
+    } else {
+        "x86_64"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn graviton_families_are_arm64() {
+        for t in [
+            "t4g.small",
+            "c7g.xlarge",
+            "m6gd.large",
+            "c6gn.medium",
+            "im4gn.large",
+            "is4gen.medium",
+            "x2gd.large",
+            "g5g.xlarge",
+            "a1.large",
+        ] {
+            assert_eq!(architecture(t), "arm64", "{t}");
+        }
+        for t in [
+            "t3.micro",
+            "g5.xlarge",
+            "g4dn.xlarge",
+            "x2iezn.2xlarge",
+            "m7i-flex.large",
+            "u7i-12tb.224xlarge",
+        ] {
+            assert_eq!(architecture(t), "x86_64", "{t}");
+        }
+    }
 
     #[test]
     fn table_is_sorted_and_unique() {

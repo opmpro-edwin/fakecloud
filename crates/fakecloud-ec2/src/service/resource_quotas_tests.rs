@@ -674,6 +674,27 @@ fn describe_instance_types_reports_real_vcpus() {
         &req("DescribeInstanceTypes", &[("InstanceType.1", "t2.micro")]),
     ));
     assert!(out.contains("<defaultVCpus>1</defaultVCpus>"), "{out}");
+    // Any type EC2 offers is described when asked for, Graviton ones as
+    // arm64; a made-up type is not.
+    let out = body(instance::describe_instance_types(
+        &Ec2Service::new(),
+        &req(
+            "DescribeInstanceTypes",
+            &[
+                ("InstanceType.1", "t4g.small"),
+                ("InstanceType.2", "c7g.xlarge"),
+                ("InstanceType.3", "m5.huge"),
+            ],
+        ),
+    ));
+    assert!(
+        out.contains("<instanceType>t4g.small</instanceType>")
+            && out.contains("<instanceType>c7g.xlarge</instanceType>"),
+        "{out}"
+    );
+    assert!(!out.contains("m5.huge"), "{out}");
+    assert!(out.contains("<item>arm64</item>"), "{out}");
+    assert!(out.contains("<defaultVCpus>4</defaultVCpus>"), "{out}");
 }
 
 #[test]

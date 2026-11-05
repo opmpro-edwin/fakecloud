@@ -4,8 +4,11 @@
 //!   - instances in the *same* subnet share a bridge and can reach each other,
 //!   - instances in *different* VPCs/subnets land on different bridges and
 //!     cannot route to each other,
-//!   - a private subnet (no internet gateway) backs onto an `--internal`
-//!     network while a public/default subnet does not.
+//!   - a subnet's network carries the subnet's CIDR block, so an instance's
+//!     container holds the private IP DescribeInstances reports;
+//!   - a private subnet (no internet gateway) reaches outside it as ECS tasks
+//!     do, unless `FAKECLOUD_EC2_ISOLATE_PRIVATE_SUBNETS` puts it on an
+//!     `--internal` network.
 //!
 //! Requires Docker (hard-fails in CI, skips locally), like the runtime E2E.
 
@@ -211,12 +214,37 @@ async fn instances_isolate_by_subnet_network() {
         "instances in different VPCs must not reach each other"
     );
 
-    // The no-IGW subnet network is `--internal`; the default subnet (public,
-    // has a 0.0.0.0/0 -> igw route) is not.
+    // Each subnet's network has the subnet's range, and the instances hold
+    // the addresses DescribeInstances reports.
+    assert_eq!(
+        docker(&[
+            "network",
+            "inspect",
+            "-f",
+            "{{range .IPAM.Config}}{{.Subnet}}{{end}}",
+            &net_a
+        ]),
+        "10.10.1.0/24"
+    );
+    assert!(a2_ip.starts_with("10.10.1."), "{a2_ip}");
+    assert!(b1_ip.starts_with("10.20.1."), "{b1_ip}");
+    assert_eq!(
+        docker(&[
+            "inspect",
+            "-f",
+            "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
+            &ca2
+        ]),
+        a2_ip
+    );
+
+    // Without isolation asked for, the no-IGW subnet's network is not
+    // `--internal` (it reaches outside, as ECS tasks do); nor is the default
+    // subnet's (public, has a 0.0.0.0/0 -> igw route).
     assert_eq!(
         docker(&["network", "inspect", "-f", "{{.Internal}}", &net_a]),
-        "true",
-        "private (no-IGW) subnet should back onto an internal network"
+        "false",
+        "a private subnet reaches outside it unless isolated"
     );
     let default_net = networks_of(&cc1)
         .into_iter()
@@ -244,4 +272,59 @@ async fn instances_isolate_by_subnet_network() {
     for net in [&net_a, &net_b, &default_net] {
         let _ = docker(&["network", "rm", net]);
     }
+}
+
+/// `FAKECLOUD_EC2_ISOLATE_PRIVATE_SUBNETS=1` puts a private subnet on an
+/// `--internal` network with no route out of it.
+#[tokio::test]
+async fn private_subnets_can_be_isolated() {
+    if !require_docker_or_skip("private_subnets_can_be_isolated") {
+        return;
+    }
+    let server = TestServer::start_with_env(&[
+        ("FAKECLOUD_EC2_DEFAULT_IMAGE", "alpine:3"),
+        ("FAKECLOUD_EC2_ISOLATE_PRIVATE_SUBNETS", "1"),
+    ])
+    .await;
+    let c = server.ec2_client().await;
+    let vpc = c
+        .create_vpc()
+        .cidr_block("10.30.0.0/16")
+        .send()
+        .await
+        .unwrap()
+        .vpc()
+        .unwrap()
+        .vpc_id()
+        .unwrap()
+        .to_string();
+    let subnet = c
+        .create_subnet()
+        .vpc_id(&vpc)
+        .cidr_block("10.30.1.0/24")
+        .send()
+        .await
+        .unwrap()
+        .subnet()
+        .unwrap()
+        .subnet_id()
+        .unwrap()
+        .to_string();
+    let id = run_in_subnet(&c, Some(&subnet)).await;
+    let ip = wait_running(&c, &id).await;
+    assert!(ip.starts_with("10.30.1."), "{ip}");
+    let net = format!("fakecloud-subnet-{subnet}");
+    assert_eq!(
+        docker(&["network", "inspect", "-f", "{{.Internal}}", &net]),
+        "true",
+        "an isolated private subnet backs onto an internal network"
+    );
+    let _ = c.terminate_instances().instance_ids(&id).send().await;
+    for _ in 0..40 {
+        if container_for(&id).is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    let _ = docker(&["network", "rm", &net]);
 }

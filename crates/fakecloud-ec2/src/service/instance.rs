@@ -318,15 +318,13 @@ fn parse_launch_opts(params: &HashMap<String, String>) -> LaunchOpts {
 }
 
 /// The result of the control-plane half of an instance launch: the reservation,
-/// the new instance ids, their rendered `instancesSet` items, and the inputs the
-/// background boot needs to bring up each backing container.
+/// the new instance ids and their rendered `instancesSet` items. The
+/// background boot reads each instance's inputs back from state
+/// ([`run_instance_inputs`]).
 pub(crate) struct Launched {
     pub(crate) reservation_id: String,
     pub(crate) ids: Vec<String>,
     pub(crate) rendered: Vec<String>,
-    user_data: Option<String>,
-    instance_tags: std::collections::BTreeMap<String, String>,
-    instance_network: Option<crate::runtime::InstanceNetwork>,
 }
 
 pub(crate) async fn run_instances(
@@ -356,9 +354,6 @@ fn boot_launched(svc: &Ec2Service, account_id: &str, launched: &Launched) {
     let runtime = svc.runtime.clone();
     let account_id = account_id.to_string();
     let ids = launched.ids.clone();
-    let user_data = launched.user_data.clone();
-    let instance_tags = launched.instance_tags.clone();
-    let instance_network = launched.instance_network.clone();
     // Capture the persistence hook so the pending->running flip is written
     // through to disk; RunInstances' own dispatch-path snapshot ran while
     // the instance was still `pending` (M12).
@@ -371,23 +366,17 @@ fn boot_launched(svc: &Ec2Service, account_id: &str, launched: &Launched) {
             // here starts nothing, and one that goes away while booting has
             // what the boot created reaped (`settle_started`).
             let _lifecycle = lock_lifecycle(runtime.as_ref(), id).await;
-            let running = match &runtime {
-                Some(rt) if wants_container(&svc_state, &account_id, id) => match rt
-                    .run_instance(
-                        &account_id,
-                        id,
-                        user_data.as_deref(),
-                        &instance_tags,
-                        instance_network.as_ref(),
-                    )
-                    .await
-                {
-                    Ok(r) => Some(r),
-                    Err(e) => {
-                        tracing::warn!(instance_id = %id, error = %e, "EC2 instance container failed to start; serving metadata-only");
-                        None
+            let inputs = run_instance_inputs(&svc_state, &account_id, id);
+            let running = match (&runtime, inputs) {
+                (Some(rt), Some(inputs)) if wants_container(&svc_state, &account_id, id) => {
+                    match inputs.run(rt, &account_id, id).await {
+                        Ok(r) => Some(r),
+                        Err(e) => {
+                            tracing::warn!(instance_id = %id, error = %e, "EC2 instance container failed to start; serving metadata-only");
+                            None
+                        }
                     }
-                },
+                }
                 _ => None,
             };
             let post = reconcile_started(&svc_state, &account_id, id, running);
@@ -576,10 +565,6 @@ pub(crate) fn launch_instances(
         .filter(|v| !v.is_empty())
         .cloned();
 
-    // Reserved `fakecloud-k8s/*` scheduling tags are read from the effective
-    // TagSpecification here, before the backing Pod is built.
-    let instance_tags = crate::service::tags::tag_specifications_for(params, "instance");
-
     // Resolve the VPC from the requested subnet (so the `vpc-id` filter and
     // describe output reflect reality), and decide whether a public IP is
     // assigned per AWS rules: explicit `AssociatePublicIpAddress=true`, else
@@ -589,7 +574,7 @@ pub(crate) fn launch_instances(
     let assoc_public = ni("AssociatePublicIpAddress")
         .or_else(|| params.get("AssociatePublicIpAddress"))
         .map(|v| v == "true");
-    let (vpc_id, subnet_auto_public, instance_network, ip_prefix, az) = {
+    let (vpc_id, subnet_auto_public, ip_prefix, az) = {
         let accounts = svc.state.read();
         let empty = Ec2State::new(account_id, region);
         let state = accounts.get(account_id).unwrap_or(&empty);
@@ -650,14 +635,6 @@ pub(crate) fn launch_instances(
                 sg_ids = vec![sg.group_id.clone()];
             }
         }
-        // The backing per-subnet network for phase-2 L3 isolation. A subnet
-        // with no `0.0.0.0/0 -> igw` route is private -> `internal` network.
-        let instance_network = subnet_id
-            .as_ref()
-            .map(|sid| crate::runtime::InstanceNetwork {
-                subnet_id: sid.clone(),
-                internal: !crate::defaults::subnet_is_public(state, sid),
-            });
         let (vpc, auto_public) = match subnet_id.as_ref() {
             Some(_) => subnet
                 .map(|s| {
@@ -671,15 +648,13 @@ pub(crate) fn launch_instances(
             // launch, which assigns public IPs by default.
             None => (Some(crate::defaults::default_vpc_id(account_id)), true),
         };
-        // Metadata-only private IP base, derived from the resolved subnet's
-        // CIDR so DescribeInstances reports an IP inside the subnet (was a
-        // hard-coded 10.0.0.x outside the subnet — bug-hunt finding 1.7). A
-        // real container-backed instance overwrites this with its true bridge
-        // IP once running.
+        // Private IP base of an instance in no known subnet. An instance in a
+        // subnet gets the subnet's lowest free address instead (below), which
+        // its container is also given on the subnet's network.
         let ip_prefix = subnet
             .map(|s| subnet_ip_prefix(&s.cidr_block))
             .unwrap_or_else(|| "10.0.0".to_string());
-        (vpc, auto_public, instance_network, ip_prefix, az)
+        (vpc, auto_public, ip_prefix, az)
     };
     let assign_public = assoc_public.unwrap_or(subnet_auto_public);
     // One fixed private IP can only go to one instance.
@@ -876,12 +851,31 @@ pub(crate) fn launch_instances(
                 }
             }
         }
+        // Every address before anything is inserted, so a subnet without
+        // room for the whole launch fails it whole, as on AWS.
+        let mut private_ips: Vec<String> = fixed_private_ip.iter().cloned().collect();
+        for idx in private_ips.len()..ids.len() {
+            let ip = match subnet_id
+                .as_deref()
+                .filter(|s| state.subnets.contains_key(*s))
+            {
+                Some(subnet) => crate::vpc_lookup::allocate_instance_ip(state, subnet, &private_ips)
+                    .ok_or_else(|| {
+                        AwsServiceError::aws_error(
+                            http::StatusCode::BAD_REQUEST,
+                            "InsufficientFreeAddressesInSubnet",
+                            format!(
+                                "There are not enough free addresses in subnet '{subnet}' to satisfy the requested number of instances."
+                            ),
+                        )
+                    })?,
+                None => format!("{ip_prefix}.{}", 10 + idx),
+            };
+            private_ips.push(ip);
+        }
         let sg_names = sg_name_map(state);
         for (idx, id) in ids.iter().enumerate() {
-            let private_ip = match (&fixed_private_ip, idx) {
-                (Some(ip), 0) => ip.clone(),
-                _ => format!("{ip_prefix}.{}", 10 + idx),
-            };
+            let private_ip = private_ips[idx].clone();
             let inst = Instance {
                 instance_id: id.clone(),
                 image_id: image_id.clone(),
@@ -997,9 +991,6 @@ pub(crate) fn launch_instances(
         reservation_id,
         ids,
         rendered,
-        user_data,
-        instance_tags,
-        instance_network,
     })
 }
 
@@ -1313,24 +1304,67 @@ fn wants_container(state: &crate::state::SharedEc2State, account_id: &str, id: &
 }
 
 /// The inputs [`crate::runtime::Ec2Runtime::run_instance`] needs to boot a
-/// backing container, reconstituted from a persisted instance: base64
-/// user-data, the tag map (carries `fakecloud-k8s/*` Pod scheduling tags), and
-/// the subnet network placement.
-type RunInstanceInputs = (
-    Option<String>,
-    std::collections::BTreeMap<String, String>,
-    Option<crate::runtime::InstanceNetwork>,
-);
+/// backing container, read from the instance's state: base64 user-data, the
+/// tag map (carries `fakecloud-k8s/*` Pod scheduling tags and
+/// `fakecloud:container-engine`), the subnet network placement and the
+/// region.
+pub(crate) struct RunInstanceInputs {
+    user_data: Option<String>,
+    tags: std::collections::BTreeMap<String, String>,
+    network: Option<crate::runtime::InstanceNetwork>,
+    region: String,
+}
 
-/// Gather the inputs needed to boot a fresh backing container for an already
-/// persisted instance (`user_data`, the tag map, and the subnet network
-/// placement), reading them from the persisted instance metadata. Mirrors the
-/// per-instance derivation in
-/// [`recover_persisted_containers`](crate::service::Ec2Service::recover_persisted_containers)
-/// so a container reconstituted here rejoins the same VPC/subnet (and re-runs
-/// the same user-data) as one recovered on restart. Returns `None` if the
-/// instance no longer exists.
-fn run_instance_inputs(
+impl RunInstanceInputs {
+    /// Boot instance `id`'s backing container from these inputs.
+    pub(crate) async fn run(
+        &self,
+        runtime: &crate::runtime::Ec2Runtime,
+        account_id: &str,
+        id: &str,
+    ) -> Result<crate::runtime::RunningInstance, crate::runtime::RuntimeError> {
+        runtime
+            .run_instance(
+                account_id,
+                id,
+                self.user_data.as_deref(),
+                &self.tags,
+                self.network.as_ref(),
+                &self.region,
+            )
+            .await
+    }
+}
+
+/// The backing-network placement of `inst`: its subnet, whether that subnet
+/// is private (no `0.0.0.0/0 -> igw` route), the subnet's and its VPC's CIDR
+/// blocks, and the instance's private IP. `None` for an instance in no
+/// subnet.
+pub(crate) fn instance_network(
+    state: &Ec2State,
+    inst: &Instance,
+) -> Option<crate::runtime::InstanceNetwork> {
+    let subnet_id = inst.subnet_id.clone()?;
+    let subnet = state.subnets.get(&subnet_id);
+    Some(crate::runtime::InstanceNetwork {
+        internal: !crate::defaults::subnet_is_public(state, &subnet_id),
+        cidr_block: subnet.map(|s| s.cidr_block.clone()),
+        vpc_cidr_block: subnet
+            .and_then(|s| state.vpcs.get(&s.vpc_id))
+            .map(|v| v.cidr_block.clone()),
+        private_ip: Some(inst.private_ip.clone()).filter(|ip| !ip.is_empty()),
+        subnet_id,
+    })
+}
+
+/// Gather the inputs needed to boot a backing container for an instance
+/// (`user_data`, the tag map, the subnet network placement and the region),
+/// reading them from the instance's state. Every boot reads them here -- a
+/// launch, a CloudFormation create, a start after a restart and the restart
+/// recovery -- so a container always joins the same VPC/subnet with the same
+/// address (and re-runs the same user-data). Returns `None` if the instance no
+/// longer exists.
+pub(crate) fn run_instance_inputs(
     state: &crate::state::SharedEc2State,
     account_id: &str,
     id: &str,
@@ -1338,22 +1372,21 @@ fn run_instance_inputs(
     let accounts = state.read();
     let s = accounts.get(account_id)?;
     let inst = s.instances.get(id)?;
-    let user_data = inst.user_data.clone();
-    // A subnet with no `0.0.0.0/0 -> igw` route is private -> `internal`
-    // network, matching RunInstances / recover_persisted_containers.
-    let network = inst
-        .subnet_id
-        .clone()
-        .map(|sid| crate::runtime::InstanceNetwork {
-            internal: !crate::defaults::subnet_is_public(s, &sid),
-            subnet_id: sid,
-        });
-    let tags = s
-        .tags_for(id)
-        .iter()
-        .map(|t| (t.key.clone(), t.value.clone()))
-        .collect();
-    Some((user_data, tags, network))
+    Some(inputs_of(s, inst))
+}
+
+/// [`run_instance_inputs`] for an instance at hand.
+pub(crate) fn inputs_of(state: &Ec2State, inst: &Instance) -> RunInstanceInputs {
+    RunInstanceInputs {
+        user_data: inst.user_data.clone(),
+        tags: state
+            .tags_for(&inst.instance_id)
+            .iter()
+            .map(|t| (t.key.clone(), t.value.clone()))
+            .collect(),
+        network: instance_network(state, inst),
+        region: crate::runtime::vpc::region_of_az(&inst.az),
+    }
 }
 
 /// Build a [`MetadataOptions`](crate::state::MetadataOptions) from launch-time
@@ -1575,29 +1608,21 @@ pub(crate) fn cfn_create_instance(
 pub(crate) async fn cfn_boot_instance(svc: &Ec2Service, account_id: &str, id: &str) {
     // The same boot inputs a direct launch passes (user data, the tag map that
     // carries `fakecloud-k8s/*` scheduling tags, the subnet network).
-    let Some((user_data, tags, instance_network)) = run_instance_inputs(&svc.state, account_id, id)
-    else {
+    let Some(inputs) = run_instance_inputs(&svc.state, account_id, id) else {
         return;
     };
 
     let lifecycle = lock_lifecycle(svc.runtime.as_ref(), id).await;
     let running = match &svc.runtime {
-        Some(rt) if wants_container(&svc.state, account_id, id) => match rt
-            .run_instance(
-                account_id,
-                id,
-                user_data.as_deref(),
-                &tags,
-                instance_network.as_ref(),
-            )
-            .await
-        {
-            Ok(r) => Some(r),
-            Err(e) => {
-                tracing::warn!(instance_id = %id, error = %e, "CFN EC2 instance container failed to start; serving metadata-only");
-                None
+        Some(rt) if wants_container(&svc.state, account_id, id) => {
+            match inputs.run(rt, account_id, id).await {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    tracing::warn!(instance_id = %id, error = %e, "CFN EC2 instance container failed to start; serving metadata-only");
+                    None
+                }
             }
-        },
+        }
         _ => None,
     };
     let post = reconcile_started(&svc.state, account_id, id, running);
@@ -1903,16 +1928,7 @@ async fn change_state(
                             // fresh container from the persisted metadata instead,
                             // mirroring `recover_persisted_containers`.
                             Some(rt) => match run_instance_inputs(&svc_state, &account_id, id) {
-                                Some((user_data, tags, network)) => match rt
-                                    .run_instance(
-                                        &account_id,
-                                        id,
-                                        user_data.as_deref(),
-                                        &tags,
-                                        network.as_ref(),
-                                    )
-                                    .await
-                                {
+                                Some(inputs) => match inputs.run(rt, &account_id, id).await {
                                     Ok(r) => Some(r),
                                     Err(e) => {
                                         tracing::warn!(instance_id = %id, error = %e, "EC2 instance container failed to start after restart; serving metadata-only");
@@ -2420,20 +2436,31 @@ pub(crate) fn describe_instance_status(
     ))
 }
 
+/// The `DescribeInstanceTypes` items: every requested type EC2 offers (see
+/// [`crate::instance_types`]), or a short default list when none is named.
 fn instance_type_items(req: &AwsRequest) -> Vec<String> {
     let wanted = indexed_list(&req.query_params, "InstanceType");
-    INSTANCE_TYPES
-        .iter()
-        .filter(|t| wanted.is_empty() || wanted.iter().any(|w| w == *t))
+    let types: Vec<&str> = if wanted.is_empty() {
+        INSTANCE_TYPES.to_vec()
+    } else {
+        wanted
+            .iter()
+            .map(String::as_str)
+            .filter(|t| crate::instance_types::default_vcpus(t).is_some())
+            .collect()
+    };
+    types
+        .into_iter()
         .map(|t| {
             format!(
                 "{}<currentGeneration>true</currentGeneration><bareMetal>false</bareMetal>\
                  <hypervisor>nitro</hypervisor><instanceStorageSupported>false</instanceStorageSupported>\
-                 <processorInfo><supportedArchitectures><item>x86_64</item></supportedArchitectures></processorInfo>\
+                 <processorInfo><supportedArchitectures><item>{}</item></supportedArchitectures></processorInfo>\
                  <vCpuInfo><defaultVCpus>{}</defaultVCpus></vCpuInfo>\
                  <memoryInfo><sizeInMiB>1024</sizeInMiB></memoryInfo>\
                  <supportedVirtualizationTypes><item>hvm</item></supportedVirtualizationTypes>",
                 ec2_elem("instanceType", t),
+                crate::instance_types::architecture(t),
                 crate::instance_types::default_vcpus(t).unwrap_or(2),
             )
         })
@@ -3389,16 +3416,28 @@ mod modify_tests {
             );
         }
 
-        let (user_data, tags, network) =
+        let inputs =
             run_instance_inputs(&svc.state, "000000000000", "i-1").expect("instance exists");
-        assert_eq!(user_data.as_deref(), Some("Zm9v"), "user-data is threaded");
         assert_eq!(
-            tags.get("Name").map(String::as_str),
+            inputs.user_data.as_deref(),
+            Some("Zm9v"),
+            "user-data is threaded"
+        );
+        assert_eq!(
+            inputs.tags.get("Name").map(String::as_str),
             Some("web"),
             "tags threaded"
         );
-        let net = network.expect("subnet-bound instance gets a network placement");
+        assert_eq!(inputs.region, "us-east-1", "region of the instance's AZ");
+        let net = inputs
+            .network
+            .expect("subnet-bound instance gets a network placement");
         assert_eq!(net.subnet_id, "subnet-1", "rejoins the same subnet");
+        assert_eq!(
+            net.private_ip.as_deref(),
+            Some("10.0.0.5"),
+            "keeps its address"
+        );
 
         // A missing instance yields None (mirrors a concurrent terminate).
         assert!(run_instance_inputs(&svc.state, "000000000000", "i-missing").is_none());
@@ -4757,6 +4796,131 @@ mod modify_tests {
         };
         drop(accounts);
         assert!(cfn_create_instance(&svc, "000000000000", "us-east-1", &bad).is_err());
+    }
+}
+
+#[cfg(test)]
+mod address_tests {
+    use super::*;
+
+    const ACCOUNT: &str = "000000000000";
+
+    fn req(action: &str, query: &[(&str, &str)]) -> AwsRequest {
+        AwsRequest {
+            service: "ec2".into(),
+            action: action.into(),
+            region: "us-east-1".into(),
+            account_id: ACCOUNT.into(),
+            request_id: "rid".into(),
+            headers: http::HeaderMap::new(),
+            query_params: query
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            body: bytes::Bytes::new(),
+            body_stream: parking_lot::Mutex::new(None),
+            path_segments: Vec::new(),
+            raw_path: "/".into(),
+            raw_query: String::new(),
+            method: http::Method::POST,
+            is_query_protocol: true,
+            access_key_id: None,
+            principal: None,
+        }
+    }
+
+    fn element(resp: AwsResponse, tag: &str) -> String {
+        let body = String::from_utf8_lossy(resp.body.expect_bytes()).to_string();
+        let open = format!("<{tag}>");
+        let start = body.find(&open).expect(&body) + open.len();
+        let end = start + body[start..].find('<').unwrap();
+        body[start..end].to_string()
+    }
+
+    fn subnet(svc: &Ec2Service, vpc_cidr: &str, cidr: &str) -> String {
+        let vpc = element(
+            super::super::vpc::create_vpc(svc, &req("CreateVpc", &[("CidrBlock", vpc_cidr)]))
+                .unwrap(),
+            "vpcId",
+        );
+        element(
+            super::super::subnet::create_subnet(
+                svc,
+                &req("CreateSubnet", &[("VpcId", &vpc), ("CidrBlock", cidr)]),
+            )
+            .unwrap(),
+            "subnetId",
+        )
+    }
+
+    fn launch(
+        svc: &Ec2Service,
+        subnet: &str,
+        count: usize,
+    ) -> Result<Vec<String>, AwsServiceError> {
+        let params: HashMap<String, String> = [
+            ("ImageId", "ami-1".to_string()),
+            ("MinCount", count.to_string()),
+            ("MaxCount", count.to_string()),
+            ("SubnetId", subnet.to_string()),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        let launched = launch_instances(svc, ACCOUNT, "us-east-1", &params)?;
+        let accounts = svc.state.read();
+        let st = accounts.get(ACCOUNT).unwrap();
+        Ok(launched
+            .ids
+            .iter()
+            .map(|id| st.instances[id].private_ip.clone())
+            .collect())
+    }
+
+    /// Instances get their subnet's lowest free addresses, distinct across
+    /// launches (a container is given exactly this address), skipping what
+    /// network interfaces hold; a terminated instance's address is free
+    /// again, and a subnet without room fails the launch whole.
+    #[test]
+    fn instances_get_distinct_addresses_from_their_subnet() {
+        let svc = Ec2Service::new();
+        let subnet_id = subnet(&svc, "10.40.0.0/16", "10.40.4.0/28");
+        assert_eq!(
+            launch(&svc, &subnet_id, 2).unwrap(),
+            ["10.40.4.4", "10.40.4.5"]
+        );
+        {
+            let mut accounts = svc.state.write();
+            let st = accounts.get_or_create(ACCOUNT);
+            crate::vpc_lookup::create_service_eni(
+                st,
+                crate::vpc_lookup::ServiceEni {
+                    subnet_id: &subnet_id,
+                    group_ids: Vec::new(),
+                    description: "ELB app/x/1".into(),
+                    private_ip: None,
+                },
+            )
+            .unwrap();
+        }
+        // .6 went to the network interface.
+        let third = launch(&svc, &subnet_id, 1).unwrap();
+        assert_eq!(third, ["10.40.4.7"]);
+        {
+            let mut accounts = svc.state.write();
+            let st = accounts.get_or_create(ACCOUNT);
+            let first = st
+                .instances
+                .values_mut()
+                .find(|i| i.private_ip == "10.40.4.4")
+                .unwrap();
+            first.state_code = 48;
+        }
+        assert_eq!(launch(&svc, &subnet_id, 1).unwrap(), ["10.40.4.4"]);
+        // A /28 has .4 to .14: seven more fit, eight do not.
+        let err = launch(&svc, &subnet_id, 8).expect_err("subnet is full");
+        assert_eq!(err.code(), "InsufficientFreeAddressesInSubnet");
+        assert_eq!(launch(&svc, &subnet_id, 7).unwrap().len(), 7);
     }
 }
 

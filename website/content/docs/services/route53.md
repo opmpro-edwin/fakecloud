@@ -97,7 +97,7 @@ By default Route 53 stores records but nothing answers a real lookup: `TestDNSAn
 
 - Longest-suffix zone match across every account's hosted zones; `CNAME`s are chased into local zones and the resolved address records appended.
 - Alias records are answered with their target's records under the queried name, as Route 53 does: an alias to an Application Load Balancer (`AliasTarget.DNSName` its DNS name, with or without the `dualstack.` prefix) answers the private IPs of the load balancer's network interfaces, and an alias to another record in a local zone answers that record's values. Load balancer DNS names (`internal-<name>-<id>.<region>.elb.amazonaws.com`) themselves resolve to the same IPs. Answers synthesized this way carry a 60-second TTL. Alias targets of other kinds (CloudFront, S3 websites, API Gateway) answer nothing yet.
-- ECS tasks use it as their VPC's DNS server (see [ECS VPC networking](/docs/services/ecs/#vpc-networking-dns-and-load-balancers)), so private hosted zones and alias records resolve inside a task as they do in a VPC.
+- ECS tasks and EC2 instances use it as their VPC's DNS server (see [ECS VPC networking](/docs/services/ecs/#vpc-networking-dns-and-load-balancers) and [EC2 VPC networking](/docs/services/ec2/#vpc-networking)), so private hosted zones and alias records resolve inside a task or an instance as they do in a VPC.
 - Names in no local zone are forwarded to an upstream resolver (`--dns-upstream`), so a container can point its sole resolver at fakecloud and still reach the internet.
 - Binding the default port 53 needs root; pass `--dns-addr 127.0.0.1:15353` (or any high port) for an unprivileged run.
 

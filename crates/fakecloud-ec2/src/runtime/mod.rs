@@ -20,8 +20,10 @@
 
 pub mod firewall;
 mod imds;
+pub(crate) mod instance_env;
 mod k8s;
 pub mod netpolicy;
+pub(crate) mod vpc;
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -42,6 +44,9 @@ use firewall::{
 /// rejects `infinity`).
 const DEFAULT_IMAGE_ENV: &str = "FAKECLOUD_EC2_DEFAULT_IMAGE";
 const DEFAULT_IMAGE: &str = "amazonlinux:2023";
+
+/// Budget for a container CLI call that copies files into a container.
+const CLI_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeError {
@@ -78,18 +83,28 @@ pub struct RunningInstance {
 }
 
 /// The L3 placement of an instance's backing container: which subnet it lands
-/// in and whether that subnet is private.
+/// in, whether that subnet is private, and the addresses that place it in its
+/// VPC (see [`vpc`]).
 ///
 /// Per-subnet networks give the isolation #1745 wants for free: two instances
 /// in the same subnet share a bridge and can talk; instances in different
 /// subnets / VPCs land on different bridges and cannot route to each other.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct InstanceNetwork {
     /// The EC2 subnet id the instance launched into.
     pub subnet_id: String,
-    /// True when the subnet has no `0.0.0.0/0 -> igw` route (private): the
-    /// backing network is created `--internal` (no NAT to host/internet).
+    /// True when the subnet has no `0.0.0.0/0 -> igw` route (private). Its
+    /// backing network is `--internal` (no NAT to host/internet) only when
+    /// `FAKECLOUD_EC2_ISOLATE_PRIVATE_SUBNETS` asks for it.
     pub internal: bool,
+    /// The subnet's CIDR block: the backing network's address range.
+    pub cidr_block: Option<String>,
+    /// The CIDR block of the subnet's VPC, whose base plus two is the VPC's
+    /// DNS server.
+    pub vpc_cidr_block: Option<String>,
+    /// The private IP EC2 gave the instance, which its container gets on the
+    /// subnet's network.
+    pub private_ip: Option<String>,
 }
 
 /// The daemon network name backing an EC2 subnet. Stable per subnet so every
@@ -352,6 +367,8 @@ impl Ec2Runtime {
                 forwarders: Arc::new(parking_lot::Mutex::new(HashMap::new())),
                 forward_locks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
                 forwarders_changed: Arc::new(ChangeHook::default()),
+                vpc_sidecars: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+                engine_socket: Arc::new(std::sync::OnceLock::new()),
             }),
             instances: Arc::new(RwLock::new(HashMap::new())),
             firewall: FirewallEnforcer::detect(),
@@ -448,7 +465,8 @@ impl Ec2Runtime {
 
     /// Boot a container for an instance. `user_data` is the base64-encoded
     /// user-data as received on the wire (RunInstances `UserData`), run at
-    /// boot the way cloud-init would, if present.
+    /// boot the way cloud-init would, if present. `region` is the instance's
+    /// region.
     pub async fn run_instance(
         &self,
         account_id: &str,
@@ -456,6 +474,7 @@ impl Ec2Runtime {
         user_data: Option<&str>,
         tags: &BTreeMap<String, String>,
         network: Option<&InstanceNetwork>,
+        region: &str,
     ) -> Result<RunningInstance, RuntimeError> {
         let image = default_image();
         let running = match &self.backend {
@@ -463,8 +482,16 @@ impl Ec2Runtime {
             // L3 isolation. k8s pods share a flat network; isolation there is a
             // NetworkPolicy concern handled separately (#1745 phase 4).
             InstanceBackend::Docker(d) => {
-                d.run_instance(account_id, instance_id, &image, user_data, network)
-                    .await?
+                let launch = DockerLaunch {
+                    account_id,
+                    instance_id,
+                    image: &image,
+                    user_data,
+                    tags,
+                    network,
+                    region,
+                };
+                d.run_instance(&launch).await?
             }
             InstanceBackend::K8s(k) => k.spawn_pod(instance_id, &image, user_data, tags).await?,
         };
@@ -747,13 +774,14 @@ impl Ec2Runtime {
             .map(|r| r.handle.clone())
     }
 
-    /// Give a Docker-backed instance IMDS in the background. The sidecar
-    /// (and, the first time, the helper image build) can take tens of
-    /// seconds, and the caller holds the instance's lifecycle lock -- which a
-    /// reset, stop or terminate waits on -- so it never runs inline. The task
-    /// re-checks that the instance is still this running container before
-    /// and after starting the sidecar, so a stop / terminate that lands
-    /// meanwhile never leaves a sidecar behind.
+    /// Give a Docker-backed instance IMDS (and, with `--dns`, its VPC's DNS
+    /// and load balancer routes) in the background. The sidecar (and, the
+    /// first time, the helper image build) can take tens of seconds, and the
+    /// caller holds the instance's lifecycle lock -- which a reset, stop or
+    /// terminate waits on -- so it never runs inline. The task re-checks that
+    /// the instance is still this running container before and after
+    /// starting the sidecar, so a stop / terminate that lands meanwhile never
+    /// leaves a sidecar behind.
     fn spawn_imds(&self, instance_id: &str, handle: &str) {
         let InstanceBackend::Docker(d) = &self.backend else {
             return;
@@ -762,6 +790,10 @@ impl Ec2Runtime {
         let instances = self.instances.clone();
         let id = instance_id.to_string();
         let handle = handle.to_string();
+        let vpc_dns = {
+            let instances = self.instances.read();
+            vpc::vpc_dns(instances.get(instance_id).and_then(|r| r.network.as_ref()))
+        };
         tokio::spawn(async move {
             let current = {
                 let (instances, id, handle) = (instances.clone(), id.clone(), handle.clone());
@@ -772,7 +804,7 @@ impl Ec2Runtime {
                         .is_some_and(|r| r.running && r.handle == handle)
                 }
             };
-            d.start_imds(&id, &handle, current).await;
+            d.start_imds(&id, &handle, vpc_dns.as_ref(), current).await;
         });
     }
 
@@ -995,6 +1027,53 @@ struct DockerInstances {
     forward_locks: Arc<parking_lot::Mutex<HashMap<(String, u16), ForwardLock>>>,
     /// Called when forwarders' security-group membership changes.
     forwarders_changed: Arc<ChangeHook>,
+    /// Instance id -> its IMDS sidecar's container id, for sidecars whose
+    /// load balancer map [`fakecloud_core::vpc_netns`] keeps current.
+    vpc_sidecars: Arc<parking_lot::Mutex<HashMap<String, String>>>,
+    /// The host engine socket mounted into instances tagged for it, resolved
+    /// on first use (see [`instance_env`]).
+    engine_socket: Arc<std::sync::OnceLock<String>>,
+}
+
+/// What one instance container is started with (Docker / Podman).
+struct DockerLaunch<'a> {
+    account_id: &'a str,
+    instance_id: &'a str,
+    image: &'a str,
+    user_data: Option<&'a str>,
+    tags: &'a BTreeMap<String, String>,
+    network: Option<&'a InstanceNetwork>,
+    region: &'a str,
+}
+
+/// Files an instance container gets before it starts.
+struct InstanceFiles<'a> {
+    /// The extra CA's PEM, for the trust bundle.
+    extra_ca: Option<&'a str>,
+    /// The sourceable AWS SDK environment.
+    aws_env: Option<String>,
+}
+
+impl InstanceFiles<'_> {
+    fn any(&self) -> bool {
+        self.extra_ca.is_some() || self.aws_env.is_some()
+    }
+}
+
+/// The daemon network backing a subnet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SubnetBacking {
+    name: String,
+    /// Whether the network's range is the subnet's CIDR block, so instances
+    /// can be given their EC2 private IPs on it.
+    addressed: bool,
+}
+
+/// What became of a `network create`.
+enum NetworkCreate {
+    Created,
+    Exists,
+    Failed(String),
 }
 
 /// A forwarder publishing one instance port on the host (see [`imds`]).
@@ -1030,6 +1109,32 @@ impl std::fmt::Debug for ChangeHook {
 /// Serializes forwarder creation for one `(instance, port)`.
 type ForwardLock = Arc<tokio::sync::Mutex<()>>;
 
+/// The subnets of a `network inspect` document: Docker's `IPAM.Config[].Subnet`
+/// and Podman's `subnets[].subnet`, in canonical form.
+fn network_subnets(inspect: &serde_json::Value) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut stack = vec![inspect];
+    while let Some(v) = stack.pop() {
+        match v {
+            serde_json::Value::Array(items) => stack.extend(items),
+            serde_json::Value::Object(map) => {
+                for (k, v) in map {
+                    match v.as_str() {
+                        Some(subnet) if k.eq_ignore_ascii_case("subnet") => {
+                            if let Some(c) = vpc::Cidr::parse(subnet) {
+                                found.push(c.canonical());
+                            }
+                        }
+                        _ => stack.push(v),
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    found
+}
+
 /// `inspect` template printing a container's IP on network `name`.
 fn network_ip_template(name: &str) -> String {
     format!("{{{{with index .NetworkSettings.Networks \"{name}\"}}}}{{{{.IPAddress}}}}{{{{end}}}}")
@@ -1038,18 +1143,28 @@ fn network_ip_template(name: &str) -> String {
 impl DockerInstances {
     async fn run_instance(
         &self,
-        account_id: &str,
-        instance_id: &str,
-        image: &str,
-        user_data: Option<&str>,
-        network: Option<&InstanceNetwork>,
+        launch: &DockerLaunch<'_>,
     ) -> Result<RunningInstance, RuntimeError> {
+        let instance_id = launch.instance_id;
         // Ensure the subnet's bridge exists and attach to it for L3 isolation.
         // Network creation is best-effort: on failure we fall back to the
         // default bridge so the instance still boots (no regression vs today).
-        let attached_network = match network {
+        let backing = match launch.network {
             Some(net) => self.ensure_subnet_network(net).await,
             None => None,
+        };
+        // The instance's EC2 private IP, on a network that carries its
+        // subnet's range (see `vpc`).
+        let pinned_ip = launch
+            .network
+            .zip(backing.as_ref())
+            .and_then(|(net, b)| vpc::pinned_ip(net, b.addressed));
+        let vpc_dns = vpc::vpc_dns(launch.network);
+        let extra_ca = instance_env::extra_ca();
+        let aws_env = instance_env::aws_env(&self.net.host_alias, self.server_port, launch.region);
+        let files = InstanceFiles {
+            extra_ca: extra_ca.as_deref(),
+            aws_env: aws_env.as_ref().map(instance_env::AwsEnv::file),
         };
 
         let mut args: Vec<String> = vec![
@@ -1070,7 +1185,9 @@ impl DockerInstances {
         // The volume is dropped on TerminateInstances. See
         // [`scoped_data_volume_name`] / [`instance_data_dir`].
         if ec2_volumes_enabled() {
-            let volume = self.resolve_data_volume(account_id, instance_id).await?;
+            let volume = self
+                .resolve_data_volume(launch.account_id, instance_id)
+                .await?;
             fakecloud_core::data_volume::ensure_volume(
                 &self.cli,
                 &volume,
@@ -1081,13 +1198,17 @@ impl DockerInstances {
             args.push("-v".to_string());
             args.push(format!("{volume}:{}", instance_data_dir()));
         }
-        if let Some(name) = &attached_network {
-            args.push("--network".to_string());
-            args.push(name.clone());
-        }
-        // The host alias resolves inside the instance (and its IMDS sidecar,
-        // which shares its /etc/hosts), so workloads can reach fakecloud.
-        self.net.push_add_host_args(&mut args);
+        // The subnet network and the instance's address on it, the host alias
+        // (which resolves inside the instance and its IMDS sidecar, which
+        // shares its /etc/hosts, so workloads can reach fakecloud), and the
+        // VPC resolver.
+        args.extend(vpc::instance_network_argv(
+            backing.as_ref().map(|b| b.name.as_str()),
+            pinned_ip,
+            self.net.add_host_arg.as_deref(),
+            &self.net.host_alias,
+            vpc_dns.as_ref(),
+        ));
         args.extend(imds::readiness_tmpfs_args());
         // IMDS answers at 169.254.169.254 through the sidecar; without a
         // helper image, point SDKs at fakecloud's per-instance IMDS instead.
@@ -1099,29 +1220,50 @@ impl DockerInstances {
             args.push("-e".to_string());
             args.push(format!("{k}={v}"));
         }
-        args.push(image.to_string());
-        args.extend(boot_command(user_data));
+        if let Some(env) = &aws_env {
+            args.extend(env.args());
+        }
+        if extra_ca.is_some() {
+            args.extend(instance_env::ssl_cert_file_env());
+        }
+        if instance_env::wants_host_engine(launch.tags) {
+            args.extend(instance_env::engine_socket_mount(
+                &self.host_engine_socket().await,
+            ));
+        }
+        args.push(launch.image.to_string());
+        args.extend(boot_command(launch.user_data));
 
         // `run` pulls a missing image itself but gives up on the first
         // throttled pull; make it available first, retrying transient
         // registry failures.
-        fakecloud_core::container_image::ensure_image(&self.cli, None, image)
+        fakecloud_core::container_image::ensure_image(&self.cli, None, launch.image)
             .await
             .map_err(RuntimeError::ContainerStartFailed)?;
 
-        let output = tokio::process::Command::new(&self.cli)
-            .args(&args)
-            .output()
-            .await
-            .map_err(|e| RuntimeError::ContainerStartFailed(e.to_string()))?;
-
-        if !output.status.success() {
-            return Err(RuntimeError::ContainerStartFailed(
-                String::from_utf8_lossy(&output.stderr).trim().to_string(),
-            ));
+        let mut started = self
+            .start_instance_container(instance_id, &args, &files)
+            .await;
+        // The address is held by a container EC2 does not know about (one
+        // that is still going away, or a forwarder the daemon gave it): the
+        // instance takes an address the daemon picks instead, which is what
+        // DescribeInstances then reports.
+        if let (Err(error), Some(ip)) = (&started, pinned_ip) {
+            if vpc::address_taken(error) {
+                tracing::warn!(
+                    instance = %instance_id,
+                    %ip,
+                    "the instance's private IP is held by another container; it gets another address in its subnet"
+                );
+                if let Some(at) = args.iter().position(|a| a == "--ip") {
+                    args.drain(at..at + 2);
+                }
+                started = self
+                    .start_instance_container(instance_id, &args, &files)
+                    .await;
+            }
         }
-
-        let container_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let container_id = started.map_err(RuntimeError::ContainerStartFailed)?;
         let private_ip = self
             .inspect_ip(&container_id)
             .await
@@ -1130,8 +1272,153 @@ impl DockerInstances {
         Ok(RunningInstance {
             container_id,
             private_ip,
-            network: attached_network,
+            network: backing.map(|b| b.name),
         })
+    }
+
+    /// Start an instance container from its `run -d` argv and return its id.
+    /// With `files` to put in it, it is created, given them (see
+    /// [`instance_env`]), then started, so they are there before user-data
+    /// runs. A container left created but not started is removed.
+    async fn start_instance_container(
+        &self,
+        instance_id: &str,
+        args: &[String],
+        files: &InstanceFiles<'_>,
+    ) -> Result<String, String> {
+        let create = files
+            .any()
+            .then(|| fakecloud_core::ca_bundle::create_argv(args))
+            .flatten();
+        let Some(create) = create else {
+            let out = tokio::process::Command::new(&self.cli)
+                .args(args)
+                .output()
+                .await
+                .map_err(|e| e.to_string())?;
+            if out.status.success() {
+                return Ok(String::from_utf8_lossy(&out.stdout).trim().to_string());
+            }
+            self.remove_unstarted(instance_id).await;
+            return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+        };
+        let created = tokio::process::Command::new(&self.cli)
+            .args(&create)
+            .output()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !created.status.success() {
+            return Err(String::from_utf8_lossy(&created.stderr).trim().to_string());
+        }
+        let id = String::from_utf8_lossy(&created.stdout).trim().to_string();
+        if let Some(ca) = files.extra_ca {
+            if let Err(error) = fakecloud_core::ca_bundle::copy_into(
+                &self.cli,
+                &id,
+                ca,
+                instance_env::BUNDLE_DIR,
+                CLI_TIMEOUT,
+            )
+            .await
+            {
+                tracing::warn!(instance = %instance_id, %error, "could not give the instance container its CA bundle");
+            }
+        }
+        if let Some(env) = &files.aws_env {
+            if let Err(error) = self
+                .copy_file_into(
+                    &id,
+                    instance_env::AWS_ENV_DIR,
+                    instance_env::AWS_ENV_FILE,
+                    env,
+                )
+                .await
+            {
+                tracing::warn!(instance = %instance_id, %error, "could not write {} in the instance", instance_env::AWS_ENV_PATH);
+            }
+        }
+        let out = tokio::process::Command::new(&self.cli)
+            .args(["start", &id])
+            .output()
+            .await
+            .map_err(|e| e.to_string())?;
+        if out.status.success() {
+            return Ok(id);
+        }
+        self.remove(&id).await;
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+
+    /// Put `contents` in created container `id` as `<dir>/<name>`, readable
+    /// by every user, creating `dir` when the image has none.
+    async fn copy_file_into(
+        &self,
+        id: &str,
+        dir: &str,
+        name: &str,
+        contents: &str,
+    ) -> Result<(), String> {
+        let staged = tempfile::tempdir().map_err(|e| format!("staging dir: {e}"))?;
+        let staged_dir = staged.path().join("dir");
+        std::fs::create_dir(&staged_dir).map_err(|e| format!("staging dir: {e}"))?;
+        let file = staged_dir.join(name);
+        std::fs::write(&file, contents).map_err(|e| format!("staging file: {e}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&staged_dir, std::fs::Permissions::from_mode(0o755));
+            let _ = std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644));
+        }
+        let out = fakecloud_core::container_net::output_within(
+            tokio::process::Command::new(&self.cli)
+                .arg("cp")
+                // `<dir>/.`: the directory's contents, into `dir` whether or
+                // not the image already has it.
+                .arg(staged_dir.join("."))
+                .arg(format!("{id}:{dir}")),
+            CLI_TIMEOUT,
+        )
+        .await
+        .map_err(|e| format!("{} cp {e}", self.cli))?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+        }
+    }
+
+    /// Remove an instance's containers that were created but never started
+    /// (a `run` whose start failed leaves one behind).
+    async fn remove_unstarted(&self, instance_id: &str) {
+        let ps = tokio::process::Command::new(&self.cli)
+            .args([
+                "ps",
+                "-aq",
+                "--filter",
+                &format!("label=fakecloud-ec2={instance_id}"),
+                "--filter",
+                "status=created",
+            ])
+            .output()
+            .await;
+        if let Ok(out) = ps {
+            for id in String::from_utf8_lossy(&out.stdout).split_whitespace() {
+                self.remove(id).await;
+            }
+        }
+    }
+
+    /// The host engine socket for instances tagged for it, resolved once.
+    async fn host_engine_socket(&self) -> String {
+        if let Some(socket) = self.engine_socket.get() {
+            return socket.clone();
+        }
+        let (cli, podman) = (self.cli.clone(), self.podman);
+        let socket =
+            tokio::task::spawn_blocking(move || instance_env::host_engine_socket(&cli, podman))
+                .await
+                .unwrap_or_else(|_| "/var/run/docker.sock".to_string());
+        self.engine_socket.get_or_init(|| socket).clone()
     }
 
     /// The helper image for IMDS sidecars and forwarders: the operator's
@@ -1229,8 +1516,9 @@ impl DockerInstances {
         Err(format!("building {tag}: {last_err}"))
     }
 
-    /// Give a running instance container IMDS at `169.254.169.254`: start
-    /// its sidecar, wait for the redirect, then release the boot (user-data
+    /// Give a running instance container IMDS at `169.254.169.254` (and,
+    /// with `vpc_dns`, its VPC's DNS server and load balancer routes): start
+    /// its sidecar, wait for the rules, then release the boot (user-data
     /// waits on [`imds::READY_FILE`]). Best-effort: on failure the boot is
     /// released anyway and the instance runs without link-local IMDS.
     ///
@@ -1240,6 +1528,7 @@ impl DockerInstances {
         &self,
         instance_id: &str,
         container_id: &str,
+        vpc_dns: Option<&fakecloud_core::vpc_netns::VpcDns>,
         still_current: impl Fn() -> bool,
     ) {
         let Some(helper) = self.ensure_helper_image().await else {
@@ -1261,6 +1550,7 @@ impl DockerInstances {
             &helper,
             &self.net.host_alias,
             self.server_port,
+            vpc_dns,
         );
         let result = match tokio::process::Command::new(&self.cli)
             .args(&argv)
@@ -1269,7 +1559,7 @@ impl DockerInstances {
         {
             Ok(out) if out.status.success() => {
                 let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                self.wait_for_sidecar(&id).await
+                self.wait_for_sidecar(&id).await.map(|()| id)
             }
             Ok(out) => Err(String::from_utf8_lossy(&out.stderr).trim().to_string()),
             Err(e) => Err(e.to_string()),
@@ -1281,6 +1571,32 @@ impl DockerInstances {
                 .output()
                 .await;
             return;
+        }
+        // Load balancer addresses route before user-data runs, and follow
+        // load balancers created later.
+        if let (Ok(sidecar), Some(_)) = (&result, vpc_dns) {
+            fakecloud_core::vpc_netns::attach(
+                &self.cli,
+                sidecar,
+                &self.net.host_alias,
+                imds::NFT_TABLE,
+            )
+            .await;
+            let replaced = self
+                .vpc_sidecars
+                .lock()
+                .insert(instance_id.to_string(), sidecar.clone());
+            fakecloud_core::vpc_netns::detach(replaced.as_slice());
+            if !still_current() {
+                // Stopped / terminated while the map was filled: its teardown
+                // may have looked for the sidecar before it was recorded.
+                self.remove_vpc_sidecar(instance_id);
+                let _ = tokio::process::Command::new(&self.cli)
+                    .args(["rm", "-f", &name])
+                    .output()
+                    .await;
+                return;
+            }
         }
         if let Err(error) = result {
             tracing::warn!(
@@ -1338,10 +1654,17 @@ impl DockerInstances {
             .await;
     }
 
+    /// Stop keeping the load balancer map of an instance's sidecar.
+    fn remove_vpc_sidecar(&self, instance_id: &str) {
+        let tracked = self.vpc_sidecars.lock().remove(instance_id);
+        fakecloud_core::vpc_netns::detach(tracked.as_slice());
+    }
+
     /// Remove an instance's IMDS sidecar and load balancer forwarders --
     /// tracked ones, and any a concurrent [`Self::forward`] is still starting
     /// (found by label).
     async fn remove_sidecars(&self, instance_id: &str) {
+        self.remove_vpc_sidecar(instance_id);
         let mut names = vec![imds::sidecar_name(instance_id)];
         self.forward_locks
             .lock()
@@ -1555,57 +1878,94 @@ impl DockerInstances {
         ))
     }
 
-    /// Create (idempotently) the daemon network backing a subnet and return its
-    /// name, or `None` if creation failed (caller falls back to the default
-    /// bridge). The network carries the shared `fakecloud-instance` ownership
-    /// label so the startup reaper prunes it after an ungraceful restart, plus
-    /// a `fakecloud-subnet=<id>` label for introspection. Private subnets get
-    /// an `--internal` network (no NAT to the host/internet).
-    async fn ensure_subnet_network(&self, net: &InstanceNetwork) -> Option<String> {
+    /// Create (idempotently) the daemon network backing a subnet, or `None`
+    /// if that failed (caller falls back to the default bridge). The network
+    /// carries the shared `fakecloud-instance` ownership label so the startup
+    /// reaper prunes it after an ungraceful restart, plus a
+    /// `fakecloud-subnet=<id>` label for introspection. Its range is the
+    /// subnet's CIDR block when the daemon allows it (see [`vpc`]).
+    async fn ensure_subnet_network(&self, net: &InstanceNetwork) -> Option<SubnetBacking> {
         let name = subnet_network_name(&net.subnet_id);
-        let mut args = vec!["network".to_string(), "create".to_string()];
-        if net.internal {
-            args.push("--internal".to_string());
-        }
-        args.push("--label".to_string());
-        args.push(format!("fakecloud-subnet={}", net.subnet_id));
-        args.push("--label".to_string());
-        args.push(format!("fakecloud-instance={}", self.instance_id));
-        args.push(name.clone());
-
-        let output = tokio::process::Command::new(&self.cli)
-            .args(&args)
-            .output()
-            .await;
-        match output {
-            // Created fresh.
-            Ok(out) if out.status.success() => Some(name),
-            // Already exists (another instance in the same subnet created it):
-            // a benign race — the network is there, so attach to it.
-            Ok(out) => {
-                let err = String::from_utf8_lossy(&out.stderr);
-                if err.contains("already exists") || err.contains("exists") {
-                    Some(name)
-                } else {
-                    tracing::warn!(
-                        subnet = %net.subnet_id,
-                        network = %name,
-                        error = %err.trim(),
-                        "subnet network creation failed; falling back to default bridge"
-                    );
-                    None
+        let isolate = vpc::isolate_private_subnets();
+        let cidr = vpc::subnet_cidr(net);
+        if cidr.is_some() {
+            let argv = vpc::network_create_argv(&name, net, &self.instance_id, true, isolate);
+            match self.create_network(&argv).await {
+                NetworkCreate::Created => {
+                    return Some(SubnetBacking {
+                        name,
+                        addressed: true,
+                    })
                 }
+                // Another instance in the subnet created it, or an earlier
+                // run did without the range.
+                NetworkCreate::Exists => {
+                    let addressed = self.network_has_range(&name, cidr.as_ref()).await;
+                    return Some(SubnetBacking { name, addressed });
+                }
+                NetworkCreate::Failed(error) => tracing::warn!(
+                    subnet = %net.subnet_id,
+                    network = %name,
+                    %error,
+                    "the subnet's network cannot have the subnet's CIDR block (another network \
+                     overlaps it?); its instances get addresses the engine picks"
+                ),
             }
-            Err(e) => {
+        }
+        let argv = vpc::network_create_argv(&name, net, &self.instance_id, false, isolate);
+        match self.create_network(&argv).await {
+            NetworkCreate::Created => Some(SubnetBacking {
+                name,
+                addressed: false,
+            }),
+            NetworkCreate::Exists => {
+                let addressed = self.network_has_range(&name, cidr.as_ref()).await;
+                Some(SubnetBacking { name, addressed })
+            }
+            NetworkCreate::Failed(error) => {
                 tracing::warn!(
                     subnet = %net.subnet_id,
                     network = %name,
-                    error = %e,
+                    %error,
                     "subnet network creation failed; falling back to default bridge"
                 );
                 None
             }
         }
+    }
+
+    async fn create_network(&self, argv: &[String]) -> NetworkCreate {
+        match tokio::process::Command::new(&self.cli)
+            .args(argv)
+            .output()
+            .await
+        {
+            Ok(out) if out.status.success() => NetworkCreate::Created,
+            Ok(out) => {
+                let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                if vpc::already_exists(&err) {
+                    NetworkCreate::Exists
+                } else {
+                    NetworkCreate::Failed(err)
+                }
+            }
+            Err(e) => NetworkCreate::Failed(e.to_string()),
+        }
+    }
+
+    /// Whether existing network `name`'s range is `cidr`.
+    async fn network_has_range(&self, name: &str, cidr: Option<&vpc::Cidr>) -> bool {
+        let Some(cidr) = cidr else {
+            return false;
+        };
+        let out = tokio::process::Command::new(&self.cli)
+            .args(["network", "inspect", name])
+            .output()
+            .await;
+        out.ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| serde_json::from_slice::<serde_json::Value>(&o.stdout).ok())
+            .is_some_and(|v| network_subnets(&v).contains(&cidr.canonical()))
     }
 
     /// Read the container's private IP from `inspect`. Returns `None` if the
@@ -1815,6 +2175,8 @@ mod reachability_tests {
                 forwarders: Arc::new(parking_lot::Mutex::new(HashMap::new())),
                 forward_locks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
                 forwarders_changed: Arc::new(ChangeHook::default()),
+                vpc_sidecars: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+                engine_socket: Arc::new(std::sync::OnceLock::new()),
             }),
             instances: Arc::new(RwLock::new(HashMap::new())),
             firewall: FirewallEnforcer::disabled(),
@@ -1961,7 +2323,7 @@ mod reachability_tests {
                 "172.30.0.7",
                 Some(InstanceNetwork {
                     subnet_id: "subnet-1".into(),
-                    internal: false,
+                    ..InstanceNetwork::default()
                 }),
             ),
         );
@@ -2073,7 +2435,14 @@ mod reachability_tests {
         let started = std::time::Instant::now();
         let running = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            rt.run_instance("123456789012", "i-fast", None, &BTreeMap::new(), None),
+            rt.run_instance(
+                "123456789012",
+                "i-fast",
+                None,
+                &BTreeMap::new(),
+                None,
+                "us-east-1",
+            ),
         )
         .await
         .expect("run_instance waited on the IMDS helper")
@@ -2140,6 +2509,88 @@ mod reachability_tests {
                 InstanceBackend::K8s(_) => None,
             }
         }
+    }
+
+    /// An instance is given its EC2 private IP on a subnet network that
+    /// carries the subnet's range; when another container holds that
+    /// address, it boots with one the engine picks and reports that one.
+    #[tokio::test]
+    async fn an_instance_whose_address_is_taken_takes_another() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("calls");
+        let script = dir.path().join("fakecli");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho \"$*\" >> {log}\ncase \"$1\" in\n  run) case \"$*\" in\n    *fakecloud-ec2-imds*) exit 1 ;;\n    *\"--ip \"*) echo 'Error response from daemon: Address already in use' >&2; exit 125 ;;\n  esac; echo cid-new ;;\n  inspect) echo 10.40.4.130 ;;\nesac\nexit 0\n",
+                log = log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        wait_executable(&script);
+        let rt = runtime_with_cli(&script.display().to_string());
+        let net = InstanceNetwork {
+            subnet_id: "subnet-1".into(),
+            internal: true,
+            cidr_block: Some("10.40.4.0/24".into()),
+            vpc_cidr_block: Some("10.40.0.0/16".into()),
+            private_ip: Some("10.40.4.4".into()),
+        };
+        let running = rt
+            .run_instance(
+                "123456789012",
+                "i-taken",
+                None,
+                &BTreeMap::new(),
+                Some(&net),
+                "us-east-1",
+            )
+            .await
+            .expect("run_instance");
+        assert_eq!(running.private_ip, "10.40.4.130");
+        assert_eq!(
+            running.network.as_deref(),
+            Some("fakecloud-subnet-subnet-1")
+        );
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            calls.contains(
+                "network create --subnet 10.40.4.0/24 --gateway 10.40.4.1 --ip-range 10.40.4.128/25"
+            ),
+            "{calls}"
+        );
+        let runs: Vec<&str> = calls
+            .lines()
+            .filter(|l| l.starts_with("run -d --label fakecloud-ec2=i-taken"))
+            .collect();
+        assert_eq!(runs.len(), 2, "{calls}");
+        assert!(
+            runs[0].contains("--network fakecloud-subnet-subnet-1 --ip 10.40.4.4"),
+            "{calls}"
+        );
+        assert!(!runs[1].contains("--ip "), "{calls}");
+        // What the failed `run` left created is removed first.
+        assert!(
+            calls.contains("ps -aq --filter label=fakecloud-ec2=i-taken --filter status=created"),
+            "{calls}"
+        );
+        rt.terminate_instance("123456789012", "i-taken").await;
+    }
+
+    #[test]
+    fn network_subnets_reads_docker_and_podman_inspect_output() {
+        let docker = serde_json::json!([{
+            "Name": "fakecloud-subnet-1",
+            "IPAM": {"Config": [{"Subnet": "10.40.4.0/24", "IPRange": "10.40.4.128/25", "Gateway": "10.40.4.1"}]}
+        }]);
+        assert_eq!(network_subnets(&docker), ["10.40.4.0/24"]);
+        let podman = serde_json::json!([{
+            "name": "fakecloud-subnet-1",
+            "subnets": [{"subnet": "10.40.4.0/24", "gateway": "10.40.4.1"}]
+        }]);
+        assert_eq!(network_subnets(&podman), ["10.40.4.0/24"]);
+        assert!(network_subnets(&serde_json::json!([{"IPAM": {"Config": []}}])).is_empty());
     }
 
     #[test]

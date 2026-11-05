@@ -329,10 +329,6 @@ pub(crate) fn namespace_network_argv(
     argv
 }
 
-/// Docker's host alias. Podman's (`host.containers.internal`) is written to
-/// the hosts file by podman itself.
-const DOCKER_HOST_ALIAS: &str = "host.docker.internal";
-
 /// `docker run` argv for the holder of `plan`'s network namespace. With
 /// `vpc_dns` the namespace resolves through the VPC's DNS server and the
 /// setup script routes it and the load balancer addresses (see `vpc_net`).
@@ -367,9 +363,10 @@ pub(crate) fn build_holder_argv(
     // `host.docker.internal` on Docker Desktop when fakecloud runs in a
     // container (no `--add-host` then): pin the alias in the namespace's
     // hosts file instead, so the setup script and the app still resolve it.
-    let pinned_alias =
-        (add_host_arg.is_none() && vpc_dns.is_some() && fakecloud_host == DOCKER_HOST_ALIAS)
-            .then(|| format!("{DOCKER_HOST_ALIAS}:host-gateway"));
+    let pinned_alias = add_host_arg
+        .is_none()
+        .then(|| fakecloud_core::vpc_netns::pinned_host_alias(vpc_dns.is_some(), fakecloud_host))
+        .flatten();
     argv.extend(namespace_network_argv(
         plan,
         task_id,

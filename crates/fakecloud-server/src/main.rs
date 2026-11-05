@@ -601,6 +601,12 @@ async fn main() {
     fakecloud_core::vpc_network::set_vpc_directory(Arc::new(
         fakecloud_ec2::vpc_lookup::Ec2VpcDirectory(ec2_state.clone()),
     ));
+    // ECS tasks and EC2 instances reach the DNS listener (`--dns`, started
+    // below) as their VPC's DNS server. Recorded before any runtime recovers
+    // persisted tasks or instances, so they get it too.
+    if cli.dns {
+        fakecloud_core::vpc_network::set_dns_port(Some(cli.dns_addr().port()));
+    }
     let route53_state: fakecloud_route53::SharedRoute53State = Arc::new(parking_lot::RwLock::new(
         fakecloud_route53::Route53Accounts::new(),
     ));
@@ -12846,9 +12852,6 @@ async fn main() {
             external: Arc::new(dns::LoadBalancerNames(elbv2_state.clone())),
             upstream: cli.dns_upstream(),
         };
-        // ECS tasks reach this listener as their VPC's DNS server (see
-        // `fakecloud_core::vpc_network`).
-        fakecloud_core::vpc_network::set_dns_port(Some(cli.dns_addr().port()));
         tokio::spawn(dns::run(dns_cfg, cli.dns_addr()));
     }
     axum::serve(

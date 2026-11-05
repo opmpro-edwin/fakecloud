@@ -1203,9 +1203,7 @@ impl Ec2Service {
         struct Pending {
             account_id: String,
             id: String,
-            user_data: Option<String>,
-            tags: std::collections::BTreeMap<String, String>,
-            network: Option<crate::runtime::InstanceNetwork>,
+            inputs: instance::RunInstanceInputs,
         }
 
         let pending: Vec<Pending> = {
@@ -1213,49 +1211,26 @@ impl Ec2Service {
             let mut out = Vec::new();
             for (_, state) in accounts.iter_mut() {
                 let account_id = state.account_id.clone();
-                // Snapshot the tag map first so we don't hold two borrows of
-                // `state` at once when re-deriving per-instance Pod tags.
-                let tag_snapshot: std::collections::BTreeMap<String, Vec<crate::state::Tag>> =
-                    state.tags.clone();
-                // Which subnets are public (have an IGW default route), computed
-                // before the mutable instance loop so we can re-derive each
-                // recovered instance's `internal` flag without a second borrow.
-                let public_subnets: std::collections::HashSet<String> = state
-                    .subnets
-                    .keys()
-                    .filter(|sid| crate::defaults::subnet_is_public(state, sid))
-                    .cloned()
+                // Only running/pending instances need a live container. Their
+                // boot inputs (tags, subnet placement, address) are read before
+                // the mutable pass below, which drops the stale container_id
+                // (the reaper removed it).
+                let recovering: Vec<(String, instance::RunInstanceInputs)> = state
+                    .instances
+                    .iter()
+                    .filter(|(_, inst)| matches!(inst.state_name.as_str(), "running" | "pending"))
+                    .map(|(id, inst)| (id.clone(), instance::inputs_of(state, inst)))
                     .collect();
-                for (id, inst) in state.instances.iter_mut() {
-                    // Only running/pending instances need a live container; the
-                    // stale container_id is dropped (the reaper removed it).
-                    if !matches!(inst.state_name.as_str(), "running" | "pending") {
-                        continue;
+                for (id, inputs) in recovering {
+                    if let Some(inst) = state.instances.get_mut(&id) {
+                        inst.state_code = 0;
+                        inst.state_name = "pending".to_string();
+                        inst.container_id = None;
                     }
-                    let tags = tag_snapshot
-                        .get(id)
-                        .map(|t| {
-                            t.iter()
-                                .map(|tag| (tag.key.clone(), tag.value.clone()))
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    let network =
-                        inst.subnet_id
-                            .clone()
-                            .map(|sid| crate::runtime::InstanceNetwork {
-                                internal: !public_subnets.contains(&sid),
-                                subnet_id: sid,
-                            });
-                    inst.state_code = 0;
-                    inst.state_name = "pending".to_string();
-                    inst.container_id = None;
                     out.push(Pending {
                         account_id: account_id.clone(),
-                        id: id.clone(),
-                        user_data: inst.user_data.clone(),
-                        tags,
-                        network,
+                        id,
+                        inputs,
                     });
                 }
             }
@@ -1276,15 +1251,7 @@ impl Ec2Service {
             let state = self.state.clone();
             handles.push(tokio::spawn(async move {
                 let _lifecycle = runtime.lock_lifecycle(&p.id).await;
-                let running = runtime
-                    .run_instance(
-                        &p.account_id,
-                        &p.id,
-                        p.user_data.as_deref(),
-                        &p.tags,
-                        p.network.as_ref(),
-                    )
-                    .await;
+                let running = p.inputs.run(&runtime, &p.account_id, &p.id).await;
                 let post = {
                     let mut accounts = state.write();
                     recovery_outcome(
