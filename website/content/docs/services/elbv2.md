@@ -113,7 +113,7 @@ Network Load Balancers and Gateway Load Balancers get no interfaces yet.
 
 For every ALB whose `state_code == "active"`, fakecloud binds a TCP listener on `127.0.0.1:0` (OS-allocated) and serves HTTP/1.1 requests through the listener-rule chain you configured. Connections are parsed, routed against your rules in priority order (first non-default match wins; otherwise the listener default actions), and dispatched to the action:
 
-- **`forward`** — picks a target group via the action's weighted distribution and a target within it via round-robin (skipping `unhealthy` / `unused` targets), then proxies the request via `reqwest`. The request carries `X-Forwarded-For`, `X-Forwarded-Proto`, `X-Forwarded-Port`, and `X-Amzn-Trace-Id` headers. The upstream's status, body, and non-hop-by-hop headers are returned to the client.
+- **`forward`** — picks a target group via the action's weighted distribution and a target within it via round-robin (skipping `unhealthy` / `unused` targets), then proxies the request via `reqwest`. The request carries `X-Forwarded-For`, `X-Forwarded-Proto`, `X-Forwarded-Port`, and `X-Amzn-Trace-Id` headers. The upstream's status, body, and non-hop-by-hop headers are returned to the client. A WebSocket handshake (`GET` with `Connection: Upgrade` and `Upgrade: websocket`) is forwarded with those headers over a connection of its own; once the target answers `101 Switching Protocols`, its answer goes back whole and the client's connection is joined to the target's until either side closes, as an ALB does on HTTP and HTTPS listeners. Any other answer to a handshake is returned like a plain response.
 - **`fixed-response`** — returns the configured status code, message body, and content type immediately.
 - **`redirect`** — emits a 301 (`HTTP_301`) or 302 (`HTTP_302`) with a `Location` header built from `protocol`/`host`/`port`/`path`/`query`, falling back to the request's own host/path when a field is omitted.
 - **`authenticate-oidc` / `authenticate-cognito`** — return `501 Not Implemented` with a body identifying the action; treated as next-batch work.
@@ -144,5 +144,5 @@ Tests that need deterministic flush timing can `POST /_fakecloud/elbv2/access-lo
 
 ## Limitations
 
-- NLB and GWLB data planes are not implemented. Only the ALB data plane (HTTP request matching, forwarding, fixed-response, redirect, sticky sessions, access logs) is functional.
+- NLB and GWLB data planes are not implemented. Only the ALB data plane (HTTP request matching, forwarding, WebSocket upgrades, fixed-response, redirect, sticky sessions, access logs) is functional.
 - HTTPS/TLS termination is not yet implemented. Listeners with `Protocol=HTTPS` are stored but the in-process bind is HTTP-only.

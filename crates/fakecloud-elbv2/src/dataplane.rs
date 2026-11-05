@@ -276,8 +276,11 @@ async fn accept_loop(dp: DataPlane, lb_arn: String, listener: TcpListener) {
                 let peer = peer_addr;
                 async move { Ok::<_, Infallible>(handle_request(&dp3, &lb3, peer, req).await) }
             });
+            // With upgrades, so a WebSocket handshake the target accepts hands
+            // the connection over (see `forward_upgrade`).
             if let Err(e) = hyper::server::conn::http1::Builder::new()
                 .serve_connection(io, svc)
+                .with_upgrades()
                 .await
             {
                 debug!("ELBv2 data plane: connection error: {e}");
@@ -365,10 +368,14 @@ async fn handle_request(
     dp: &DataPlane,
     lb_arn: &str,
     peer_addr: SocketAddr,
-    req: Request<Incoming>,
+    mut req: Request<Incoming>,
 ) -> Response<Full<Bytes>> {
     let request_start = Instant::now();
     let request_creation_time = Utc::now();
+    // A WebSocket handshake: the client's connection, handed over once the
+    // target switches protocols.
+    let client_upgrade = (req.method() == Method::GET && is_websocket_upgrade(req.headers()))
+        .then(|| hyper::upgrade::on(&mut req));
     // Read request fully into memory. Body sizes that matter for ALB
     // tests are small; the streaming-body refactor is its own batch.
     let (parts, body) = req.into_parts();
@@ -489,6 +496,7 @@ async fn handle_request(
                 parts.headers,
                 body_bytes,
                 listener_port,
+                client_upgrade,
                 &mut log_ctx,
             )
             .await
@@ -1028,6 +1036,7 @@ async fn forward_action(
     headers: HeaderMap,
     body: Bytes,
     listener_port: u16,
+    client_upgrade: Option<hyper::upgrade::OnUpgrade>,
     log_ctx: &mut RequestLogContext,
 ) -> Response<Full<Bytes>> {
     // Prefer `forward.target_groups` (weighted), fall back to the
@@ -1177,6 +1186,22 @@ async fn forward_action(
         HeaderName::from_static("x-amzn-trace-id"),
         HeaderValue::from_str(&trace_id).unwrap(),
     );
+    if let Some(client) = client_upgrade {
+        let upgrade = headers
+            .get(http::header::UPGRADE)
+            .cloned()
+            .unwrap_or_else(|| HeaderValue::from_static("websocket"));
+        return forward_upgrade(
+            &upstream,
+            method,
+            path_and_query,
+            forwarded_headers,
+            upgrade,
+            client,
+            log_ctx,
+        )
+        .await;
+    }
     for (k, v) in forwarded_headers.iter() {
         req_builder = req_builder.header(k.as_str(), v.as_bytes());
     }
@@ -1277,6 +1302,125 @@ fn pick_weighted(
         }
     }
     chosen
+}
+
+/// Forwards a WebSocket handshake to the target over a connection of its
+/// own. Once the target switches protocols (`101`), the client's connection
+/// and the target's are joined until either side closes, as an ALB does on
+/// HTTP and HTTPS listeners; any other answer goes back as it came.
+async fn forward_upgrade(
+    upstream: &fakecloud_core::dataplane::Endpoint,
+    method: Method,
+    path_and_query: &str,
+    mut headers: HeaderMap,
+    upgrade: HeaderValue,
+    client: hyper::upgrade::OnUpgrade,
+    log_ctx: &mut RequestLogContext,
+) -> Response<Full<Bytes>> {
+    let stream = match tokio::net::TcpStream::connect((upstream.host.as_str(), upstream.port)).await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            log_ctx.error_reason = format!("UpstreamError: {e}");
+            return canned(StatusCode::BAD_GATEWAY, &format!("Upstream error: {e}"));
+        }
+    };
+    let (mut sender, conn) = match hyper::client::conn::http1::handshake(TokioIo::new(stream)).await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            log_ctx.error_reason = format!("UpstreamError: {e}");
+            return canned(StatusCode::BAD_GATEWAY, &format!("Upstream error: {e}"));
+        }
+    };
+    tokio::spawn(async move {
+        if let Err(e) = conn.with_upgrades().await {
+            debug!("ELBv2 data plane: upstream connection error: {e}");
+        }
+    });
+
+    // The hop-by-hop headers that ask for the switch, which the forwarded
+    // headers no longer carry.
+    headers.insert(
+        http::header::CONNECTION,
+        HeaderValue::from_static("upgrade"),
+    );
+    headers.insert(http::header::UPGRADE, upgrade);
+    let mut req = Request::new(http_body_util::Empty::<Bytes>::new());
+    *req.method_mut() = method;
+    *req.uri_mut() = match path_and_query.parse() {
+        Ok(u) => u,
+        Err(_) => return canned(StatusCode::BAD_REQUEST, "Bad Request"),
+    };
+    *req.headers_mut() = headers;
+    let mut target_resp = match sender.send_request(req).await {
+        Ok(r) => r,
+        Err(e) => {
+            log_ctx.error_reason = format!("UpstreamError: {e}");
+            return canned(StatusCode::BAD_GATEWAY, &format!("Upstream error: {e}"));
+        }
+    };
+    log_ctx.target_status_code = Some(target_resp.status().as_u16());
+
+    if target_resp.status() != StatusCode::SWITCHING_PROTOCOLS {
+        let status = target_resp.status();
+        let target_headers = target_resp.headers().clone();
+        let body = match target_resp.into_body().collect().await {
+            Ok(c) => c.to_bytes(),
+            Err(e) => {
+                return canned(
+                    StatusCode::BAD_GATEWAY,
+                    &format!("Upstream body error: {e}"),
+                );
+            }
+        };
+        let mut resp = Response::new(Full::new(body));
+        *resp.status_mut() = status;
+        for (k, v) in target_headers.iter() {
+            if !is_hop_by_hop(k.as_str()) {
+                resp.headers_mut().append(k.clone(), v.clone());
+            }
+        }
+        return resp;
+    }
+
+    // The target's handshake answer goes back whole: its Upgrade, Connection
+    // and Sec-WebSocket-Accept are what the client checks.
+    let mut resp = Response::new(Full::new(Bytes::new()));
+    *resp.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
+    *resp.headers_mut() = target_resp.headers().clone();
+    let target = hyper::upgrade::on(&mut target_resp);
+    tokio::spawn(async move {
+        let (client, target) = match tokio::try_join!(client, target) {
+            Ok(p) => p,
+            Err(e) => {
+                debug!("ELBv2 data plane: upgrade failed: {e}");
+                return;
+            }
+        };
+        let mut client = TokioIo::new(client);
+        let mut target = TokioIo::new(target);
+        if let Err(e) = tokio::io::copy_bidirectional(&mut client, &mut target).await {
+            trace!("ELBv2 data plane: upgraded connection ended: {e}");
+        }
+    });
+    resp
+}
+
+/// Whether `headers` ask to switch the connection to WebSocket, the one
+/// upgrade an ALB takes.
+fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
+    let connection_upgrade = headers
+        .get_all(http::header::CONNECTION)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|token| token.trim().eq_ignore_ascii_case("upgrade"));
+    let websocket = headers
+        .get(http::header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("websocket"));
+    connection_upgrade && websocket
 }
 
 fn reqwest_method(m: &Method) -> reqwest::Method {
