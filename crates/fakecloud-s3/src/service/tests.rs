@@ -6,7 +6,7 @@ fn s3_condition_keys_emits_list_params() {
     q.insert("prefix".to_string(), "logs/".to_string());
     q.insert("delimiter".to_string(), "/".to_string());
     q.insert("max-keys".to_string(), "100".to_string());
-    let keys = s3_condition_keys("ListObjectsV2", &q, &HeaderMap::new());
+    let keys = s3_condition_keys("ListBucket", &q, &HeaderMap::new());
     assert_eq!(keys.get("s3:prefix"), Some(&vec!["logs/".to_string()]));
     assert_eq!(keys.get("s3:delimiter"), Some(&vec!["/".to_string()]));
     assert_eq!(keys.get("s3:max-keys"), Some(&vec!["100".to_string()]));
@@ -52,7 +52,7 @@ fn s3_condition_keys_emit_request_header_keys() {
 #[test]
 fn s3_condition_keys_omits_absent_params() {
     let q = std::collections::HashMap::new();
-    let keys = s3_condition_keys("ListObjectsV2", &q, &HeaderMap::new());
+    let keys = s3_condition_keys("ListBucket", &q, &HeaderMap::new());
     assert!(keys.is_empty());
 }
 
@@ -60,7 +60,7 @@ fn s3_condition_keys_omits_absent_params() {
 fn s3_condition_keys_partial_params() {
     let mut q = std::collections::HashMap::new();
     q.insert("prefix".to_string(), "archive/".to_string());
-    let keys = s3_condition_keys("ListObjects", &q, &HeaderMap::new());
+    let keys = s3_condition_keys("ListBucketVersions", &q, &HeaderMap::new());
     assert_eq!(keys.len(), 1);
     assert_eq!(keys.get("s3:prefix"), Some(&vec!["archive/".to_string()]));
 }
@@ -72,6 +72,112 @@ fn s3_condition_keys_empty_for_non_list_actions() {
     assert!(s3_condition_keys("GetObject", &q, &HeaderMap::new()).is_empty());
     assert!(s3_condition_keys("PutObject", &q, &HeaderMap::new()).is_empty());
     assert!(s3_condition_keys("ListBuckets", &q, &HeaderMap::new()).is_empty());
+}
+
+#[test]
+fn operations_are_authorized_under_their_iam_actions() {
+    use fakecloud_core::service::AwsService as _;
+
+    let svc = make_service();
+    let action = |method: Method, path: &str, query: &[(&str, &str)]| {
+        let a = svc
+            .iam_action_for(&make_request(method, path, query, b""))
+            .unwrap();
+        (a.action, a.resource)
+    };
+    let object = || "arn:aws:s3:::b/k".to_string();
+    let bucket = || "arn:aws:s3:::b".to_string();
+    assert_eq!(action(Method::HEAD, "/b/k", &[]), ("GetObject", object()));
+    assert_eq!(
+        action(Method::GET, "/b/k", &[("versionId", "v1")]),
+        ("GetObjectVersion", object())
+    );
+    assert_eq!(
+        action(Method::HEAD, "/b/k", &[("versionId", "v1")]),
+        ("GetObjectVersion", object())
+    );
+    assert_eq!(
+        action(Method::GET, "/b", &[("list-type", "2")]),
+        ("ListBucket", bucket())
+    );
+    assert_eq!(action(Method::GET, "/b", &[]), ("ListBucket", bucket()));
+    assert_eq!(action(Method::HEAD, "/b", &[]), ("ListBucket", bucket()));
+    assert_eq!(
+        action(Method::GET, "/b", &[("versions", "")]),
+        ("ListBucketVersions", bucket())
+    );
+    assert_eq!(
+        action(Method::GET, "/", &[]),
+        ("ListAllMyBuckets", "*".to_string())
+    );
+    assert_eq!(
+        action(Method::POST, "/b/k", &[("uploads", "")]),
+        ("PutObject", object())
+    );
+    assert_eq!(
+        action(
+            Method::PUT,
+            "/b/k",
+            &[("partNumber", "1"), ("uploadId", "u")]
+        ),
+        ("PutObject", object())
+    );
+    assert_eq!(
+        action(Method::GET, "/b/k", &[("uploadId", "u")]),
+        ("ListMultipartUploadParts", object())
+    );
+    assert_eq!(
+        action(Method::GET, "/b", &[("uploads", "")]),
+        ("ListBucketMultipartUploads", bucket())
+    );
+    assert_eq!(
+        action(Method::DELETE, "/b", &[("cors", "")]),
+        ("PutBucketCORS", bucket())
+    );
+    assert_eq!(
+        action(Method::DELETE, "/b", &[("tagging", "")]),
+        ("PutBucketTagging", bucket())
+    );
+    assert_eq!(
+        action(Method::GET, "/b", &[("publicAccessBlock", "")]),
+        ("GetBucketPublicAccessBlock", bucket())
+    );
+    assert_eq!(
+        action(Method::GET, "/b", &[("object-lock", "")]),
+        ("GetBucketObjectLockConfiguration", bucket())
+    );
+    // Operations named as their action are unchanged.
+    assert_eq!(action(Method::PUT, "/b/k", &[]), ("PutObject", object()));
+    assert_eq!(
+        action(Method::GET, "/b", &[("location", "")]),
+        ("GetBucketLocation", bucket())
+    );
+}
+
+#[test]
+fn delete_objects_is_authorized_per_key() {
+    use fakecloud_core::service::AwsService as _;
+
+    let svc = make_service();
+    let req = make_request(
+        Method::POST,
+        "/b",
+        &[("delete", "")],
+        b"<Delete><Object><Key>a/1</Key></Object>\
+          <Object><Key>a/2</Key><VersionId>v1</VersionId></Object></Delete>",
+    );
+    let actions: Vec<_> = svc
+        .iam_actions_for(&req)
+        .into_iter()
+        .map(|a| (a.action, a.resource))
+        .collect();
+    assert_eq!(
+        actions,
+        vec![
+            ("DeleteObject", "arn:aws:s3:::b/a/1".to_string()),
+            ("DeleteObjectVersion", "arn:aws:s3:::b/a/2".to_string()),
+        ]
+    );
 }
 
 #[test]
@@ -5233,7 +5339,7 @@ fn put_bucket_replication_requires_pass_role_on_the_replication_role() {
     let req = make_request(Method::PUT, "/src", &[("replication", "")], body);
     let actions = svc.iam_actions_for(&req);
     assert_eq!(actions.len(), 2, "{actions:?}");
-    assert_eq!(actions[0].action, "PutBucketReplication");
+    assert_eq!(actions[0].action, "PutReplicationConfiguration");
     assert!(actions[1].is_pass_role());
     assert_eq!(actions[1].resource, "arn:aws:iam::123456789012:role/repl");
     let keys = svc.iam_condition_keys_for(&req, &actions[1]);
@@ -8041,13 +8147,14 @@ fn governance_bypass_requires_bypass_governance_retention_permission() {
     assert_eq!(
         actions(&with_bypass(delete, "TRUE")),
         vec![
-            ("DeleteObject", "arn:aws:s3:::b/k".to_string()),
+            ("DeleteObjectVersion", "arn:aws:s3:::b/k".to_string()),
             ("BypassGovernanceRetention", "arn:aws:s3:::b/k".to_string()),
         ]
     );
 
-    // Other operations ignore the header. DeleteObjects is authorized per key
-    // by AWS, so a request-level check would wrongly fail the whole batch.
+    // Other operations ignore the header. DeleteObjects is authorized per key,
+    // and AWS reports a key the bypass does not cover in the response, which a
+    // request-level check cannot do.
     let put = with_bypass(make_request(Method::PUT, "/b/k", &[], b"x"), "true");
     assert_eq!(
         actions(&put),
@@ -8061,7 +8168,7 @@ fn governance_bypass_requires_bypass_governance_retention_permission() {
     );
     assert_eq!(
         actions(&with_bypass(batch, "true")),
-        vec![("DeleteObjects", "arn:aws:s3:::b".to_string())]
+        vec![("DeleteObject", "arn:aws:s3:::b/a/1".to_string())]
     );
 }
 

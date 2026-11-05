@@ -1349,9 +1349,9 @@ async fn s3_get_object_resource_scoped() {
 
 #[tokio::test]
 async fn s3_list_objects_v2_prefix_condition_key() {
-    // A policy that only allows ListObjectsV2 when `s3:prefix` starts
-    // with "logs/" must let `prefix=logs/2026/` through and deny
-    // `prefix=secrets/`.
+    // A policy that only allows s3:ListBucket (the action ListObjectsV2 is
+    // authorized under) when `s3:prefix` starts with "logs/" must let
+    // `prefix=logs/2026/` through and deny `prefix=secrets/`.
     let server = start_strict().await;
     let boot = sdk_config_with(&server, "test", "test").await;
     let s3_boot = aws_sdk_s3::Client::new(&boot);
@@ -1369,7 +1369,7 @@ async fn s3_list_objects_v2_prefix_condition_key() {
         "AllowListLogs",
         r#"{"Version":"2012-10-17","Statement":[{
             "Effect":"Allow",
-            "Action":"s3:ListObjectsV2",
+            "Action":"s3:ListBucket",
             "Resource":"arn:aws:s3:::prefixed",
             "Condition":{"StringLike":{"s3:prefix":"logs/*"}}
         }]}"#,

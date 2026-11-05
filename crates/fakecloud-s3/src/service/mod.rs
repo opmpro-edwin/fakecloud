@@ -2009,7 +2009,7 @@ impl AwsService for S3Service {
                 });
             }
         }
-        let action = s3_detect_action(
+        let operation = s3_detect_action(
             request.method.as_str(),
             bucket,
             key.as_deref(),
@@ -2018,7 +2018,7 @@ impl AwsService for S3Service {
         // A handful of S3-adjacent ops are authorized under sibling IAM
         // service prefixes, not `s3:`. Select the right prefix so a policy
         // targeting the real action string actually matches.
-        let service = match action {
+        let service = match operation {
             "CreateSession" | "ListAllMyDirectoryBuckets" => "s3express",
             "WriteGetObjectResponse" => "s3-object-lambda",
             _ => "s3",
@@ -2027,10 +2027,14 @@ impl AwsService for S3Service {
         // partition, so policies written against those ARNs must match here.
         let bucket_region = bucket.and_then(|b| self.bucket_region(b));
         let region = bucket_region.as_deref().unwrap_or(&request.region);
-        let resource = s3_resource_for(region, action, bucket, key.as_deref());
+        let resource = s3_resource_for(region, operation, bucket, key.as_deref());
+        let versioned = request
+            .query_params
+            .get("versionId")
+            .is_some_and(|v| !v.is_empty());
         Some(fakecloud_core::auth::IamAction {
             service,
-            action,
+            action: s3_iam_action(operation, versioned),
             resource,
         })
     }
@@ -2118,9 +2122,34 @@ impl AwsService for S3Service {
                 return actions;
             }
         }
+        // DeleteObjects is authorized per key, as s3:DeleteObject (or
+        // s3:DeleteObjectVersion) on each object it names. AWS reports a denied
+        // key as an `<Error>` entry in a 200 response; a request-level check can
+        // only refuse the whole batch, so every key must be allowed.
+        if action.service == "s3" && is_delete_objects(request) {
+            let entries =
+                parse_delete_objects_xml(std::str::from_utf8(&request.body).unwrap_or(""));
+            if !entries.is_empty() {
+                return entries
+                    .into_iter()
+                    .map(|entry| fakecloud_core::auth::IamAction {
+                        service: "s3",
+                        action: if entry.version_id.is_some() {
+                            "DeleteObjectVersion"
+                        } else {
+                            "DeleteObject"
+                        },
+                        resource: format!("{}/{}", action.resource, entry.key),
+                    })
+                    .collect();
+            }
+        }
         // A replication configuration names the role S3 assumes to copy
         // objects, so AWS also requires `iam:PassRole` on it.
-        let pass_role = if action.service == "s3" && action.action == "PutBucketReplication" {
+        let pass_role = if action.service == "s3"
+            && request.method.as_str() == "PUT"
+            && action.action == "PutReplicationConfiguration"
+        {
             replication_role_arn(&request.body)
         } else {
             None
@@ -2296,8 +2325,9 @@ fn s3_condition_keys(
             out.insert(format!("s3:{header}"), vec![value.to_string()]);
         }
     }
-    if matches!(action, "ListObjects" | "ListObjectsV2") {
-        // Both list variants share the same query param shape.
+    if matches!(action, "ListBucket" | "ListBucketVersions") {
+        // ListObjects, ListObjectsV2 and ListObjectVersions share the same
+        // query param shape.
         if let Some(prefix) = query.get("prefix") {
             out.insert("s3:prefix".to_string(), vec![prefix.clone()]);
         }
@@ -2434,7 +2464,8 @@ fn s3_request_tags(
     }
 }
 
-/// Derive the IAM action name from an S3 REST request. Handles the
+/// Derive the operation from an S3 REST request; `s3_iam_action` gives the
+/// IAM action it is authorized under. Handles the
 /// common cases (GetObject, PutObject, DeleteObject, ListObjectsV2,
 /// CreateBucket, ...) plus a subset of sub-resource operations
 /// (`?acl`, `?tagging`, `?versioning`, `?policy`, `?cors`, `?website`,
@@ -2835,6 +2866,88 @@ fn s3_detect_action(
         ("HEAD", false) => Some("HeadBucket"),
         _ => None,
     }
+}
+
+/// The IAM action AWS authorizes an S3 operation under, per each operation's
+/// Permissions section and "Actions defined by Amazon S3" in the Service
+/// Authorization Reference. Most operations share their action's name; these
+/// do not. A request for one version of an object (`versionId`) needs the
+/// version's action.
+fn s3_iam_action(operation: &'static str, versioned: bool) -> &'static str {
+    match (operation, versioned) {
+        ("GetObject" | "HeadObject", false) => "GetObject",
+        ("GetObject" | "HeadObject", true) => "GetObjectVersion",
+        ("DeleteObject", true) => "DeleteObjectVersion",
+        ("GetObjectAcl", true) => "GetObjectVersionAcl",
+        ("PutObjectAcl", true) => "PutObjectVersionAcl",
+        ("GetObjectTagging", true) => "GetObjectVersionTagging",
+        ("PutObjectTagging", true) => "PutObjectVersionTagging",
+        ("DeleteObjectTagging", true) => "DeleteObjectVersionTagging",
+        ("GetObjectAttributes", true) => "GetObjectVersionAttributes",
+        ("CreateMultipartUpload" | "UploadPart" | "CompleteMultipartUpload", _) => "PutObject",
+        ("ListParts", _) => "ListMultipartUploadParts",
+        ("ListMultipartUploads", _) => "ListBucketMultipartUploads",
+        ("ListObjects" | "ListObjectsV2" | "HeadBucket", _) => "ListBucket",
+        ("ListObjectVersions", _) => "ListBucketVersions",
+        ("ListBuckets", _) => "ListAllMyBuckets",
+        ("DeleteObjects", _) => "DeleteObject",
+        ("GetBucketCors", _) => "GetBucketCORS",
+        ("PutBucketCors" | "DeleteBucketCors", _) => "PutBucketCORS",
+        ("GetBucketEncryption", _) => "GetEncryptionConfiguration",
+        ("PutBucketEncryption" | "DeleteBucketEncryption", _) => "PutEncryptionConfiguration",
+        ("GetBucketLifecycleConfiguration", _) => "GetLifecycleConfiguration",
+        ("PutBucketLifecycleConfiguration" | "DeleteBucketLifecycle", _) => {
+            "PutLifecycleConfiguration"
+        }
+        ("GetBucketNotificationConfiguration", _) => "GetBucketNotification",
+        ("PutBucketNotificationConfiguration", _) => "PutBucketNotification",
+        ("GetBucketReplication", _) => "GetReplicationConfiguration",
+        ("PutBucketReplication" | "DeleteBucketReplication", _) => "PutReplicationConfiguration",
+        ("DeleteBucketOwnershipControls", _) => "PutBucketOwnershipControls",
+        ("DeleteBucketTagging", _) => "PutBucketTagging",
+        ("GetPublicAccessBlock", _) => "GetBucketPublicAccessBlock",
+        ("PutPublicAccessBlock" | "DeletePublicAccessBlock", _) => "PutBucketPublicAccessBlock",
+        ("GetBucketAccelerateConfiguration", _) => "GetAccelerateConfiguration",
+        ("PutBucketAccelerateConfiguration", _) => "PutAccelerateConfiguration",
+        ("GetBucketInventoryConfiguration" | "ListBucketInventoryConfigurations", _) => {
+            "GetInventoryConfiguration"
+        }
+        ("PutBucketInventoryConfiguration" | "DeleteBucketInventoryConfiguration", _) => {
+            "PutInventoryConfiguration"
+        }
+        ("GetBucketAnalyticsConfiguration" | "ListBucketAnalyticsConfigurations", _) => {
+            "GetAnalyticsConfiguration"
+        }
+        ("PutBucketAnalyticsConfiguration" | "DeleteBucketAnalyticsConfiguration", _) => {
+            "PutAnalyticsConfiguration"
+        }
+        (
+            "GetBucketIntelligentTieringConfiguration"
+            | "ListBucketIntelligentTieringConfigurations",
+            _,
+        ) => "GetIntelligentTieringConfiguration",
+        (
+            "PutBucketIntelligentTieringConfiguration"
+            | "DeleteBucketIntelligentTieringConfiguration",
+            _,
+        ) => "PutIntelligentTieringConfiguration",
+        ("GetBucketMetricsConfiguration" | "ListBucketMetricsConfigurations", _) => {
+            "GetMetricsConfiguration"
+        }
+        ("PutBucketMetricsConfiguration" | "DeleteBucketMetricsConfiguration", _) => {
+            "PutMetricsConfiguration"
+        }
+        ("GetObjectLockConfiguration", _) => "GetBucketObjectLockConfiguration",
+        ("PutObjectLockConfiguration", _) => "PutBucketObjectLockConfiguration",
+        (operation, _) => operation,
+    }
+}
+
+/// Whether a request is DeleteObjects (`POST /bucket?delete`).
+fn is_delete_objects(request: &AwsRequest) -> bool {
+    request.method.as_str() == "POST"
+        && request.path_segments.len() == 1
+        && request.query_params.contains_key("delete")
 }
 
 /// Build the S3 resource ARN for an action. Returns `*` for
@@ -4728,7 +4841,9 @@ fn governance_bypass_actions(
         resource,
     };
     match primary.action {
-        "DeleteObject" | "PutObjectRetention" => vec![bypass(primary.resource.clone())],
+        "DeleteObject" | "DeleteObjectVersion" | "PutObjectRetention" => {
+            vec![bypass(primary.resource.clone())]
+        }
         _ => Vec::new(),
     }
 }
