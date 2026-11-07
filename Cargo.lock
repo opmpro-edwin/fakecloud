@@ -5853,6 +5853,7 @@ dependencies = [
  "fakecloud-persistence",
  "fakecloud-wafv2",
  "flate2",
+ "futures-util",
  "http 1.4.0",
  "http-body-util",
  "hyper 1.9.0",

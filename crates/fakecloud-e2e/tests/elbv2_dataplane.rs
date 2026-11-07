@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aws_sdk_elasticloadbalancingv2::types::{
-    Action, ActionTypeEnum, FixedResponseActionConfig, ProtocolEnum, TargetDescription,
-    TargetTypeEnum,
+    Action, ActionTypeEnum, FixedResponseActionConfig, LoadBalancerAttribute, ProtocolEnum,
+    TargetDescription, TargetTypeEnum,
 };
 use helpers::TestServer;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -321,6 +321,195 @@ async fn elbv2_dataplane_passes_websocket_upgrades() {
             .unwrap();
         assert_eq!(echoed, message);
     }
+}
+
+/// A target that answers `/events` with a stream that goes on writing,
+/// `/ticks` with a part every second, five times, and `/stall` with one
+/// part and then nothing for six seconds; anything else (the health checks)
+/// with 200. None of them says how long it is: each ends by closing.
+async fn start_streaming_target() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let head = read_head(&mut sock).await;
+                let path = head.split_whitespace().nth(1).unwrap_or("/").to_string();
+                let parts: Vec<(&[u8], u64)> = match path.as_str() {
+                    "/events" => vec![(b"data: one\n\n", 0), (b"data: two\n\n", 1)],
+                    "/ticks" => (0..5).map(|_| (&b"tick\n"[..], 1)).collect(),
+                    "/stall" => vec![(b"early\n", 0), (b"late\n", 6)],
+                    _ => {
+                        let _ = sock
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                            )
+                            .await;
+                        return;
+                    }
+                };
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                          Cache-Control: no-cache\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+                for (part, after) in parts {
+                    tokio::time::sleep(Duration::from_secs(after)).await;
+                    if sock.write_all(part).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    addr
+}
+
+/// Asks the load balancer at `port` for `path`, on a connection that
+/// closes with the answer; what came back within `wait`, and whether the
+/// answer had ended by then.
+async fn read_through(port: u16, path: &str, wait: Duration) -> (String, bool) {
+    let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    sock.write_all(
+        format!("GET {path} HTTP/1.1\r\nHost: stream.example\r\nConnection: close\r\n\r\n")
+            .as_bytes(),
+    )
+    .await
+    .unwrap();
+    let mut got = Vec::new();
+    let mut buf = [0u8; 4096];
+    let deadline = tokio::time::Instant::now() + wait;
+    let ended = loop {
+        match tokio::time::timeout_at(deadline, sock.read(&mut buf)).await {
+            Err(_) => break false,
+            Ok(Ok(0) | Err(_)) => break true,
+            Ok(Ok(n)) => got.extend_from_slice(&buf[..n]),
+        }
+    };
+    (String::from_utf8_lossy(&got).into_owned(), ended)
+}
+
+#[tokio::test]
+async fn elbv2_dataplane_streams_answers_and_times_idle_ones_out() {
+    let server = TestServer::start().await;
+    let elbv2 = server.elbv2_client().await;
+    let target = start_streaming_target().await;
+
+    let lb_arn = elbv2
+        .create_load_balancer()
+        .name("dp-stream-lb")
+        .scheme(aws_sdk_elasticloadbalancingv2::types::LoadBalancerSchemeEnum::Internal)
+        .send()
+        .await
+        .unwrap()
+        .load_balancers()
+        .first()
+        .unwrap()
+        .load_balancer_arn()
+        .unwrap()
+        .to_string();
+    elbv2
+        .modify_load_balancer_attributes()
+        .load_balancer_arn(&lb_arn)
+        .attributes(
+            LoadBalancerAttribute::builder()
+                .key("idle_timeout.timeout_seconds")
+                .value("2")
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+    let tg_arn = elbv2
+        .create_target_group()
+        .name("dp-stream-tg")
+        .protocol(ProtocolEnum::Http)
+        .port(80)
+        .target_type(TargetTypeEnum::Ip)
+        .health_check_protocol(ProtocolEnum::Http)
+        .health_check_path("/")
+        .health_check_interval_seconds(5)
+        .health_check_timeout_seconds(2)
+        .healthy_threshold_count(2)
+        .unhealthy_threshold_count(2)
+        .send()
+        .await
+        .unwrap()
+        .target_groups()
+        .first()
+        .unwrap()
+        .target_group_arn()
+        .unwrap()
+        .to_string();
+    elbv2
+        .register_targets()
+        .target_group_arn(&tg_arn)
+        .targets(
+            TargetDescription::builder()
+                .id(target.ip().to_string())
+                .port(target.port() as i32)
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+    elbv2
+        .create_listener()
+        .load_balancer_arn(&lb_arn)
+        .protocol(ProtocolEnum::Http)
+        .port(80)
+        .default_actions(
+            Action::builder()
+                .r#type(ActionTypeEnum::Forward)
+                .target_group_arn(&tg_arn)
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+    let port = wait_for_bound_port(&server, &lb_arn, Duration::from_secs(8))
+        .await
+        .expect("data plane should bind a port for the active LB");
+    assert!(
+        wait_for_target_healthy(&elbv2, &tg_arn, Duration::from_secs(10)).await,
+        "target should reach healthy state"
+    );
+
+    // The first event arrives while the target is still writing: the
+    // answer is passed on as it comes, not once it has ended.
+    let (early, ended) = read_through(port, "/events", Duration::from_millis(700)).await;
+    assert!(!ended, "the stream is still open: {early}");
+    assert!(early.contains("text/event-stream"), "{early}");
+    assert!(
+        early.contains("data: one"),
+        "the first event is through: {early}"
+    );
+    assert!(!early.contains("data: two"), "{early}");
+
+    // An answer that keeps moving lasts as long as it moves, past the
+    // idle timeout of 2 seconds.
+    let (ticks, ended) = read_through(port, "/ticks", Duration::from_secs(9)).await;
+    assert!(ended, "{ticks}");
+    assert_eq!(ticks.matches("tick").count(), 5, "every part came: {ticks}");
+
+    // One that stops for longer than the idle timeout is cut off then,
+    // long before the target would have gone on.
+    let started = std::time::Instant::now();
+    let (stalled, ended) = read_through(port, "/stall", Duration::from_secs(5)).await;
+    assert!(ended, "the idle answer was ended: {stalled}");
+    assert!(stalled.contains("early"), "{stalled}");
+    assert!(!stalled.contains("late"), "{stalled}");
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "ended near the idle timeout, after {:?}",
+        started.elapsed()
+    );
 }
 
 async fn wait_for_target_healthy(

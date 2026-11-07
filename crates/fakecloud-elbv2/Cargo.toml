@@ -17,6 +17,7 @@ async-trait = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 flate2 = { workspace = true }
+futures-util = "0.3"
 http = { workspace = true }
 http-body-util = "0.1"
 hyper = { workspace = true }

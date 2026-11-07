@@ -8,13 +8,23 @@
 //! `fixed-response`, `redirect`, or `authenticate-oidc` /
 //! `authenticate-cognito` (501 — declared next-batch).
 //!
+//! A target's answer is streamed to the client as the target sends it,
+//! so a response that never ends (Server-Sent Events, a long download)
+//! arrives as it is written. As on an ALB, a connection to a target
+//! times out after 10 seconds, and an exchange with the target that is
+//! idle for longer than the load balancer's
+//! `idle_timeout.timeout_seconds` (60 by default) ends: a 504 before
+//! the answer's head arrives, the connection closed after.
+//!
 //! TLS termination, mTLS, and raw NLB TCP are intentionally next-
 //! batch work items. The data-plane doc page enumerates the gap.
 
 use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -25,8 +35,9 @@ use fakecloud_wafv2::evaluator::{
 };
 use fakecloud_wafv2::{IpSet, RegexPatternSet, RuleGroup, SharedWafv2State, WebAcl};
 use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode};
-use http_body_util::{BodyExt, Full};
-use hyper::body::Incoming;
+use http_body_util::combinators::UnsyncBoxBody;
+use http_body_util::{BodyExt, Full, StreamBody};
+use hyper::body::{Frame, Incoming, SizeHint};
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use parking_lot::Mutex;
@@ -42,6 +53,14 @@ use crate::state::{Action, Listener, LoadBalancer, Rule, SharedElbv2State, Targe
 const ENV_DISABLE: &str = "FAKECLOUD_ELBV2_DISABLE_DATAPLANE";
 const SUPERVISOR_TICK_SECS: u64 = 1;
 const STICKY_COOKIE: &str = "AWSALB";
+/// How long an ALB waits to connect to a target.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// An ALB's idle timeout when its attributes do not say.
+const IDLE_TIMEOUT_SECS: u64 = 60;
+
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+/// What the data plane answers with: whole, or streamed from a target.
+type Body = UnsyncBoxBody<Bytes, BoxError>;
 
 pub fn dataplane_enabled() -> bool {
     !matches!(
@@ -118,8 +137,10 @@ pub fn spawn_dataplane_with_delivery(
         .danger_accept_invalid_certs(true)
         // Disable redirects so we surface them as the upstream sees them.
         .redirect(reqwest::redirect::Policy::none())
-        // Per-request timeout — keep tight; tests want fast feedback.
-        .timeout(Duration::from_secs(30))
+        // No timeout for the whole exchange: a streamed answer may last as
+        // long as it keeps moving. Idleness is timed per load balancer in
+        // `forward_action`.
+        .connect_timeout(CONNECT_TIMEOUT)
         .build()
     {
         Ok(c) => c,
@@ -369,7 +390,7 @@ async fn handle_request(
     lb_arn: &str,
     peer_addr: SocketAddr,
     mut req: Request<Incoming>,
-) -> Response<Full<Bytes>> {
+) -> Response<Body> {
     let request_start = Instant::now();
     let request_creation_time = Utc::now();
     // A WebSocket handshake: the client's connection, handed over once the
@@ -381,7 +402,7 @@ async fn handle_request(
     let (parts, body) = req.into_parts();
     let body_bytes = match body.collect().await {
         Ok(c) => c.to_bytes(),
-        Err(_) => return canned(StatusCode::BAD_REQUEST, "Bad Request"),
+        Err(_) => return canned_body(StatusCode::BAD_REQUEST, "Bad Request"),
     };
     let received_bytes = body_bytes.len() as u64;
     let user_agent = parts
@@ -427,7 +448,7 @@ async fn handle_request(
     let snap = match snapshot(dp, lb_arn) {
         Some(s) => s,
         None => {
-            let resp = canned(StatusCode::SERVICE_UNAVAILABLE, "LB removed");
+            let resp = canned_body(StatusCode::SERVICE_UNAVAILABLE, "LB removed");
             return finalize_response(dp, lb_arn, peer_addr, &mut log_ctx, resp);
         }
     };
@@ -435,7 +456,7 @@ async fn handle_request(
     let listener = match snap.listener_for_request(&parts.headers) {
         Some(l) => l,
         None => {
-            let resp = canned(StatusCode::BAD_GATEWAY, "No listener");
+            let resp = canned_body(StatusCode::BAD_GATEWAY, "No listener");
             return finalize_response(dp, lb_arn, peer_addr, &mut log_ctx, resp);
         }
     };
@@ -460,7 +481,7 @@ async fn handle_request(
     ) {
         log_ctx.actions_executed = String::from("waf");
         log_ctx.action_taken = ActionTaken::WafBlock;
-        return finalize_response(dp, lb_arn, peer_addr, &mut log_ctx, waf_resp);
+        return finalize_response(dp, lb_arn, peer_addr, &mut log_ctx, boxed(waf_resp));
     }
 
     let rules: Vec<&Rule> = snap.rules_for_listener(&listener.arn);
@@ -477,7 +498,7 @@ async fn handle_request(
     let action = match actions.iter().min_by_key(|a| a.order.unwrap_or(0)) {
         Some(a) => a.clone(),
         None => {
-            let resp = canned(StatusCode::BAD_GATEWAY, "No action");
+            let resp = canned_body(StatusCode::BAD_GATEWAY, "No action");
             return finalize_response(dp, lb_arn, peer_addr, &mut log_ctx, resp);
         }
     };
@@ -504,7 +525,7 @@ async fn handle_request(
         "fixed-response" => {
             log_ctx.actions_executed = "fixed-response".to_string();
             log_ctx.action_taken = ActionTaken::FixedResponse;
-            fixed_response_action(&action)
+            boxed(fixed_response_action(&action))
         }
         "redirect" => {
             log_ctx.actions_executed = "redirect".to_string();
@@ -516,18 +537,18 @@ async fn handle_request(
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("-")
                 .to_string();
-            r
+            boxed(r)
         }
         "authenticate-oidc" | "authenticate-cognito" => {
             log_ctx.actions_executed = "authenticate".to_string();
-            canned(
+            canned_body(
                 StatusCode::NOT_IMPLEMENTED,
                 "OIDC/Cognito authenticate-action is on the next-batch ELBv2 list",
             )
         }
         other => {
             log_ctx.actions_executed = other.to_string();
-            canned(
+            canned_body(
                 StatusCode::BAD_GATEWAY,
                 &format!("Unsupported action: {other}"),
             )
@@ -574,17 +595,18 @@ fn finalize_response(
     lb_arn: &str,
     peer_addr: SocketAddr,
     ctx: &mut RequestLogContext,
-    resp: Response<Full<Bytes>>,
-) -> Response<Full<Bytes>> {
+    resp: Response<Body>,
+) -> Response<Body> {
     let Some(logger) = dp.access_logger.as_ref() else {
         return resp;
     };
     // Cheap snapshot of response details before we hand the response
-    // back to hyper. `body.size_hint().exact()` is set because we
-    // construct every response with `Full<Bytes>`.
+    // back to hyper. A whole answer knows its size now; a streamed one
+    // is counted as it goes, and its line written once it ends.
     use hyper::body::Body as _;
     let elb_status_code = resp.status().as_u16();
-    let sent_bytes = resp.body().size_hint().exact().unwrap_or(0);
+    let exact_size = resp.body().size_hint().exact();
+    let sent_bytes = exact_size.unwrap_or(0);
     let total_elapsed = ctx.request_start.elapsed().as_secs_f64();
     let target_processing_time = match ctx.action_taken {
         ActionTaken::Forward => total_elapsed,
@@ -641,6 +663,18 @@ fn finalize_response(
         classification: "-".to_string(),
         classification_reason: "-".to_string(),
     };
+    if exact_size.is_none() {
+        let logger = Arc::clone(logger);
+        let lb_arn = lb_arn.to_string();
+        return resp.map(|body| {
+            Counted::new(body, move |sent| {
+                let mut access_record = access_record;
+                access_record.sent_bytes = sent;
+                logger.record(&lb_arn, access_record);
+            })
+            .boxed_unsync()
+        });
+    }
     logger.record(lb_arn, access_record);
     // The connection log is emitted once per accepted TCP connection
     // by `accept_loop` after `serve_connection` returns. Keep-alive
@@ -662,6 +696,9 @@ struct LbSnapshot {
     /// The load balancer's security groups: the source instance targets'
     /// security-group rules must admit.
     security_groups: Vec<String>,
+    /// How long an exchange with a target may go without a byte either
+    /// way: `idle_timeout.timeout_seconds`.
+    idle_timeout: Duration,
     listeners: Vec<Listener>,
     rules: Vec<Rule>,
     target_groups: BTreeMap<String, TargetGroup>,
@@ -697,6 +734,13 @@ fn snapshot(dp: &DataPlane, lb_arn: &str) -> Option<LbSnapshot> {
     for (_acct, st) in accs.iter() {
         if let Some(lb) = st.load_balancers.get(lb_arn) {
             let security_groups = lb.security_groups.clone();
+            let idle_timeout = Duration::from_secs(
+                lb.attributes
+                    .get("idle_timeout.timeout_seconds")
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .filter(|&s| s > 0)
+                    .unwrap_or(IDLE_TIMEOUT_SECS),
+            );
             let listeners: Vec<Listener> = st
                 .listeners
                 .values()
@@ -718,6 +762,7 @@ fn snapshot(dp: &DataPlane, lb_arn: &str) -> Option<LbSnapshot> {
                 .collect();
             return Some(LbSnapshot {
                 security_groups,
+                idle_timeout,
                 listeners,
                 rules,
                 target_groups,
@@ -1038,7 +1083,7 @@ async fn forward_action(
     listener_port: u16,
     client_upgrade: Option<hyper::upgrade::OnUpgrade>,
     log_ctx: &mut RequestLogContext,
-) -> Response<Full<Bytes>> {
+) -> Response<Body> {
     // Prefer `forward.target_groups` (weighted), fall back to the
     // single `target_group_arn` field for legacy actions.
     let target_groups: Vec<(String, i32)> = if let Some(fwd) = action.forward.as_ref() {
@@ -1049,7 +1094,7 @@ async fn forward_action(
     } else if let Some(tg) = action.target_group_arn.as_ref() {
         vec![(tg.clone(), 1)]
     } else {
-        return canned(
+        return canned_body(
             StatusCode::BAD_GATEWAY,
             "forward action without target groups",
         );
@@ -1057,7 +1102,7 @@ async fn forward_action(
 
     let total_weight: i32 = target_groups.iter().map(|(_, w)| *w).sum();
     if total_weight <= 0 {
-        return canned(StatusCode::BAD_GATEWAY, "no positive target-group weight");
+        return canned_body(StatusCode::BAD_GATEWAY, "no positive target-group weight");
     }
     // Pick a target group (weighted round-robin). Lock is taken
     // and released within the helper — never across the upstream
@@ -1073,7 +1118,7 @@ async fn forward_action(
     log_ctx.target_group_arn = tg_arn.clone();
     let tg = match snap.target_groups.get(&tg_arn) {
         Some(t) => t,
-        None => return canned(StatusCode::SERVICE_UNAVAILABLE, "Target group not found"),
+        None => return canned_body(StatusCode::SERVICE_UNAVAILABLE, "Target group not found"),
     };
 
     // Sticky session: if the request carries an AWSALB cookie that
@@ -1106,7 +1151,7 @@ async fn forward_action(
         .filter(|t| t.health.state != "unhealthy" && t.health.state != "unused")
         .collect();
     if healthy.is_empty() {
-        return canned(StatusCode::SERVICE_UNAVAILABLE, "No healthy targets");
+        return canned_body(StatusCode::SERVICE_UNAVAILABLE, "No healthy targets");
     }
 
     let chosen: &crate::state::TargetDescription = if let Some(sticky_key) = sticky_pick.as_ref() {
@@ -1132,7 +1177,7 @@ async fn forward_action(
     let scheme = "http";
     let target_port = chosen.port.or(tg.port).unwrap_or(80);
     let Ok(target_port) = u16::try_from(target_port) else {
-        return canned(StatusCode::BAD_GATEWAY, "target port out of range");
+        return canned_body(StatusCode::BAD_GATEWAY, "target port out of range");
     };
     let upstream = resolve_upstream(
         &tg_arn,
@@ -1191,16 +1236,18 @@ async fn forward_action(
             .get(http::header::UPGRADE)
             .cloned()
             .unwrap_or_else(|| HeaderValue::from_static("websocket"));
-        return forward_upgrade(
-            &upstream,
-            method,
-            path_and_query,
-            forwarded_headers,
-            upgrade,
-            client,
-            log_ctx,
-        )
-        .await;
+        return boxed(
+            forward_upgrade(
+                &upstream,
+                method,
+                path_and_query,
+                forwarded_headers,
+                upgrade,
+                client,
+                log_ctx,
+            )
+            .await,
+        );
     }
     for (k, v) in forwarded_headers.iter() {
         req_builder = req_builder.header(k.as_str(), v.as_bytes());
@@ -1209,15 +1256,26 @@ async fn forward_action(
         req_builder = req_builder.body(body.to_vec());
     }
 
-    let upstream_resp = match req_builder.send().await {
-        Ok(r) => r,
-        Err(e) => {
+    // The target has the idle timeout to start answering, as on an ALB;
+    // one it cannot be connected to, or that stays silent, is a 504.
+    let upstream_resp = match tokio::time::timeout(snap.idle_timeout, req_builder.send()).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
             log_ctx.error_reason = format!("UpstreamError: {e}");
-            return canned(StatusCode::BAD_GATEWAY, &format!("Upstream error: {e}"));
+            let status = if e.is_timeout() {
+                StatusCode::GATEWAY_TIMEOUT
+            } else {
+                StatusCode::BAD_GATEWAY
+            };
+            return canned_body(status, &format!("Upstream error: {e}"));
+        }
+        Err(_) => {
+            log_ctx.error_reason = "TargetResponseTimeout".to_string();
+            return canned_body(StatusCode::GATEWAY_TIMEOUT, "Gateway Timeout");
         }
     };
 
-    let mut resp = Response::new(Full::new(Bytes::new()));
+    let mut resp = Response::new(Body::default());
     *resp.status_mut() = upstream_resp.status();
     log_ctx.target_status_code = Some(upstream_resp.status().as_u16());
     let upstream_headers = upstream_resp.headers().clone();
@@ -1250,17 +1308,92 @@ async fn forward_action(
         }
     }
 
-    let resp_body = match upstream_resp.bytes().await {
-        Ok(b) => b,
-        Err(e) => {
-            return canned(
-                StatusCode::BAD_GATEWAY,
-                &format!("Upstream body error: {e}"),
-            );
-        }
-    };
-    *resp.body_mut() = Full::new(resp_body);
+    *resp.body_mut() = relay(upstream_resp, snap.idle_timeout);
     resp
+}
+
+/// The target's body, passed on as each part arrives. It ends in an
+/// error once the target sends nothing for `idle`, as an ALB closes a
+/// connection idle past its timeout.
+fn relay(response: reqwest::Response, idle: Duration) -> Body {
+    let parts = futures_util::stream::unfold(Some(response), move |response| async move {
+        let mut response = response?;
+        match tokio::time::timeout(idle, response.chunk()).await {
+            Ok(Ok(Some(part))) => Some((Ok(Frame::data(part)), Some(response))),
+            Ok(Ok(None)) => None,
+            Ok(Err(e)) => Some((Err(BoxError::from(e)), None)),
+            Err(_) => Some((
+                Err(BoxError::from(
+                    "the target was idle past the load balancer's idle timeout",
+                )),
+                None,
+            )),
+        }
+    });
+    StreamBody::new(parts).boxed_unsync()
+}
+
+/// A streamed answer on its way to the client, its bytes counted as they
+/// go. `done` gets the count once the answer has all gone, failed, or the
+/// client went away, as an ALB writes its access-log line when the
+/// request completes.
+struct Counted {
+    inner: Body,
+    sent: u64,
+    done: Option<Box<dyn FnOnce(u64) + Send>>,
+}
+
+impl Counted {
+    fn new(inner: Body, done: impl FnOnce(u64) + Send + 'static) -> Self {
+        Self {
+            inner,
+            sent: 0,
+            done: Some(Box::new(done)),
+        }
+    }
+
+    fn finish(&mut self) {
+        if let Some(done) = self.done.take() {
+            done(self.sent);
+        }
+    }
+}
+
+impl hyper::body::Body for Counted {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+        let this = self.get_mut();
+        let polled = Pin::new(&mut this.inner).poll_frame(cx);
+        match &polled {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    this.sent += data.len() as u64;
+                }
+            }
+            Poll::Ready(Some(Err(_)) | None) => this.finish(),
+            Poll::Pending => {}
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        self.finish();
+    }
 }
 
 fn round_robin_pick(
@@ -1463,6 +1596,15 @@ fn strip_hop_by_hop(h: &mut HeaderMap) {
     for n in to_remove {
         h.remove(n);
     }
+}
+
+/// A whole answer as the data plane sends it.
+fn boxed(resp: Response<Full<Bytes>>) -> Response<Body> {
+    resp.map(|body| body.map_err(|never| match never {}).boxed_unsync())
+}
+
+fn canned_body(status: StatusCode, msg: &str) -> Response<Body> {
+    boxed(canned(status, msg))
 }
 
 fn canned(status: StatusCode, msg: &str) -> Response<Full<Bytes>> {
