@@ -1313,6 +1313,8 @@ pub(crate) struct RunInstanceInputs {
     tags: std::collections::BTreeMap<String, String>,
     network: Option<crate::runtime::InstanceNetwork>,
     region: String,
+    /// The EBS volumes attached to the instance, which its container mounts.
+    volumes: Vec<crate::runtime::AttachedVolume>,
 }
 
 impl RunInstanceInputs {
@@ -1327,10 +1329,13 @@ impl RunInstanceInputs {
             .run_instance(
                 account_id,
                 id,
-                self.user_data.as_deref(),
-                &self.tags,
-                self.network.as_ref(),
-                &self.region,
+                &crate::runtime::Boot {
+                    user_data: self.user_data.as_deref(),
+                    tags: &self.tags,
+                    network: self.network.as_ref(),
+                    region: &self.region,
+                    volumes: &self.volumes,
+                },
             )
             .await
     }
@@ -1386,6 +1391,7 @@ pub(crate) fn inputs_of(state: &Ec2State, inst: &Instance) -> RunInstanceInputs 
             .collect(),
         network: instance_network(state, inst),
         region: crate::runtime::vpc::region_of_az(&inst.az),
+        volumes: super::volume::attached_volumes(state, &inst.instance_id),
     }
 }
 
@@ -1789,6 +1795,8 @@ async fn change_state(
 
     let mut changes = Vec::new();
     let mut affected: Vec<String> = Vec::new();
+    // DeleteOnTermination volumes that went with terminated instances.
+    let mut deleted_volumes: Vec<String> = Vec::new();
     {
         let mut accounts = svc.state.write();
         let state = accounts.get_or_create(&req.account_id);
@@ -1863,7 +1871,7 @@ async fn change_state(
                 .retain(|_, a| !affected.contains(&a.instance_id));
             // Its EBS volumes go with it: DeleteOnTermination ones are
             // deleted, the rest detached.
-            super::volume::release_terminated_volumes(state, &affected);
+            deleted_volumes = super::volume::release_terminated_volumes(state, &affected);
             // Network interfaces too: the ones launched with it are deleted,
             // other attached ones detached.
             let deleted: Vec<String> = state
@@ -1959,6 +1967,11 @@ async fn change_state(
                         }
                     }
                     _ => {}
+                }
+            }
+            if let Some(rt) = &runtime {
+                for volume_id in &deleted_volumes {
+                    rt.delete_volume(&account_id, volume_id).await;
                 }
             }
             // Lifecycle changes move/remove instances (new IP on start, gone on

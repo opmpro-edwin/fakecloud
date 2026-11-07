@@ -3021,11 +3021,12 @@ async fn ec2_delete_volume() {
 async fn ec2_attach_volume() {
     let s = TestServer::start().await;
     let c = s.ec2_client().await;
+    let instance = run_one(&c).await;
     let id = make_vol(&c).await;
     let r = c
         .attach_volume()
         .volume_id(&id)
-        .instance_id("i-1")
+        .instance_id(&instance)
         .device("/dev/sdf")
         .send()
         .await
@@ -3038,10 +3039,11 @@ async fn ec2_attach_volume() {
 async fn ec2_detach_volume() {
     let s = TestServer::start().await;
     let c = s.ec2_client().await;
+    let instance = run_one(&c).await;
     let id = make_vol(&c).await;
     c.attach_volume()
         .volume_id(&id)
-        .instance_id("i-1")
+        .instance_id(&instance)
         .device("/dev/sdf")
         .send()
         .await

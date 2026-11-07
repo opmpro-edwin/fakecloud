@@ -156,6 +156,35 @@ struct InstanceRecord {
     private_ip: String,
     /// Whether the backing container should be running (false once stopped).
     running: bool,
+    /// The account and region the instance runs in, captured at `RunInstances`
+    /// so a Docker recreate mounts the same data and EBS volumes.
+    account_id: String,
+    region: String,
+    /// The EBS volumes attached to the instance, each mounted in its container
+    /// at its device name when mounting is on.
+    volumes: Vec<AttachedVolume>,
+    /// The attached volumes changed while the instance was stopped: its
+    /// container is recreated, not restarted, when it starts.
+    remount: bool,
+}
+
+/// What an instance boots with: its user-data (base64, as `RunInstances`
+/// received it), tags, subnet placement, region and attached EBS volumes.
+#[derive(Debug, Clone, Copy)]
+pub struct Boot<'a> {
+    pub user_data: Option<&'a str>,
+    pub tags: &'a BTreeMap<String, String>,
+    pub network: Option<&'a InstanceNetwork>,
+    pub region: &'a str,
+    pub volumes: &'a [AttachedVolume],
+}
+
+/// An EBS volume attached to an instance: its container mounts the volume's
+/// backing container volume at the attachment's device name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachedVolume {
+    pub volume_id: String,
+    pub device: String,
 }
 
 /// The selected backing-container backend.
@@ -471,11 +500,15 @@ impl Ec2Runtime {
         &self,
         account_id: &str,
         instance_id: &str,
-        user_data: Option<&str>,
-        tags: &BTreeMap<String, String>,
-        network: Option<&InstanceNetwork>,
-        region: &str,
+        boot: &Boot<'_>,
     ) -> Result<RunningInstance, RuntimeError> {
+        let Boot {
+            user_data,
+            tags,
+            network,
+            region,
+            volumes,
+        } = *boot;
         let image = default_image();
         let running = match &self.backend {
             // Docker attaches the container to the subnet's per-VPC bridge for
@@ -490,10 +523,16 @@ impl Ec2Runtime {
                     tags,
                     network,
                     region,
+                    volumes,
                 };
                 d.run_instance(&launch).await?
             }
-            InstanceBackend::K8s(k) => k.spawn_pod(instance_id, &image, user_data, tags).await?,
+            InstanceBackend::K8s(k) => {
+                if ebs_mounts_enabled() && !volumes.is_empty() {
+                    tracing::warn!(instance = %instance_id, "the Kubernetes backend does not mount attached EBS volumes");
+                }
+                k.spawn_pod(instance_id, &image, user_data, tags).await?
+            }
         };
         self.instances.write().insert(
             instance_id.to_string(),
@@ -505,10 +544,110 @@ impl Ec2Runtime {
                 network: network.cloned(),
                 private_ip: running.private_ip.clone(),
                 running: true,
+                account_id: account_id.to_string(),
+                region: region.to_string(),
+                volumes: volumes.to_vec(),
+                remount: false,
             },
         );
         self.spawn_imds(instance_id, &running.container_id);
         Ok(running)
+    }
+
+    /// Mount `volumes`, the EBS volumes now attached to the instance, in its
+    /// container (maps to `AttachVolume` and `DetachVolume`). Docker cannot
+    /// change a container's mounts, so a running instance's container is
+    /// recreated on the same root data volume, private IP and user-data -- to
+    /// the instance, a reboot -- and its new handle and IP are returned; a
+    /// stopped one is recreated when it next starts. With mounting off, or on
+    /// the Kubernetes backend, the container is left as it is.
+    pub async fn set_volumes(
+        &self,
+        instance_id: &str,
+        volumes: Vec<AttachedVolume>,
+    ) -> Option<RunningInstance> {
+        let InstanceBackend::Docker(d) = &self.backend else {
+            return None;
+        };
+        let record = {
+            let mut instances = self.instances.write();
+            let record = instances.get_mut(instance_id)?;
+            if record.volumes == volumes {
+                return None;
+            }
+            record.volumes = volumes;
+            if !ebs_mounts_enabled() {
+                return None;
+            }
+            if !record.running {
+                record.remount = true;
+                return None;
+            }
+            record.clone()
+        };
+        self.recreate(d, instance_id, &record).await
+    }
+
+    /// Remove the container volume backing EBS volume `volume_id` (maps to
+    /// `DeleteVolume`, and to a `DeleteOnTermination` volume going with its
+    /// instance). A no-op with mounting off: no such volume was made.
+    pub async fn delete_volume(&self, account_id: &str, volume_id: &str) {
+        let InstanceBackend::Docker(d) = &self.backend else {
+            return;
+        };
+        if !ebs_mounts_enabled() {
+            return;
+        }
+        let name = ebs_volume_name(
+            fakecloud_core::data_volume::current_scope().tag(),
+            account_id,
+            volume_id,
+        );
+        fakecloud_core::data_volume::remove_volume(&d.cli, &name).await;
+    }
+
+    /// Replace a Docker-backed instance's container with one booted from its
+    /// record, whose mounts changed. The old container goes first, so the new
+    /// one takes its private IP.
+    async fn recreate(
+        &self,
+        d: &DockerInstances,
+        instance_id: &str,
+        record: &InstanceRecord,
+    ) -> Option<RunningInstance> {
+        self.update_ip(instance_id, "");
+        d.remove_sidecars(instance_id).await;
+        d.remove(&record.handle).await;
+        let launch = DockerLaunch {
+            account_id: &record.account_id,
+            instance_id,
+            image: &record.image,
+            user_data: record.user_data.as_deref(),
+            tags: &record.tags,
+            network: record.network.as_ref(),
+            region: &record.region,
+            volumes: &record.volumes,
+        };
+        match d.run_instance(&launch).await {
+            Ok(running) => {
+                if let Some(r) = self.instances.write().get_mut(instance_id) {
+                    r.handle.clone_from(&running.container_id);
+                    r.private_ip.clone_from(&running.private_ip);
+                    r.running = true;
+                    r.remount = false;
+                }
+                self.spawn_imds(instance_id, &running.container_id);
+                Some(running)
+            }
+            Err(error) => {
+                tracing::warn!(instance = %instance_id, %error, "could not recreate the instance's container with its EBS volumes");
+                if let Some(r) = self.instances.write().get_mut(instance_id) {
+                    r.running = false;
+                    r.remount = true;
+                }
+                None
+            }
+        }
     }
 
     /// Stop an instance's backing container (maps to `StopInstances`).
@@ -542,6 +681,11 @@ impl Ec2Runtime {
     pub async fn start_instance(&self, instance_id: &str) -> Option<RunningInstance> {
         let record = self.instances.read().get(instance_id)?.clone();
         match &self.backend {
+            // Its EBS volumes changed while it was stopped: a container that
+            // mounts them takes the old one's place.
+            InstanceBackend::Docker(d) if record.remount => {
+                self.recreate(d, instance_id, &record).await
+            }
             InstanceBackend::Docker(d) => {
                 // Same container; only the IP may change. The subnet network the
                 // container was created on persists across stop/start.
@@ -950,6 +1094,25 @@ fn ec2_volumes_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Whether an EBS volume attached to an instance is mounted in its container,
+/// at the attachment's device name (`FAKECLOUD_EC2_MOUNT_VOLUMES`, off unless
+/// set). The instance then sees the volume as a directory there, not a block
+/// device, already formatted. Docker cannot add a mount to a running
+/// container, so attaching or detaching a volume recreates a running
+/// instance's container: to the instance, a reboot.
+fn ebs_mounts_enabled() -> bool {
+    std::env::var("FAKECLOUD_EC2_MOUNT_VOLUMES")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes"))
+        .unwrap_or(false)
+}
+
+/// Docker volume name backing an EBS volume in a volume scope: stable across
+/// restarts of a data dir, so a volume keeps its contents whichever instance
+/// it is attached to.
+fn ebs_volume_name(scope_tag: &str, account_id: &str, volume_id: &str) -> String {
+    fakecloud_core::data_volume::scoped_volume_name("ebs", scope_tag, &[account_id, volume_id])
+}
+
 /// Docker volume name for an instance's data dir in a volume scope
 /// (`fakecloud_core::data_volume`): stable for the same data dir across
 /// restarts, so the recovered container reattaches it, and distinct for any
@@ -1044,6 +1207,7 @@ struct DockerLaunch<'a> {
     tags: &'a BTreeMap<String, String>,
     network: Option<&'a InstanceNetwork>,
     region: &'a str,
+    volumes: &'a [AttachedVolume],
 }
 
 /// Files an instance container gets before it starts.
@@ -1197,6 +1361,22 @@ impl DockerInstances {
             .await;
             args.push("-v".to_string());
             args.push(format!("{volume}:{}", instance_data_dir()));
+        }
+        // Its attached EBS volumes, each at its device name.
+        if ebs_mounts_enabled() {
+            let scope = fakecloud_core::data_volume::current_scope();
+            for attached in launch.volumes {
+                let volume = ebs_volume_name(scope.tag(), launch.account_id, &attached.volume_id);
+                fakecloud_core::data_volume::ensure_volume(
+                    &self.cli,
+                    &volume,
+                    scope,
+                    &[format!("fakecloud-ebs={}", attached.volume_id)],
+                )
+                .await;
+                args.push("-v".to_string());
+                args.push(format!("{volume}:{}", attached.device));
+            }
         }
         // The subnet network and the instance's address on it, the host alias
         // (which resolves inside the instance and its IMDS sidecar, which
@@ -2194,6 +2374,10 @@ mod reachability_tests {
             network,
             private_ip: ip.into(),
             running: true,
+            account_id: "123456789012".into(),
+            region: "us-east-1".into(),
+            volumes: Vec::new(),
+            remount: false,
         }
     }
 
@@ -2242,6 +2426,65 @@ mod reachability_tests {
             .lines()
             .filter(|l| l.starts_with(&format!("{verb} ")))
             .count()
+    }
+
+    /// The instance container runs of `log`: those of image `busybox`, which
+    /// the sidecars and forwarders don't run.
+    fn instance_runs(log: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.starts_with("run ") && l.contains(" busybox "))
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn attached_volumes_are_mounted_by_recreating_the_container() {
+        std::env::set_var("FAKECLOUD_EC2_MOUNT_VOLUMES", "1");
+        let dir = tempfile::tempdir().unwrap();
+        let (cli, log) = fake_cli(dir.path());
+        let rt = runtime_with_cli(&cli);
+        rt.instances
+            .write()
+            .insert("i-vol".into(), record("172.30.0.5", None));
+        let sdf = vec![AttachedVolume {
+            volume_id: "vol-1".into(),
+            device: "/dev/sdf".into(),
+        }];
+
+        // Running: its container goes and one mounting the volume at its
+        // device takes its place.
+        let running = rt
+            .set_volumes("i-vol", sdf.clone())
+            .await
+            .expect("recreated");
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(calls.contains("rm -f cid-instance"), "{calls}");
+        let runs = instance_runs(&log);
+        assert_eq!(runs.len(), 1, "{calls}");
+        assert!(
+            runs[0].contains("-123456789012-vol-1:/dev/sdf "),
+            "{}",
+            runs[0]
+        );
+        assert_eq!(rt.instances.read()["i-vol"].handle, running.container_id);
+
+        // The same volumes again: nothing to do.
+        assert!(rt.set_volumes("i-vol", sdf).await.is_none());
+        assert_eq!(instance_runs(&log).len(), 1);
+
+        // Stopped: the change waits for the next start, which recreates it
+        // without the volume.
+        rt.stop_instance("i-vol").await;
+        assert!(rt.set_volumes("i-vol", Vec::new()).await.is_none());
+        assert!(rt.instances.read()["i-vol"].remount);
+        assert_eq!(instance_runs(&log).len(), 1);
+        rt.start_instance("i-vol").await.expect("started");
+        let runs = instance_runs(&log);
+        assert_eq!(runs.len(), 2);
+        assert!(!runs[1].contains("vol-1"), "{}", runs[1]);
+        assert!(!rt.instances.read()["i-vol"].remount);
     }
 
     #[tokio::test]
@@ -2438,10 +2681,13 @@ mod reachability_tests {
             rt.run_instance(
                 "123456789012",
                 "i-fast",
-                None,
-                &BTreeMap::new(),
-                None,
-                "us-east-1",
+                &Boot {
+                    user_data: None,
+                    tags: &BTreeMap::new(),
+                    network: None,
+                    region: "us-east-1",
+                    volumes: &[],
+                },
             ),
         )
         .await
@@ -2541,10 +2787,13 @@ mod reachability_tests {
             .run_instance(
                 "123456789012",
                 "i-taken",
-                None,
-                &BTreeMap::new(),
-                Some(&net),
-                "us-east-1",
+                &Boot {
+                    user_data: None,
+                    tags: &BTreeMap::new(),
+                    network: Some(&net),
+                    region: "us-east-1",
+                    volumes: &[],
+                },
             )
             .await
             .expect("run_instance");

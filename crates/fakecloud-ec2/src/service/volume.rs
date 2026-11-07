@@ -4,9 +4,11 @@
 use fakecloud_aws::ec2query::{ec2_elem, ec2_list, ec2_return};
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
+use crate::runtime::AttachedVolume;
 use crate::service::Ec2Service;
 use crate::service_helpers::{
-    filter_value_matches, gen_id, indexed_list, not_found, paginate, parse_filters, require,
+    filter_value_matches, gen_id, incorrect_instance_state, incorrect_state, indexed_list,
+    instance_not_found, invalid_parameter_value, not_found, paginate, parse_filters, require,
     validate_enum, validate_max_results, Filter,
 };
 use crate::state::{Ec2State, Tag, Volume, VolumeAttachment};
@@ -288,7 +290,11 @@ pub(crate) fn create_launch_volumes(
 /// attachment has `DeleteOnTermination` is deleted (to the recycle bin when a
 /// retention rule covers volumes, as DeleteVolume does); any other is
 /// detached and becomes `available`.
-pub(crate) fn release_terminated_volumes(state: &mut Ec2State, instance_ids: &[String]) {
+/// Returns the volumes deleted outright, whose backing data goes too.
+pub(crate) fn release_terminated_volumes(
+    state: &mut Ec2State,
+    instance_ids: &[String],
+) -> Vec<String> {
     let retention = state.recycle_bin_retention.volumes;
     let mut deleted = Vec::new();
     for vol in state.volumes.values_mut() {
@@ -310,9 +316,119 @@ pub(crate) fn release_terminated_volumes(state: &mut Ec2State, instance_ids: &[S
             vol.state = "available".to_string();
         }
     }
-    for id in deleted {
-        state.volumes.remove(&id);
-        state.tags.remove(&id);
+    for id in &deleted {
+        state.volumes.remove(id);
+        state.tags.remove(id);
+    }
+    deleted
+}
+
+/// The EBS volumes attached to `instance_id`, or being attached to it, in
+/// device order: what its container mounts.
+pub(crate) fn attached_volumes(state: &Ec2State, instance_id: &str) -> Vec<AttachedVolume> {
+    let mut attached: Vec<AttachedVolume> = state
+        .volumes
+        .values()
+        .flat_map(|v| &v.attachments)
+        .filter(|a| a.instance_id == instance_id && a.status != "detaching")
+        .map(|a| AttachedVolume {
+            volume_id: a.volume_id.clone(),
+            device: a.device.clone(),
+        })
+        .collect();
+    attached.sort_by(|a, b| a.device.cmp(&b.device));
+    attached
+}
+
+/// Whether `device` is a device name an EBS volume can be attached at on a
+/// Linux instance: `/dev/sd[b-z]`, `/dev/xvd[b-z]`, `/dev/hd[b-z]`, with a
+/// second letter or a partition number as AWS allows.
+fn valid_device(device: &str) -> bool {
+    let Some(name) = ["/dev/sd", "/dev/xvd", "/dev/hd"]
+        .iter()
+        .find_map(|prefix| device.strip_prefix(prefix))
+    else {
+        return false;
+    };
+    let letters = name.chars().take_while(char::is_ascii_lowercase).count();
+    let digits = &name[letters..];
+    (1..=2).contains(&letters)
+        && digits.len() <= 2
+        && digits.chars().all(|c| c.is_ascii_digit())
+        && !name.starts_with('a')
+}
+
+/// Mount the instance's EBS volumes in its container as they are attached
+/// now, in the background (a running container is recreated, which takes a
+/// while), then settle the volumes that were on their way: `attaching` ones
+/// are `attached`, `detaching` ones `available`.
+fn remount_in_background(svc: &Ec2Service, account_id: &str, instance_id: &str) {
+    let Some(runtime) = svc.runtime.clone() else {
+        return;
+    };
+    let state = svc.state.clone();
+    let store = svc.snapshot_store.clone();
+    let lock = svc.snapshot_lock.clone();
+    let account_id = account_id.to_string();
+    let instance_id = instance_id.to_string();
+    tokio::spawn(async move {
+        {
+            let _lifecycle = runtime.lock_lifecycle(&instance_id).await;
+            let volumes = state
+                .read()
+                .get(&account_id)
+                .map(|s| attached_volumes(s, &instance_id))
+                .unwrap_or_default();
+            if let Some(running) = runtime.set_volumes(&instance_id, volumes).await {
+                let gone = {
+                    let mut accounts = state.write();
+                    match accounts
+                        .get_mut(&account_id)
+                        .and_then(|s| s.instances.get_mut(&instance_id))
+                    {
+                        Some(inst) if inst.state_code != 48 => {
+                            inst.private_ip = running.private_ip;
+                            inst.container_id = Some(running.container_id);
+                            false
+                        }
+                        _ => true,
+                    }
+                };
+                if gone {
+                    // Terminated while its container was recreated: the new
+                    // container belongs to nothing.
+                    runtime.terminate_instance(&account_id, &instance_id).await;
+                }
+            }
+            settle_attachments(&state, &account_id, &instance_id);
+        }
+        if runtime.network_isolation_enforced() {
+            super::firewall_model::reconcile(&state, &runtime).await;
+        }
+        super::save_ec2_snapshot(&state, store, &lock).await;
+    });
+}
+
+/// The volumes attaching to or detaching from `instance_id` reach the state
+/// they were on their way to.
+fn settle_attachments(state: &crate::state::SharedEc2State, account_id: &str, instance_id: &str) {
+    let mut accounts = state.write();
+    let Some(state) = accounts.get_mut(account_id) else {
+        return;
+    };
+    for v in state.volumes.values_mut() {
+        v.attachments
+            .retain(|a| !(a.instance_id == instance_id && a.status == "detaching"));
+        for a in v
+            .attachments
+            .iter_mut()
+            .filter(|a| a.instance_id == instance_id && a.status == "attaching")
+        {
+            a.status = "attached".to_string();
+        }
+        if v.attachments.is_empty() && v.state == "in-use" {
+            v.state = "available".to_string();
+        }
     }
 }
 
@@ -409,29 +525,38 @@ pub(crate) fn delete_volume(
     req: &AwsRequest,
 ) -> Result<AwsResponse, AwsServiceError> {
     let id = require(&req.query_params, "VolumeId")?;
-    let mut accounts = svc.state.write();
-    let state = accounts.get_or_create(&req.account_id);
-    let retention = state.recycle_bin_retention.volumes;
-    let vol = state
-        .volumes
-        .get_mut(&id)
-        .ok_or_else(|| not_found("InvalidVolume.NotFound", &id))?;
-    // AWS rejects deleting an attached volume — it must be detached first.
-    if vol.state == "in-use" || !vol.attachments.is_empty() {
-        return Err(AwsServiceError::aws_error(
-            http::StatusCode::BAD_REQUEST,
-            "VolumeInUse",
-            format!("Volume '{id}' is currently attached and cannot be deleted"),
-        ));
-    }
-    if retention {
-        // A recycle-bin retention rule covers volumes: soft-delete so it can be
-        // listed and restored rather than destroying it.
-        vol.state = "deleting".to_string();
-        vol.in_recycle_bin = true;
-    } else {
-        state.volumes.remove(&id);
-        state.tags.remove(&id);
+    let deleted = {
+        let mut accounts = svc.state.write();
+        let state = accounts.get_or_create(&req.account_id);
+        let retention = state.recycle_bin_retention.volumes;
+        let vol = state
+            .volumes
+            .get_mut(&id)
+            .ok_or_else(|| not_found("InvalidVolume.NotFound", &id))?;
+        // AWS rejects deleting an attached volume — it must be detached first.
+        if vol.state == "in-use" || !vol.attachments.is_empty() {
+            return Err(AwsServiceError::aws_error(
+                http::StatusCode::BAD_REQUEST,
+                "VolumeInUse",
+                format!("Volume '{id}' is currently attached and cannot be deleted"),
+            ));
+        }
+        if retention {
+            // A recycle-bin retention rule covers volumes: soft-delete so it can
+            // be listed and restored rather than destroying it.
+            vol.state = "deleting".to_string();
+            vol.in_recycle_bin = true;
+            false
+        } else {
+            state.volumes.remove(&id);
+            state.tags.remove(&id);
+            true
+        }
+    };
+    // Its data goes with it.
+    if let (true, Some(runtime)) = (deleted, svc.runtime.clone()) {
+        let account_id = req.account_id.clone();
+        tokio::spawn(async move { runtime.delete_volume(&account_id, &id).await });
     }
     Ok(Ec2Service::respond(
         "DeleteVolume",
@@ -533,22 +658,72 @@ pub(crate) fn attach_volume(
     let device = require(&req.query_params, "Device")?;
     let instance_id = require(&req.query_params, "InstanceId")?;
     let volume_id = require(&req.query_params, "VolumeId")?;
-    let att = VolumeAttachment {
-        volume_id: volume_id.clone(),
-        instance_id,
-        device,
-        status: "attached".to_string(),
-        delete_on_termination: false,
-    };
-    {
+    if !valid_device(&device) {
+        return Err(invalid_parameter_value(format!(
+            "Value ({device}) for parameter device is invalid. {device} is not a valid EBS device name."
+        )));
+    }
+    let (att, remount) = {
         let mut accounts = svc.state.write();
         let state = accounts.get_or_create(&req.account_id);
+        if !state.volumes.contains_key(&volume_id) {
+            return Err(not_found("InvalidVolume.NotFound", &volume_id));
+        }
+        let inst = state
+            .instances
+            .get(&instance_id)
+            .ok_or_else(|| instance_not_found(&instance_id))?;
+        // Shutting down or terminated: there is nothing to attach to.
+        if matches!(inst.state_code, 32 | 48) {
+            return Err(incorrect_instance_state(&instance_id, &inst.state_name));
+        }
+        let az = inst.az.clone();
+        let backed = inst.container_id.is_some();
+        if state.volumes.values().any(|v| {
+            v.attachments
+                .iter()
+                .any(|a| a.instance_id == instance_id && a.device == device)
+        }) {
+            return Err(invalid_parameter_value(format!(
+                "Attachment point {device} is already in use"
+            )));
+        }
         let v = state
             .volumes
             .get_mut(&volume_id)
             .ok_or_else(|| not_found("InvalidVolume.NotFound", &volume_id))?;
+        if v.state != "available" || !v.attachments.is_empty() {
+            return Err(AwsServiceError::aws_error(
+                http::StatusCode::BAD_REQUEST,
+                "VolumeInUse",
+                format!("{volume_id} is already attached to an instance"),
+            ));
+        }
+        if v.availability_zone != az {
+            return Err(AwsServiceError::aws_error(
+                http::StatusCode::BAD_REQUEST,
+                "InvalidVolume.ZoneMismatch",
+                format!(
+                    "The volume '{volume_id}' is not in the same availability zone as instance '{instance_id}'"
+                ),
+            ));
+        }
+        // An instance with a container has it recreated around the volume
+        // before the attachment counts as made.
+        let remount = backed && svc.runtime.is_some();
+        let att = VolumeAttachment {
+            volume_id: volume_id.clone(),
+            instance_id,
+            device,
+            status: if remount { "attaching" } else { "attached" }.to_string(),
+            delete_on_termination: false,
+        };
         v.state = "in-use".to_string();
         v.attachments = vec![att.clone()];
+        (att, remount)
+    };
+    if remount {
+        remount_in_background(svc, &req.account_id, &att.instance_id);
     }
     Ok(Ec2Service::respond(
         "AttachVolume",
@@ -562,30 +737,52 @@ pub(crate) fn detach_volume(
     req: &AwsRequest,
 ) -> Result<AwsResponse, AwsServiceError> {
     let volume_id = require(&req.query_params, "VolumeId")?;
-    let mut att = VolumeAttachment {
-        volume_id: volume_id.clone(),
-        instance_id: req
-            .query_params
-            .get("InstanceId")
-            .cloned()
-            .unwrap_or_default(),
-        device: req.query_params.get("Device").cloned().unwrap_or_default(),
-        status: "detaching".to_string(),
-        delete_on_termination: false,
-    };
-    {
+    let (att, remount) = {
         let mut accounts = svc.state.write();
         let state = accounts.get_or_create(&req.account_id);
         let v = state
             .volumes
+            .get(&volume_id)
+            .ok_or_else(|| not_found("InvalidVolume.NotFound", &volume_id))?;
+        let Some(attached) = v.attachments.first() else {
+            return Err(incorrect_state(format!(
+                "Volume '{volume_id}' is in the '{}' state.",
+                v.state
+            )));
+        };
+        let instance_id = attached.instance_id.clone();
+        if let Some(asked) = req.query_params.get("InstanceId").filter(|i| !i.is_empty()) {
+            if *asked != instance_id {
+                return Err(AwsServiceError::aws_error(
+                    http::StatusCode::BAD_REQUEST,
+                    "InvalidAttachment.NotFound",
+                    format!("Volume '{volume_id}' is not attached to instance '{asked}'"),
+                ));
+            }
+        }
+        let backed = state
+            .instances
+            .get(&instance_id)
+            .is_some_and(|i| i.container_id.is_some());
+        // An instance with a container has it recreated without the volume
+        // before the volume is free.
+        let remount = backed && svc.runtime.is_some();
+        let v = state
+            .volumes
             .get_mut(&volume_id)
             .ok_or_else(|| not_found("InvalidVolume.NotFound", &volume_id))?;
-        if let Some(a) = v.attachments.first() {
-            att.instance_id = a.instance_id.clone();
-            att.device = a.device.clone();
+        let mut att = v.attachments[0].clone();
+        att.status = "detaching".to_string();
+        if remount {
+            v.attachments[0].status = "detaching".to_string();
+        } else {
+            v.attachments.clear();
+            v.state = "available".to_string();
         }
-        v.state = "available".to_string();
-        v.attachments.clear();
+        (att, remount)
+    };
+    if remount {
+        remount_in_background(svc, &req.account_id, &att.instance_id);
     }
     Ok(Ec2Service::respond(
         "DetachVolume",
@@ -1247,6 +1444,170 @@ mod tests {
             .unwrap(),
         );
         assert!(!empty.contains("<volumeId>vol-1</volumeId>"), "{empty}");
+    }
+
+    fn attach(
+        svc: &Ec2Service,
+        volume: &str,
+        instance: &str,
+        device: &str,
+    ) -> Result<AwsResponse, AwsServiceError> {
+        attach_volume(
+            svc,
+            &req(
+                "AttachVolume",
+                &[
+                    ("VolumeId", volume),
+                    ("InstanceId", instance),
+                    ("Device", device),
+                ],
+            ),
+        )
+    }
+
+    fn volume_state(svc: &Ec2Service, id: &str) -> (String, Vec<String>) {
+        let accounts = svc.state.read();
+        let v = &accounts.get("000000000000").unwrap().volumes[id];
+        (
+            v.state.clone(),
+            v.attachments
+                .iter()
+                .map(|a| format!("{} {} {}", a.instance_id, a.device, a.status))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn attach_volume_refuses_what_aws_refuses() {
+        let svc = Ec2Service::new();
+        crate::test_support::seed_instance(&svc, "i-1");
+        seed_volume(&svc, "vol-1", "available", false);
+        seed_volume(&svc, "vol-2", "available", false);
+        // A device no instance mounts a volume at.
+        assert_eq!(
+            err_of(attach(&svc, "vol-1", "i-1", "/dev/foo")).code(),
+            "InvalidParameterValue"
+        );
+        assert_eq!(
+            err_of(attach(&svc, "vol-1", "i-1", "/dev/sda1")).code(),
+            "InvalidParameterValue"
+        );
+        // An instance that is not there.
+        assert_eq!(
+            err_of(attach(&svc, "vol-1", "i-nope", "/dev/sdf")).code(),
+            "InvalidInstanceID.NotFound"
+        );
+        // A volume in another availability zone.
+        svc.state
+            .write()
+            .get_or_create("000000000000")
+            .volumes
+            .get_mut("vol-2")
+            .unwrap()
+            .availability_zone = "us-east-1b".into();
+        assert_eq!(
+            err_of(attach(&svc, "vol-2", "i-1", "/dev/sdf")).code(),
+            "InvalidVolume.ZoneMismatch"
+        );
+        // Attached once; a second time, and a second volume at the same device, are refused.
+        attach(&svc, "vol-1", "i-1", "/dev/sdf").unwrap();
+        assert_eq!(
+            err_of(attach(&svc, "vol-1", "i-1", "/dev/sdg")).code(),
+            "VolumeInUse"
+        );
+        seed_volume(&svc, "vol-3", "available", false);
+        assert_eq!(
+            err_of(attach(&svc, "vol-3", "i-1", "/dev/sdf")).code(),
+            "InvalidParameterValue"
+        );
+        // A terminated instance takes no volume.
+        svc.state
+            .write()
+            .get_or_create("000000000000")
+            .instances
+            .get_mut("i-1")
+            .unwrap()
+            .state_code = 48;
+        assert_eq!(
+            err_of(attach(&svc, "vol-3", "i-1", "/dev/sdg")).code(),
+            "IncorrectInstanceState"
+        );
+    }
+
+    #[test]
+    fn a_volume_attaches_and_detaches_at_once_without_a_container() {
+        let svc = Ec2Service::new();
+        crate::test_support::seed_instance(&svc, "i-1");
+        seed_volume(&svc, "vol-1", "available", false);
+        let body = body_of(attach(&svc, "vol-1", "i-1", "/dev/xvdf").unwrap());
+        assert!(body.contains("<status>attached</status>"), "{body}");
+        assert_eq!(
+            volume_state(&svc, "vol-1"),
+            ("in-use".into(), vec!["i-1 /dev/xvdf attached".into()])
+        );
+        let detached =
+            body_of(detach_volume(&svc, &req("DetachVolume", &[("VolumeId", "vol-1")])).unwrap());
+        assert!(
+            detached.contains("<status>detaching</status>"),
+            "{detached}"
+        );
+        assert_eq!(volume_state(&svc, "vol-1"), ("available".into(), vec![]));
+        // Detaching it again: it is attached to nothing.
+        let err = err_of(detach_volume(
+            &svc,
+            &req("DetachVolume", &[("VolumeId", "vol-1")]),
+        ));
+        assert_eq!(err.code(), "IncorrectState");
+    }
+
+    #[test]
+    fn detach_names_the_instance_it_is_attached_to() {
+        let svc = Ec2Service::new();
+        seed_volume(&svc, "vol-1", "in-use", true);
+        let err = err_of(detach_volume(
+            &svc,
+            &req(
+                "DetachVolume",
+                &[("VolumeId", "vol-1"), ("InstanceId", "i-2")],
+            ),
+        ));
+        assert_eq!(err.code(), "InvalidAttachment.NotFound");
+        assert_eq!(volume_state(&svc, "vol-1").0, "in-use");
+    }
+
+    #[test]
+    fn an_instance_mounts_its_volumes_in_device_order_but_not_those_leaving() {
+        let svc = Ec2Service::new();
+        seed_volume(&svc, "vol-b", "in-use", true);
+        seed_volume(&svc, "vol-a", "in-use", true);
+        seed_volume(&svc, "vol-c", "in-use", true);
+        {
+            let mut accounts = svc.state.write();
+            let st = accounts.get_or_create("000000000000");
+            st.volumes.get_mut("vol-a").unwrap().attachments[0].device = "/dev/sdg".into();
+            st.volumes.get_mut("vol-c").unwrap().attachments[0].status = "detaching".into();
+        }
+        let accounts = svc.state.read();
+        let attached = attached_volumes(accounts.get("000000000000").unwrap(), "i-1");
+        let devices: Vec<(&str, &str)> = attached
+            .iter()
+            .map(|a| (a.volume_id.as_str(), a.device.as_str()))
+            .collect();
+        assert_eq!(devices, [("vol-b", "/dev/sdf"), ("vol-a", "/dev/sdg")]);
+    }
+
+    #[test]
+    fn a_terminated_instance_frees_its_volumes_and_deletes_those_it_takes_along() {
+        let svc = Ec2Service::new();
+        seed_volume(&svc, "vol-keep", "in-use", true);
+        seed_volume(&svc, "vol-go", "in-use", true);
+        let mut accounts = svc.state.write();
+        let st = accounts.get_or_create("000000000000");
+        st.volumes.get_mut("vol-go").unwrap().attachments[0].delete_on_termination = true;
+        let deleted = release_terminated_volumes(st, &["i-1".to_string()]);
+        assert_eq!(deleted, ["vol-go"]);
+        assert_eq!(st.volumes["vol-keep"].state, "available");
+        assert!(!st.volumes.contains_key("vol-go"));
     }
 
     #[test]
