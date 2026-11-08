@@ -423,6 +423,7 @@ async fn handle_request(
         .to_string();
 
     let mut log_ctx = RequestLogContext {
+        client_ip: peer_addr.ip().to_string(),
         request_creation_time,
         request_start,
         received_bytes,
@@ -568,6 +569,8 @@ enum ActionTaken {
 
 /// Captured per-request fields used to build the access-log line.
 struct RequestLogContext {
+    /// The address of the client that connected, which `X-Forwarded-For` carries on.
+    client_ip: String,
     request_creation_time: chrono::DateTime<chrono::Utc>,
     request_start: Instant,
     received_bytes: u64,
@@ -1071,6 +1074,15 @@ async fn resolve_upstream(
     .await
 }
 
+/// The `X-Forwarded-For` an ALB sends on: the one it was given, if any, with the
+/// address of the client that connected to it appended, as AWS does.
+fn forwarded_for(existing: Option<&str>, client: &str) -> String {
+    match existing {
+        Some(existing) => format!("{existing}, {client}"),
+        None => client.to_string(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn forward_action(
     dp: &DataPlane,
@@ -1207,13 +1219,12 @@ async fn forward_action(
     let mut req_builder = dp.upstream.request(reqwest_method(&method), &upstream_url);
     let mut forwarded_headers = headers.clone();
     strip_hop_by_hop(&mut forwarded_headers);
-    let xff = match forwarded_headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-    {
-        Some(existing) => format!("{existing}, 127.0.0.1"),
-        None => "127.0.0.1".to_string(),
-    };
+    let xff = forwarded_for(
+        forwarded_headers
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok()),
+        &log_ctx.client_ip,
+    );
     forwarded_headers.insert(
         HeaderName::from_static("x-forwarded-for"),
         HeaderValue::from_str(&xff).unwrap(),
@@ -1875,5 +1886,19 @@ mod waf_tests {
         assert_eq!(outcome, WafEvalOutcome::Block);
         let resp = waf_outcome_to_response(outcome).expect("expected synthetic response");
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+}
+
+#[cfg(test)]
+mod forwarded_for_tests {
+    use super::forwarded_for;
+
+    #[test]
+    fn the_client_address_is_appended() {
+        assert_eq!(forwarded_for(None, "192.0.2.10"), "192.0.2.10");
+        assert_eq!(
+            forwarded_for(Some("198.51.100.4"), "192.0.2.10"),
+            "198.51.100.4, 192.0.2.10"
+        );
     }
 }
