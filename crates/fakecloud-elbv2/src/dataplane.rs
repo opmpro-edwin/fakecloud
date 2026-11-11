@@ -53,9 +53,11 @@ use crate::state::{Action, Listener, LoadBalancer, Rule, SharedElbv2State, Targe
 const ENV_DISABLE: &str = "FAKECLOUD_ELBV2_DISABLE_DATAPLANE";
 const SUPERVISOR_TICK_SECS: u64 = 1;
 const STICKY_COOKIE: &str = "AWSALB";
-/// How long an ALB waits to connect to a target.
+/// How long an ALB waits to connect to a target before answering 504.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// An ALB's idle timeout when its attributes do not say.
+/// The `idle_timeout.timeout_seconds` load balancer attribute, and the
+/// idle timeout an ALB has when its attributes do not say.
+const IDLE_TIMEOUT_ATTRIBUTE: &str = "idle_timeout.timeout_seconds";
 const IDLE_TIMEOUT_SECS: u64 = 60;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -102,6 +104,7 @@ struct DataPlane {
     rr_counters: Arc<Mutex<BTreeMap<String, usize>>>,
     /// Sticky-session map: `AWSALB` cookie value -> `tg_arn|target_id|target_port`.
     sticky_targets: Arc<Mutex<BTreeMap<String, String>>>,
+    /// Client to the targets (see [`upstream_client`]).
     upstream: reqwest::Client,
     /// Address used to reach loopback-published sibling targets (EC2 instances
     /// and ECS bridge-mode tasks publish their ports on the host daemon).
@@ -110,6 +113,31 @@ struct DataPlane {
     /// itself containerized — otherwise the forward would hit fakecloud's own
     /// loopback and 502 (#1539-class, bug-hunt 2026-06-24 0.B).
     sibling_host: String,
+}
+
+/// The HTTP client the data plane forwards plain requests with. It accepts
+/// any target certificate, as an ALB does not verify the certificates of
+/// HTTPS targets, and sets no timeout for the whole exchange: a streamed
+/// answer may last as long as it keeps moving. Idleness is timed per load
+/// balancer in `forward_action`.
+fn upstream_client() -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        // Disable redirects so we surface them as the upstream sees them.
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(CONNECT_TIMEOUT)
+        .build()
+}
+
+/// The load balancer's idle timeout: its `idle_timeout.timeout_seconds`
+/// attribute, 60 seconds when unset or not a positive number.
+fn idle_timeout_of(lb: &LoadBalancer) -> Duration {
+    lb.attributes
+        .get(IDLE_TIMEOUT_ATTRIBUTE)
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(IDLE_TIMEOUT_SECS))
 }
 
 pub fn spawn_dataplane(
@@ -133,16 +161,7 @@ pub fn spawn_dataplane_with_delivery(
         debug!("ELBv2 data plane disabled via {ENV_DISABLE}");
         return None;
     }
-    let upstream = match reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        // Disable redirects so we surface them as the upstream sees them.
-        .redirect(reqwest::redirect::Policy::none())
-        // No timeout for the whole exchange: a streamed answer may last as
-        // long as it keeps moving. Idleness is timed per load balancer in
-        // `forward_action`.
-        .connect_timeout(CONNECT_TIMEOUT)
-        .build()
-    {
+    let upstream = match upstream_client() {
         Ok(c) => c,
         Err(e) => {
             warn!("ELBv2 data plane: failed to build reqwest client: {e}");
@@ -423,7 +442,6 @@ async fn handle_request(
         .to_string();
 
     let mut log_ctx = RequestLogContext {
-        client_ip: peer_addr.ip().to_string(),
         request_creation_time,
         request_start,
         received_bytes,
@@ -462,10 +480,18 @@ async fn handle_request(
         }
     };
 
-    let listener_port: u16 = listener
-        .port
-        .and_then(|p| u16::try_from(p).ok())
-        .unwrap_or(80);
+    let forwarded = ForwardedFor {
+        client_ip: peer_addr.ip(),
+        proto: listener
+            .protocol
+            .as_deref()
+            .unwrap_or("HTTP")
+            .to_ascii_lowercase(),
+        port: listener
+            .port
+            .and_then(|p| u16::try_from(p).ok())
+            .unwrap_or(80),
+    };
 
     // WAF v2 evaluation: if a WebACL is associated with this LB, run
     // each request through the evaluator before the listener-rule
@@ -517,7 +543,7 @@ async fn handle_request(
                 parts.uri,
                 parts.headers,
                 body_bytes,
-                listener_port,
+                &forwarded,
                 client_upgrade,
                 &mut log_ctx,
             )
@@ -569,8 +595,6 @@ enum ActionTaken {
 
 /// Captured per-request fields used to build the access-log line.
 struct RequestLogContext {
-    /// The address of the client that connected, which `X-Forwarded-For` carries on.
-    client_ip: String,
     request_creation_time: chrono::DateTime<chrono::Utc>,
     request_start: Instant,
     received_bytes: u64,
@@ -700,7 +724,7 @@ struct LbSnapshot {
     /// security-group rules must admit.
     security_groups: Vec<String>,
     /// How long an exchange with a target may go without a byte either
-    /// way: `idle_timeout.timeout_seconds`.
+    /// way (see [`idle_timeout_of`]).
     idle_timeout: Duration,
     listeners: Vec<Listener>,
     rules: Vec<Rule>,
@@ -737,13 +761,7 @@ fn snapshot(dp: &DataPlane, lb_arn: &str) -> Option<LbSnapshot> {
     for (_acct, st) in accs.iter() {
         if let Some(lb) = st.load_balancers.get(lb_arn) {
             let security_groups = lb.security_groups.clone();
-            let idle_timeout = Duration::from_secs(
-                lb.attributes
-                    .get("idle_timeout.timeout_seconds")
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .filter(|&s| s > 0)
-                    .unwrap_or(IDLE_TIMEOUT_SECS),
-            );
+            let idle_timeout = idle_timeout_of(lb);
             let listeners: Vec<Listener> = st
                 .listeners
                 .values()
@@ -1092,7 +1110,7 @@ async fn forward_action(
     uri: http::Uri,
     headers: HeaderMap,
     body: Bytes,
-    listener_port: u16,
+    forwarded: &ForwardedFor,
     client_upgrade: Option<hyper::upgrade::OnUpgrade>,
     log_ctx: &mut RequestLogContext,
 ) -> Response<Body> {
@@ -1157,12 +1175,8 @@ async fn forward_action(
         None
     };
 
-    let healthy: Vec<&crate::state::TargetDescription> = tg
-        .targets
-        .iter()
-        .filter(|t| t.health.state != "unhealthy" && t.health.state != "unused")
-        .collect();
-    if healthy.is_empty() {
+    let routable = routable_targets(&tg.targets);
+    if routable.is_empty() {
         return canned_body(StatusCode::SERVICE_UNAVAILABLE, "No healthy targets");
     }
 
@@ -1171,22 +1185,27 @@ async fn forward_action(
         let parts: Vec<&str> = sticky_key.split('|').collect();
         if parts.len() == 3 && parts[0] == tg_arn {
             let port: Option<i32> = parts[2].parse().ok();
-            healthy
+            routable
                 .iter()
                 .copied()
                 .find(|t| t.id == parts[1] && t.port == port)
                 .unwrap_or_else(|| {
-                    healthy[round_robin_pick(&dp.rr_counters, &tg_arn, healthy.len())]
+                    routable[round_robin_pick(&dp.rr_counters, &tg_arn, routable.len())]
                 })
         } else {
-            healthy[round_robin_pick(&dp.rr_counters, &tg_arn, healthy.len())]
+            routable[round_robin_pick(&dp.rr_counters, &tg_arn, routable.len())]
         }
     } else {
-        healthy[round_robin_pick(&dp.rr_counters, &tg_arn, healthy.len())]
+        routable[round_robin_pick(&dp.rr_counters, &tg_arn, routable.len())]
     };
 
-    // Build upstream URL.
-    let scheme = "http";
+    // Build upstream URL: TLS to HTTPS target groups, as an ALB opens one
+    // (the client accepts any target certificate, as an ALB does).
+    let tls = tg
+        .protocol
+        .as_deref()
+        .is_some_and(|p| p.eq_ignore_ascii_case("HTTPS"));
+    let scheme = if tls { "https" } else { "http" };
     let target_port = chosen.port.or(tg.port).unwrap_or(80);
     let Ok(target_port) = u16::try_from(target_port) else {
         return canned_body(StatusCode::BAD_GATEWAY, "target port out of range");
@@ -1219,24 +1238,7 @@ async fn forward_action(
     let mut req_builder = dp.upstream.request(reqwest_method(&method), &upstream_url);
     let mut forwarded_headers = headers.clone();
     strip_hop_by_hop(&mut forwarded_headers);
-    let xff = forwarded_for(
-        forwarded_headers
-            .get("x-forwarded-for")
-            .and_then(|v| v.to_str().ok()),
-        &log_ctx.client_ip,
-    );
-    forwarded_headers.insert(
-        HeaderName::from_static("x-forwarded-for"),
-        HeaderValue::from_str(&xff).unwrap(),
-    );
-    forwarded_headers.insert(
-        HeaderName::from_static("x-forwarded-proto"),
-        HeaderValue::from_static("http"),
-    );
-    forwarded_headers.insert(
-        HeaderName::from_static("x-forwarded-port"),
-        HeaderValue::from_str(&listener_port.to_string()).unwrap(),
-    );
+    forwarded.apply(&mut forwarded_headers);
     let trace_id = format!("Root=1-{:x}-{}", chrono::Utc::now().timestamp(), short_id());
     forwarded_headers.insert(
         HeaderName::from_static("x-amzn-trace-id"),
@@ -1250,6 +1252,8 @@ async fn forward_action(
         return boxed(
             forward_upgrade(
                 &upstream,
+                tls,
+                snap.idle_timeout,
                 method,
                 path_and_query,
                 forwarded_headers,
@@ -1273,12 +1277,7 @@ async fn forward_action(
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {
             log_ctx.error_reason = format!("UpstreamError: {e}");
-            let status = if e.is_timeout() {
-                StatusCode::GATEWAY_TIMEOUT
-            } else {
-                StatusCode::BAD_GATEWAY
-            };
-            return canned_body(status, &format!("Upstream error: {e}"));
+            return boxed(upstream_error(&e.to_string(), e.is_timeout()));
         }
         Err(_) => {
             log_ctx.error_reason = "TargetResponseTimeout".to_string();
@@ -1407,6 +1406,82 @@ impl Drop for Counted {
     }
 }
 
+/// What an ALB tells a target about the client's request, in the
+/// `X-Forwarded-*` headers.
+struct ForwardedFor {
+    /// The address of the client connected to the load balancer.
+    client_ip: std::net::IpAddr,
+    /// The listener's protocol, lowercased (`http` / `https`).
+    proto: String,
+    /// The listener's port.
+    port: u16,
+}
+
+impl ForwardedFor {
+    /// Sets the `X-Forwarded-*` headers as an ALB does: the client address is
+    /// appended to any `X-Forwarded-For` the client sent, and `Proto` / `Port`
+    /// name the listener the request came in on, replacing client values.
+    fn apply(&self, headers: &mut HeaderMap) {
+        // Several `X-Forwarded-For` lines are one comma-separated chain.
+        let existing: Vec<&str> = headers
+            .get_all("x-forwarded-for")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+        let existing = existing.join(", ");
+        let xff = forwarded_for(
+            (!existing.is_empty()).then_some(existing.as_str()),
+            &self.client_ip.to_string(),
+        );
+        if let Ok(v) = HeaderValue::from_str(&xff) {
+            headers.insert(HeaderName::from_static("x-forwarded-for"), v);
+        }
+        if let Ok(v) = HeaderValue::from_str(&self.proto) {
+            headers.insert(HeaderName::from_static("x-forwarded-proto"), v);
+        }
+        headers.insert(
+            HeaderName::from_static("x-forwarded-port"),
+            HeaderValue::from(self.port),
+        );
+    }
+}
+
+/// The targets of a target group that take new requests. Healthy targets
+/// (and `unavailable` ones, whose group runs no health checks) when there are
+/// any; otherwise the ALB fails open across the `unhealthy` and `initial`
+/// targets, as AWS routes to all registered targets when none is healthy.
+/// `draining` and `unused` targets never take new requests, so a group with
+/// nothing else routable is empty.
+fn routable_targets(
+    targets: &[crate::state::TargetDescription],
+) -> Vec<&crate::state::TargetDescription> {
+    let healthy: Vec<_> = targets
+        .iter()
+        .filter(|t| matches!(t.health.state.as_str(), "healthy" | "unavailable"))
+        .collect();
+    if !healthy.is_empty() {
+        return healthy;
+    }
+    targets
+        .iter()
+        .filter(|t| matches!(t.health.state.as_str(), "unhealthy" | "initial"))
+        .collect()
+}
+
+/// The answer to a request the target did not complete: 504 when the
+/// connection could not be opened in time or the target stayed silent past
+/// the idle timeout, as on an ALB; 502 for any other failure.
+fn upstream_error(error: &str, timed_out: bool) -> Response<Full<Bytes>> {
+    if timed_out {
+        canned(
+            StatusCode::GATEWAY_TIMEOUT,
+            &format!("Upstream timeout: {error}"),
+        )
+    } else {
+        canned(StatusCode::BAD_GATEWAY, &format!("Upstream error: {error}"))
+    }
+}
+
 fn round_robin_pick(
     counters: &Arc<Mutex<BTreeMap<String, usize>>>,
     tg_arn: &str,
@@ -1452,8 +1527,11 @@ fn pick_weighted(
 /// own. Once the target switches protocols (`101`), the client's connection
 /// and the target's are joined until either side closes, as an ALB does on
 /// HTTP and HTTPS listeners; any other answer goes back as it came.
+#[allow(clippy::too_many_arguments)]
 async fn forward_upgrade(
     upstream: &fakecloud_core::dataplane::Endpoint,
+    tls: bool,
+    idle_timeout: Duration,
     method: Method,
     path_and_query: &str,
     mut headers: HeaderMap,
@@ -1461,27 +1539,13 @@ async fn forward_upgrade(
     client: hyper::upgrade::OnUpgrade,
     log_ctx: &mut RequestLogContext,
 ) -> Response<Full<Bytes>> {
-    let stream = match tokio::net::TcpStream::connect((upstream.host.as_str(), upstream.port)).await
-    {
+    let mut sender = match open_upgrade_connection(upstream, tls).await {
         Ok(s) => s,
-        Err(e) => {
-            log_ctx.error_reason = format!("UpstreamError: {e}");
-            return canned(StatusCode::BAD_GATEWAY, &format!("Upstream error: {e}"));
+        Err(UpstreamConnectError { message, timed_out }) => {
+            log_ctx.error_reason = format!("UpstreamError: {message}");
+            return upstream_error(&message, timed_out);
         }
     };
-    let (mut sender, conn) = match hyper::client::conn::http1::handshake(TokioIo::new(stream)).await
-    {
-        Ok(p) => p,
-        Err(e) => {
-            log_ctx.error_reason = format!("UpstreamError: {e}");
-            return canned(StatusCode::BAD_GATEWAY, &format!("Upstream error: {e}"));
-        }
-    };
-    tokio::spawn(async move {
-        if let Err(e) = conn.with_upgrades().await {
-            debug!("ELBv2 data plane: upstream connection error: {e}");
-        }
-    });
 
     // The hop-by-hop headers that ask for the switch, which the forwarded
     // headers no longer carry.
@@ -1497,11 +1561,16 @@ async fn forward_upgrade(
         Err(_) => return canned(StatusCode::BAD_REQUEST, "Bad Request"),
     };
     *req.headers_mut() = headers;
-    let mut target_resp = match sender.send_request(req).await {
-        Ok(r) => r,
-        Err(e) => {
+    // The target has the idle timeout to answer the handshake.
+    let mut target_resp = match tokio::time::timeout(idle_timeout, sender.send_request(req)).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
             log_ctx.error_reason = format!("UpstreamError: {e}");
-            return canned(StatusCode::BAD_GATEWAY, &format!("Upstream error: {e}"));
+            return upstream_error(&e.to_string(), false);
+        }
+        Err(_) => {
+            log_ctx.error_reason = "UpstreamError: idle timeout".to_string();
+            return upstream_error("idle timeout", true);
         }
     };
     log_ctx.target_status_code = Some(target_resp.status().as_u16());
@@ -1549,6 +1618,150 @@ async fn forward_upgrade(
         }
     });
     resp
+}
+
+/// Why a connection to the target for an upgrade could not be opened.
+struct UpstreamConnectError {
+    message: String,
+    /// The TCP connect did not complete in [`CONNECT_TIMEOUT`].
+    timed_out: bool,
+}
+
+impl UpstreamConnectError {
+    fn failed(e: impl std::fmt::Display) -> Self {
+        Self {
+            message: e.to_string(),
+            timed_out: false,
+        }
+    }
+}
+
+/// Opens an HTTP/1.1 connection to the target for a WebSocket handshake:
+/// TLS for an HTTPS target group (any certificate accepted, as by an ALB),
+/// plain TCP otherwise. The connection task runs with upgrades enabled so the
+/// target's `101` hands the stream over.
+async fn open_upgrade_connection(
+    upstream: &fakecloud_core::dataplane::Endpoint,
+    tls: bool,
+) -> Result<
+    hyper::client::conn::http1::SendRequest<http_body_util::Empty<Bytes>>,
+    UpstreamConnectError,
+> {
+    let stream = match tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        tokio::net::TcpStream::connect((upstream.host.as_str(), upstream.port)),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return Err(UpstreamConnectError::failed(e)),
+        Err(_) => {
+            return Err(UpstreamConnectError {
+                message: "connect timeout".to_string(),
+                timed_out: true,
+            })
+        }
+    };
+    if tls {
+        let server_name = rustls::pki_types::ServerName::try_from(upstream.host.clone())
+            .map_err(UpstreamConnectError::failed)?;
+        let stream = tokio_rustls::TlsConnector::from(target_tls_config())
+            .connect(server_name, stream)
+            .await
+            .map_err(UpstreamConnectError::failed)?;
+        upgrade_handshake(stream).await
+    } else {
+        upgrade_handshake(stream).await
+    }
+}
+
+async fn upgrade_handshake<S>(
+    io: S,
+) -> Result<
+    hyper::client::conn::http1::SendRequest<http_body_util::Empty<Bytes>>,
+    UpstreamConnectError,
+>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let (sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(io))
+        .await
+        .map_err(UpstreamConnectError::failed)?;
+    tokio::spawn(async move {
+        if let Err(e) = conn.with_upgrades().await {
+            debug!("ELBv2 data plane: upstream connection error: {e}");
+        }
+    });
+    Ok(sender)
+}
+
+/// TLS settings for connections to HTTPS targets: HTTP/1.1 (the upgrade is an
+/// HTTP/1.1 mechanism) and no certificate verification, since an ALB accepts
+/// any certificate a target presents, self-signed or expired included.
+fn target_tls_config() -> Arc<rustls::ClientConfig> {
+    static CONFIG: std::sync::OnceLock<Arc<rustls::ClientConfig>> = std::sync::OnceLock::new();
+    Arc::clone(CONFIG.get_or_init(|| {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut config = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
+            .with_safe_default_protocol_versions()
+            .expect("the ring provider supports the default TLS versions")
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAnyTargetCert(provider)))
+            .with_no_client_auth();
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        Arc::new(config)
+    }))
+}
+
+/// Accepts the target's certificate whatever it is; handshake signatures are
+/// still checked against the certificate's key, so the session is with the
+/// holder of that key.
+#[derive(Debug)]
+struct AcceptAnyTargetCert(Arc<rustls::crypto::CryptoProvider>);
+
+impl rustls::client::danger::ServerCertVerifier for AcceptAnyTargetCert {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
 }
 
 /// Whether `headers` ask to switch the connection to WebSocket, the one
@@ -1900,5 +2113,486 @@ mod forwarded_for_tests {
             forwarded_for(Some("198.51.100.4"), "192.0.2.10"),
             "198.51.100.4, 192.0.2.10"
         );
+    }
+}
+
+#[cfg(test)]
+mod forward_tests {
+    use super::*;
+    use crate::service::Elbv2Service;
+    use crate::state::{Elbv2Accounts, TargetDescription, TargetHealth};
+    use fakecloud_core::service::{AwsRequest, AwsService};
+    use parking_lot::RwLock;
+    use std::net::{IpAddr, Ipv4Addr};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const ACCOUNT: &str = "123456789012";
+
+    fn req(action: &str, params: &[(&str, &str)]) -> AwsRequest {
+        AwsRequest {
+            service: "elasticloadbalancing".to_string(),
+            action: action.to_string(),
+            region: "us-east-1".to_string(),
+            account_id: ACCOUNT.to_string(),
+            request_id: "rid".to_string(),
+            headers: HeaderMap::new(),
+            query_params: params
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+            body: Bytes::new(),
+            body_stream: parking_lot::Mutex::new(None),
+            path_segments: vec![],
+            raw_path: "/".to_string(),
+            raw_query: String::new(),
+            method: Method::POST,
+            is_query_protocol: true,
+            access_key_id: None,
+            principal: None,
+        }
+    }
+
+    fn target(id: &str, port: u16, state: &str) -> TargetDescription {
+        TargetDescription {
+            id: id.to_string(),
+            port: Some(i32::from(port)),
+            availability_zone: None,
+            health: TargetHealth {
+                state: state.to_string(),
+                reason: None,
+                description: None,
+            },
+            consecutive_success: 0,
+            consecutive_failure: 0,
+            last_probe_at: None,
+        }
+    }
+
+    fn states(targets: &[&TargetDescription]) -> Vec<String> {
+        targets.iter().map(|t| t.health.state.clone()).collect()
+    }
+
+    #[test]
+    fn all_unhealthy_targets_take_requests() {
+        let targets = vec![
+            target("10.0.0.1", 80, "unhealthy"),
+            target("10.0.0.2", 80, "unhealthy"),
+        ];
+        assert_eq!(routable_targets(&targets).len(), 2);
+    }
+
+    #[test]
+    fn no_healthy_target_fails_open_across_unhealthy_and_initial_only() {
+        let targets = vec![
+            target("10.0.0.1", 80, "unhealthy"),
+            target("10.0.0.2", 80, "initial"),
+            target("10.0.0.3", 80, "draining"),
+            target("10.0.0.4", 80, "unused"),
+        ];
+        assert_eq!(
+            states(&routable_targets(&targets)),
+            vec!["unhealthy", "initial"]
+        );
+    }
+
+    #[test]
+    fn healthy_targets_take_requests_alone_in_a_mix() {
+        let targets = vec![
+            target("10.0.0.1", 80, "unhealthy"),
+            target("10.0.0.2", 80, "healthy"),
+            target("10.0.0.3", 80, "initial"),
+            target("10.0.0.4", 80, "draining"),
+        ];
+        let routable = routable_targets(&targets);
+        assert_eq!(routable.len(), 1);
+        assert_eq!(routable[0].id, "10.0.0.2");
+    }
+
+    #[test]
+    fn draining_and_unused_targets_are_never_routed() {
+        let targets = vec![
+            target("10.0.0.1", 80, "draining"),
+            target("10.0.0.2", 80, "unused"),
+        ];
+        assert!(routable_targets(&targets).is_empty());
+    }
+
+    fn forwarded(proto: &str, port: u16) -> ForwardedFor {
+        ForwardedFor {
+            client_ip: IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3)),
+            proto: proto.to_string(),
+            port,
+        }
+    }
+
+    #[test]
+    fn forwarded_headers_name_the_client_and_the_listener() {
+        let mut headers = HeaderMap::new();
+        forwarded("https", 443).apply(&mut headers);
+        assert_eq!(headers["x-forwarded-for"], "10.1.2.3");
+        assert_eq!(headers["x-forwarded-proto"], "https");
+        assert_eq!(headers["x-forwarded-port"], "443");
+    }
+
+    #[test]
+    fn forwarded_for_appends_the_client_to_the_existing_chain() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", HeaderValue::from_static("203.0.113.9"));
+        // A client cannot choose the protocol or port the target is told.
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        headers.insert("x-forwarded-port", HeaderValue::from_static("8443"));
+        forwarded("http", 80).apply(&mut headers);
+        assert_eq!(headers["x-forwarded-for"], "203.0.113.9, 10.1.2.3");
+        assert_eq!(headers["x-forwarded-proto"], "http");
+        assert_eq!(headers["x-forwarded-port"], "80");
+    }
+
+    #[test]
+    fn forwarded_for_carries_ipv6_clients_bare() {
+        let mut headers = HeaderMap::new();
+        ForwardedFor {
+            client_ip: "2001:db8::7".parse().unwrap(),
+            proto: "http".to_string(),
+            port: 80,
+        }
+        .apply(&mut headers);
+        assert_eq!(headers["x-forwarded-for"], "2001:db8::7");
+    }
+
+    /// A target that answers each request with the scheme it was reached over
+    /// and the `X-Forwarded-*` headers it got, takes WebSocket upgrades and
+    /// then echoes bytes, and never answers `/slow`.
+    async fn spawn_target(tls: bool) -> u16 {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let acceptor = tls.then(|| {
+            let key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+            let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![key.cert.der().clone()],
+                rustls::pki_types::PrivateKeyDer::Pkcs8(key.key_pair.serialize_der().into()),
+            )
+            .unwrap();
+            tokio_rustls::TlsAcceptor::from(Arc::new(config))
+        });
+        tokio::spawn(async move {
+            loop {
+                let Ok((sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let scheme = if tls { "https" } else { "http" };
+                    let svc = service_fn(move |req| target_answer(scheme, req));
+                    let builder = hyper::server::conn::http1::Builder::new();
+                    match acceptor {
+                        Some(a) => {
+                            let Ok(s) = a.accept(sock).await else {
+                                return;
+                            };
+                            let _ = builder
+                                .serve_connection(TokioIo::new(s), svc)
+                                .with_upgrades()
+                                .await;
+                        }
+                        None => {
+                            let _ = builder
+                                .serve_connection(TokioIo::new(sock), svc)
+                                .with_upgrades()
+                                .await;
+                        }
+                    }
+                });
+            }
+        });
+        port
+    }
+
+    async fn target_answer(
+        scheme: &'static str,
+        mut req: Request<Incoming>,
+    ) -> Result<Response<Full<Bytes>>, Infallible> {
+        if req.uri().path() == "/slow" {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        }
+        if is_websocket_upgrade(req.headers()) {
+            let on = hyper::upgrade::on(&mut req);
+            tokio::spawn(async move {
+                let Ok(up) = on.await else { return };
+                let mut io = TokioIo::new(up);
+                let mut buf = [0u8; 64];
+                while let Ok(n) = io.read(&mut buf).await {
+                    if n == 0 || io.write_all(&buf[..n]).await.is_err() {
+                        return;
+                    }
+                }
+            });
+            let mut resp = Response::new(Full::new(Bytes::new()));
+            *resp.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
+            resp.headers_mut()
+                .insert(http::header::UPGRADE, HeaderValue::from_static("websocket"));
+            resp.headers_mut().insert(
+                http::header::CONNECTION,
+                HeaderValue::from_static("upgrade"),
+            );
+            return Ok(resp);
+        }
+        let h = |n: &str| {
+            req.headers()
+                .get(n)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("-")
+                .to_string()
+        };
+        let body = format!(
+            "scheme={scheme} xff={} proto={} port={}",
+            h("x-forwarded-for"),
+            h("x-forwarded-proto"),
+            h("x-forwarded-port")
+        );
+        Ok(Response::new(Full::new(Bytes::from(body))))
+    }
+
+    /// A port with nothing listening on it.
+    async fn dead_port() -> u16 {
+        let l = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        l.local_addr().unwrap().port()
+    }
+
+    struct Alb {
+        state: SharedElbv2State,
+        tg_arn: String,
+        port: u16,
+    }
+
+    impl Alb {
+        fn set_targets(&self, targets: Vec<TargetDescription>) {
+            let mut accs = self.state.write();
+            let st = accs.get_mut(ACCOUNT).unwrap();
+            st.target_groups.get_mut(&self.tg_arn).unwrap().targets = targets;
+        }
+
+        fn url(&self, path: &str) -> String {
+            format!("http://127.0.0.1:{}{path}", self.port)
+        }
+    }
+
+    /// An ALB, created through the API, with an HTTP:80 listener forwarding
+    /// to a target group of `tg_protocol`, served by the data plane on a
+    /// loopback port. `lb_attributes` are applied with
+    /// ModifyLoadBalancerAttributes.
+    async fn alb(tg_protocol: &str, lb_attributes: &[(&str, &str)]) -> Alb {
+        let state: SharedElbv2State = Arc::new(RwLock::new(Elbv2Accounts::new()));
+        let svc = Elbv2Service::new(Arc::clone(&state));
+        svc.handle(req(
+            "CreateLoadBalancer",
+            &[("Name", "dp"), ("Subnets.member.1", "subnet-1")],
+        ))
+        .await
+        .unwrap();
+        svc.handle(req(
+            "CreateTargetGroup",
+            &[
+                ("Name", "dp-tg"),
+                ("Protocol", tg_protocol),
+                ("Port", "443"),
+            ],
+        ))
+        .await
+        .unwrap();
+        let (lb_arn, tg_arn) = {
+            let accs = state.read();
+            let st = accs.get(ACCOUNT).unwrap();
+            (
+                st.load_balancers.keys().next().unwrap().clone(),
+                st.target_groups.keys().next().unwrap().clone(),
+            )
+        };
+        svc.handle(req(
+            "CreateListener",
+            &[
+                ("LoadBalancerArn", &lb_arn),
+                ("Protocol", "HTTP"),
+                ("Port", "80"),
+                ("DefaultActions.member.1.Type", "forward"),
+                ("DefaultActions.member.1.TargetGroupArn", &tg_arn),
+            ],
+        ))
+        .await
+        .unwrap();
+        for (i, (k, v)) in lb_attributes.iter().enumerate() {
+            let key = format!("Attributes.member.{}.Key", i + 1);
+            let value = format!("Attributes.member.{}.Value", i + 1);
+            svc.handle(req(
+                "ModifyLoadBalancerAttributes",
+                &[("LoadBalancerArn", &lb_arn), (&key, k), (&value, v)],
+            ))
+            .await
+            .unwrap();
+        }
+        let dp = DataPlane {
+            state: Arc::clone(&state),
+            waf_state: None,
+            access_logger: None,
+            waf_count_metrics: Arc::new(Mutex::new(BTreeMap::new())),
+            rr_counters: Arc::new(Mutex::new(BTreeMap::new())),
+            sticky_targets: Arc::new(Mutex::new(BTreeMap::new())),
+            upstream: upstream_client().unwrap(),
+            sibling_host: "127.0.0.1".to_string(),
+        };
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(accept_loop(dp, lb_arn, listener));
+        Alb {
+            state,
+            tg_arn,
+            port,
+        }
+    }
+
+    fn client() -> reqwest::Client {
+        reqwest::Client::builder().no_proxy().build().unwrap()
+    }
+
+    async fn get(url: &str) -> (StatusCode, String) {
+        let resp = client().get(url).send().await.unwrap();
+        let status = resp.status();
+        (status, resp.text().await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn https_target_group_is_reached_over_tls_with_any_certificate() {
+        let alb = alb("HTTPS", &[]).await;
+        let target_port = spawn_target(true).await;
+        alb.set_targets(vec![target("127.0.0.1", target_port, "healthy")]);
+        let (status, body) = get(&alb.url("/")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.starts_with("scheme=https "), "{body}");
+        // The listener is HTTP:80 and the client connected from loopback.
+        assert!(body.contains("xff=127.0.0.1 proto=http port=80"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn http_target_group_stays_plain_http() {
+        let alb = alb("HTTP", &[]).await;
+        let target_port = spawn_target(false).await;
+        alb.set_targets(vec![target("127.0.0.1", target_port, "healthy")]);
+        let (status, body) = get(&alb.url("/")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.starts_with("scheme=http "), "{body}");
+    }
+
+    /// Sends a WebSocket handshake through the ALB and checks that bytes
+    /// written after the `101` come back from the echoing target.
+    async fn websocket_echo(alb: &Alb) {
+        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", alb.port))
+            .await
+            .unwrap();
+        s.write_all(
+            b"GET /ws HTTP/1.1\r\nHost: dp\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\
+              Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            assert_eq!(s.read(&mut byte).await.unwrap(), 1, "connection closed");
+            head.push(byte[0]);
+        }
+        let head = String::from_utf8_lossy(&head);
+        assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+        s.write_all(b"ping").await.unwrap();
+        let mut echo = [0u8; 4];
+        s.read_exact(&mut echo).await.unwrap();
+        assert_eq!(&echo, b"ping");
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_passes_through_to_https_targets() {
+        let alb = alb("HTTPS", &[]).await;
+        let target_port = spawn_target(true).await;
+        alb.set_targets(vec![target("127.0.0.1", target_port, "healthy")]);
+        websocket_echo(&alb).await;
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_passes_through_to_http_targets() {
+        let alb = alb("HTTP", &[]).await;
+        let target_port = spawn_target(false).await;
+        alb.set_targets(vec![target("127.0.0.1", target_port, "healthy")]);
+        websocket_echo(&alb).await;
+    }
+
+    #[tokio::test]
+    async fn requests_reach_targets_when_all_are_unhealthy() {
+        let alb = alb("HTTP", &[]).await;
+        let target_port = spawn_target(false).await;
+        alb.set_targets(vec![target("127.0.0.1", target_port, "unhealthy")]);
+        let (status, body) = get(&alb.url("/")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    #[tokio::test]
+    async fn requests_skip_unhealthy_targets_while_one_is_healthy() {
+        let alb = alb("HTTP", &[]).await;
+        let target_port = spawn_target(false).await;
+        alb.set_targets(vec![
+            target("127.0.0.1", dead_port().await, "unhealthy"),
+            target("127.0.0.1", target_port, "healthy"),
+            target("127.0.0.1", dead_port().await, "initial"),
+        ]);
+        for _ in 0..6 {
+            let (status, body) = get(&alb.url("/")).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn only_draining_targets_answer_503() {
+        let alb = alb("HTTP", &[]).await;
+        let target_port = spawn_target(false).await;
+        alb.set_targets(vec![target("127.0.0.1", target_port, "draining")]);
+        let (status, _) = get(&alb.url("/")).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn idle_timeout_attribute_bounds_a_silent_target() {
+        let alb = alb("HTTP", &[("idle_timeout.timeout_seconds", "1")]).await;
+        let target_port = spawn_target(false).await;
+        alb.set_targets(vec![target("127.0.0.1", target_port, "healthy")]);
+        let started = Instant::now();
+        let (status, body) = get(&alb.url("/slow")).await;
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{body}");
+        let waited = started.elapsed();
+        assert!(
+            waited >= Duration::from_secs(1) && waited < Duration::from_secs(10),
+            "waited {waited:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_timeout_comes_from_the_attribute_with_a_60s_default() {
+        let alb = alb("HTTP", &[("idle_timeout.timeout_seconds", "4000")]).await;
+        let lb = {
+            let accs = alb.state.read();
+            accs.get(ACCOUNT)
+                .unwrap()
+                .load_balancers
+                .values()
+                .next()
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(idle_timeout_of(&lb), Duration::from_secs(4000));
+        let mut unset = lb.clone();
+        unset.attributes.remove(IDLE_TIMEOUT_ATTRIBUTE);
+        assert_eq!(idle_timeout_of(&unset), Duration::from_secs(60));
     }
 }
