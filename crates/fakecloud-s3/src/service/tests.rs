@@ -12086,3 +12086,182 @@ fn delete_objects_replicates_markers_committed_before_a_failure() {
     assert!(dst.objects["a"].is_delete_marker);
     assert!(!dst.objects.contains_key("b"));
 }
+
+// ---- Object Lock condition keys (G4) ----
+
+mod object_lock_keys {
+    use super::*;
+    use fakecloud_core::auth::ConditionContext;
+    use fakecloud_iam::condition::CompiledCondition;
+
+    fn now() -> DateTime<Utc> {
+        "2026-01-01T00:00:00Z".parse().unwrap()
+    }
+
+    fn hdrs(pairs: &[(&'static str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(*k, v.parse().unwrap());
+        }
+        h
+    }
+
+    fn put_keys(pairs: &[(&'static str, &str)]) -> std::collections::BTreeMap<String, Vec<String>> {
+        object_lock_condition_keys("PutObject", &HashMap::new(), &hdrs(pairs), b"", now())
+    }
+
+    /// Does the Deny condition block fire for these keys?
+    fn denies(
+        cond: serde_json::Value,
+        keys: std::collections::BTreeMap<String, Vec<String>>,
+    ) -> bool {
+        let ctx = ConditionContext {
+            service_keys: keys,
+            ..Default::default()
+        };
+        CompiledCondition::parse(&cond).matches(&ctx)
+    }
+
+    fn mode_deny() -> serde_json::Value {
+        serde_json::json!({"StringNotEquals": {"s3:object-lock-mode": "COMPLIANCE"}})
+    }
+    fn days_deny() -> serde_json::Value {
+        serde_json::json!({"NumericLessThan": {"s3:object-lock-remaining-retention-days": "365"}})
+    }
+
+    #[test]
+    fn mode_policy_allows_compliance_denies_missing_and_governance() {
+        let ok = put_keys(&[("x-amz-object-lock-mode", "COMPLIANCE")]);
+        assert!(!denies(mode_deny(), ok));
+        assert!(denies(mode_deny(), put_keys(&[])));
+        let gov = put_keys(&[("x-amz-object-lock-mode", "GOVERNANCE")]);
+        assert!(denies(mode_deny(), gov));
+    }
+
+    #[test]
+    fn retention_days_policy() {
+        let long = put_keys(&[
+            ("x-amz-object-lock-mode", "COMPLIANCE"),
+            (
+                "x-amz-object-lock-retain-until-date",
+                "2027-02-05T00:00:00Z",
+            ),
+        ]);
+        assert_eq!(
+            long.get("s3:object-lock-remaining-retention-days"),
+            Some(&vec!["400".to_string()])
+        );
+        assert!(!denies(days_deny(), long));
+        let short = put_keys(&[
+            ("x-amz-object-lock-mode", "COMPLIANCE"),
+            (
+                "x-amz-object-lock-retain-until-date",
+                "2026-01-31T00:00:00Z",
+            ),
+        ]);
+        assert!(denies(days_deny(), short));
+        // Absent key: a plain NumericLessThan does not apply.
+        assert!(!denies(days_deny(), put_keys(&[])));
+    }
+
+    #[test]
+    fn remaining_days_round_up() {
+        // exactly 365 days minus 1s of "latency" still yields 365
+        let k = put_keys(&[(
+            "x-amz-object-lock-retain-until-date",
+            "2026-12-31T23:59:59Z",
+        )]);
+        assert_eq!(
+            k.get("s3:object-lock-remaining-retention-days"),
+            Some(&vec!["365".to_string()])
+        );
+        assert!(!denies(days_deny(), k));
+        let k = put_keys(&[(
+            "x-amz-object-lock-retain-until-date",
+            "2027-01-01T00:00:01Z",
+        )]);
+        assert_eq!(
+            k.get("s3:object-lock-remaining-retention-days"),
+            Some(&vec!["366".to_string()])
+        );
+    }
+
+    #[test]
+    fn date_and_legal_hold_headers() {
+        let k = put_keys(&[
+            (
+                "x-amz-object-lock-retain-until-date",
+                "2027-01-01T00:00:00Z",
+            ),
+            ("x-amz-object-lock-legal-hold", "ON"),
+        ]);
+        assert_eq!(
+            k.get("s3:object-lock-retain-until-date"),
+            Some(&vec!["2027-01-01T00:00:00Z".to_string()])
+        );
+        assert_eq!(
+            k.get("s3:object-lock-legal-hold"),
+            Some(&vec!["ON".to_string()])
+        );
+        assert!(!k.contains_key("s3:object-lock-mode"));
+    }
+
+    #[test]
+    fn copy_and_multipart_use_headers() {
+        for action in ["CopyObject", "CreateMultipartUpload", "PutObjectRetention"] {
+            let k = object_lock_condition_keys(
+                action,
+                &HashMap::new(),
+                &hdrs(&[("x-amz-object-lock-mode", "COMPLIANCE")]),
+                b"",
+                now(),
+            );
+            assert_eq!(
+                k.get("s3:object-lock-mode"),
+                Some(&vec!["COMPLIANCE".to_string()])
+            );
+        }
+    }
+
+    #[test]
+    fn put_object_retention_reads_body() {
+        let mut q = HashMap::new();
+        q.insert("retention".to_string(), String::new());
+        let body = b"<Retention><Mode>COMPLIANCE</Mode><RetainUntilDate>2026-01-11T00:00:00Z</RetainUntilDate></Retention>";
+        let k =
+            object_lock_condition_keys("PutObjectRetention", &q, &HeaderMap::new(), body, now());
+        assert_eq!(
+            k.get("s3:object-lock-mode"),
+            Some(&vec!["COMPLIANCE".to_string()])
+        );
+        assert_eq!(
+            k.get("s3:object-lock-remaining-retention-days"),
+            Some(&vec!["10".to_string()])
+        );
+    }
+
+    #[test]
+    fn put_object_legal_hold_reads_body() {
+        let mut q = HashMap::new();
+        q.insert("legal-hold".to_string(), String::new());
+        let body = b"<LegalHold><Status>ON</Status></LegalHold>";
+        let k =
+            object_lock_condition_keys("PutObjectLegalHold", &q, &HeaderMap::new(), body, now());
+        assert_eq!(
+            k.get("s3:object-lock-legal-hold"),
+            Some(&vec!["ON".to_string()])
+        );
+    }
+
+    #[test]
+    fn unrelated_actions_get_no_lock_keys() {
+        let k = object_lock_condition_keys(
+            "GetObject",
+            &HashMap::new(),
+            &hdrs(&[("x-amz-object-lock-mode", "COMPLIANCE")]),
+            b"",
+            now(),
+        );
+        assert!(k.is_empty());
+    }
+}

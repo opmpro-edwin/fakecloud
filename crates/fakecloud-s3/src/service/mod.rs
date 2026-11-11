@@ -2192,6 +2192,13 @@ impl AwsService for S3Service {
             );
         }
         let mut keys = s3_condition_keys(action.action, &request.query_params, &request.headers);
+        keys.extend(object_lock_condition_keys(
+            action.action,
+            &request.query_params,
+            &request.headers,
+            &request.body,
+            Utc::now(),
+        ));
         // S3 Control UntagResource: `aws:TagKeys` lists the keys being removed.
         if action.action == "UntagResource" && control_tags::is_control_tags_request(request) {
             keys.insert(
@@ -2337,6 +2344,78 @@ fn s3_condition_keys(
         if let Some(max_keys) = query.get("max-keys") {
             out.insert("s3:max-keys".to_string(), vec![max_keys.clone()]);
         }
+    }
+    out
+}
+
+/// Object Lock condition keys AWS derives from the request.
+///
+/// PutObject / CopyObject / CreateMultipartUpload (and the PutObjectRetention /
+/// PutObjectLegalHold permissions their lock headers imply) read the
+/// `x-amz-object-lock-*` headers; the PutObjectRetention and PutObjectLegalHold
+/// APIs read the request body's `Mode` / `RetainUntilDate` / `Status`. Keys are
+/// omitted when the request does not carry the value, so a plain `NumericLessThan`
+/// does not apply while a negated operator does, as in AWS.
+/// `s3:object-lock-remaining-retention-days` is whole days from `now` until the
+/// retain-until date, rounded up.
+fn object_lock_condition_keys(
+    action: &str,
+    query: &std::collections::HashMap<String, String>,
+    headers: &HeaderMap,
+    body: &[u8],
+    now: DateTime<Utc>,
+) -> std::collections::BTreeMap<String, Vec<String>> {
+    let mut out = std::collections::BTreeMap::new();
+    if !matches!(
+        action,
+        "PutObject"
+            | "CopyObject"
+            | "CreateMultipartUpload"
+            | "PutObjectRetention"
+            | "PutObjectLegalHold"
+    ) {
+        return out;
+    }
+    let header = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    let text = std::str::from_utf8(body).unwrap_or("");
+    let (mode, until, hold) = if query.contains_key("retention") {
+        (
+            extract_xml_value(text, "Mode"),
+            extract_xml_value(text, "RetainUntilDate"),
+            None,
+        )
+    } else if query.contains_key("legal-hold") {
+        (None, None, extract_xml_value(text, "Status"))
+    } else {
+        (
+            header("x-amz-object-lock-mode"),
+            header("x-amz-object-lock-retain-until-date"),
+            header("x-amz-object-lock-legal-hold"),
+        )
+    };
+    if let Some(mode) = mode.filter(|v| !v.trim().is_empty()) {
+        out.insert("s3:object-lock-mode".to_string(), vec![mode]);
+    }
+    if let Some(until) = until.and_then(|v| v.trim().parse::<DateTime<Utc>>().ok()) {
+        out.insert(
+            "s3:object-lock-retain-until-date".to_string(),
+            vec![until.format("%Y-%m-%dT%H:%M:%SZ").to_string()],
+        );
+        let secs = (until - now).num_seconds().max(0);
+        let days = (secs + 86_399) / 86_400;
+        out.insert(
+            "s3:object-lock-remaining-retention-days".to_string(),
+            vec![days.to_string()],
+        );
+    }
+    if let Some(hold) = hold.filter(|v| !v.trim().is_empty()) {
+        out.insert("s3:object-lock-legal-hold".to_string(), vec![hold]);
     }
     out
 }
