@@ -2497,3 +2497,196 @@ fn tag_keys_fall_back_to_plain_context_entries() {
         .insert("aws:RequestTag/Team".to_string(), vec!["red".to_string()]);
     assert_eq!(evaluate(&[policy], &wrong_case), Decision::ImplicitDeny);
 }
+
+// --- Role ARN principals match the role's sessions (G3) -------------
+
+fn bucket_policy_for(effect: &str, principal_arn: &str) -> PolicyDocument {
+    doc(json!({
+        "Statement": [{
+            "Effect": effect,
+            "Principal": {"AWS": principal_arn},
+            "Action": "s3:GetObject",
+            "Resource": "arn:aws:s3:::bucket/key"
+        }]
+    }))
+}
+
+fn eval_bucket(policy: &PolicyDocument, principal: &Principal, account: &str) -> Decision {
+    let identity = doc(allow_get_wildcard());
+    let r = req(principal, "s3:GetObject", "arn:aws:s3:::bucket/key");
+    // Resource-only grants are tested with no identity policy; the Deny
+    // variants with an identity Allow, so only the bucket policy can deny.
+    if policy
+        .statements
+        .iter()
+        .any(|s| matches!(s.effect, Effect::Deny))
+    {
+        evaluate_with_resource_policy(&[identity], Some(policy), &r, account)
+    } else {
+        evaluate_with_resource_policy(&[], Some(policy), &r, account)
+    }
+}
+
+#[test]
+fn role_arn_principal_allows_every_session_of_the_role() {
+    let policy = bucket_policy_for("Allow", "arn:aws:iam::111111111111:role/app");
+    for session in ["app/task-1", "app/9f3c2a"] {
+        let p = assumed_role_principal(ACCT_A, session);
+        assert_eq!(
+            eval_bucket(&policy, &p, ACCT_A),
+            Decision::Allow,
+            "{session}"
+        );
+    }
+    // Another role's session, and the same role name in another account,
+    // are not the named role.
+    let other = assumed_role_principal(ACCT_A, "app2/task-1");
+    assert_eq!(eval_bucket(&policy, &other, ACCT_A), Decision::ImplicitDeny);
+    let foreign = assumed_role_principal(ACCT_B, "app/task-1");
+    assert_eq!(
+        eval_bucket(&policy, &foreign, ACCT_A),
+        Decision::ImplicitDeny
+    );
+    // A user is never a role session.
+    let user = principal_in(ACCT_A, "app");
+    assert_eq!(eval_bucket(&policy, &user, ACCT_A), Decision::ImplicitDeny);
+}
+
+#[test]
+fn role_arn_principal_deny_applies_to_every_session_of_the_role() {
+    let policy = bucket_policy_for("Deny", "arn:aws:iam::111111111111:role/app");
+    let p = assumed_role_principal(ACCT_A, "app/task-1");
+    assert_eq!(eval_bucket(&policy, &p, ACCT_A), Decision::ExplicitDeny);
+    let other = assumed_role_principal(ACCT_A, "other/task-1");
+    assert_eq!(eval_bucket(&policy, &other, ACCT_A), Decision::Allow);
+}
+
+#[test]
+fn session_arn_principal_matches_only_that_session() {
+    let policy = bucket_policy_for(
+        "Allow",
+        "arn:aws:sts::111111111111:assumed-role/app/task-1",
+    );
+    let same = assumed_role_principal(ACCT_A, "app/task-1");
+    assert_eq!(eval_bucket(&policy, &same, ACCT_A), Decision::Allow);
+    let sibling = assumed_role_principal(ACCT_A, "app/task-2");
+    assert_eq!(
+        eval_bucket(&policy, &sibling, ACCT_A),
+        Decision::ImplicitDeny
+    );
+}
+
+#[test]
+fn pathed_role_principal_needs_the_role_path() {
+    // The session ARN carries no path; the IAM adapter puts the stored role
+    // ARN (path included) in `aws:PrincipalArn`, which decides the match.
+    let p = assumed_role_principal(ACCT_A, "svc/task-1");
+    let mut r = req(&p, "s3:GetObject", "arn:aws:s3:::bucket/key");
+    r.context.aws_principal_arn = Some("arn:aws:iam::111111111111:role/team/svc".into());
+    let pathed = bucket_policy_for("Allow", "arn:aws:iam::111111111111:role/team/svc");
+    assert_eq!(
+        evaluate_with_resource_policy(&[], Some(&pathed), &r, ACCT_A),
+        Decision::Allow
+    );
+    let pathless = bucket_policy_for("Allow", "arn:aws:iam::111111111111:role/svc");
+    assert_eq!(
+        evaluate_with_resource_policy(&[], Some(&pathless), &r, ACCT_A),
+        Decision::ImplicitDeny
+    );
+    // A context naming a different role is ignored: the session's own role
+    // (path-less) is used instead.
+    r.context.aws_principal_arn = Some("arn:aws:iam::111111111111:role/team/other".into());
+    assert_eq!(
+        evaluate_with_resource_policy(&[], Some(&pathless), &r, ACCT_A),
+        Decision::Allow
+    );
+}
+
+#[test]
+fn not_principal_role_arn_exempts_its_sessions() {
+    let policy = doc(json!({
+        "Statement": [{
+            "Effect": "Deny",
+            "NotPrincipal": {"AWS": "arn:aws:iam::111111111111:role/app"},
+            "Action": "s3:GetObject",
+            "Resource": "arn:aws:s3:::bucket/key"
+        }]
+    }));
+    let identity = doc(allow_get_wildcard());
+    let vault = assumed_role_principal(ACCT_A, "app/task-1");
+    let r = req(&vault, "s3:GetObject", "arn:aws:s3:::bucket/key");
+    assert_eq!(
+        evaluate_with_resource_policy(&[identity.clone()], Some(&policy), &r, ACCT_A),
+        Decision::Allow
+    );
+    let other = assumed_role_principal(ACCT_A, "other/task-1");
+    let r = req(&other, "s3:GetObject", "arn:aws:s3:::bucket/key");
+    assert_eq!(
+        evaluate_with_resource_policy(&[identity], Some(&policy), &r, ACCT_A),
+        Decision::ExplicitDeny
+    );
+}
+
+#[test]
+fn kms_key_policy_role_grant_is_direct_for_its_sessions() {
+    // No account-root delegation: only the direct role grant can allow.
+    let key_policy = doc(json!({
+        "Statement": [{
+            "Effect": "Allow",
+            "Principal": {"AWS": "arn:aws:iam::123456789012:role/app"},
+            "Action": ["kms:GenerateDataKey", "kms:Decrypt"],
+            "Resource": "*"
+        }]
+    }));
+    let vault = assumed_role_principal(KMS_ACCT, "app/ecs-task-id");
+    for action in ["kms:GenerateDataKey", "kms:Decrypt"] {
+        let r = req(&vault, action, KMS_KEY_ARN);
+        assert_eq!(
+            evaluate_with_resource_policy(&[], Some(&key_policy), &r, KMS_ACCT),
+            Decision::Allow,
+            "{action}"
+        );
+    }
+    let other = assumed_role_principal(KMS_ACCT, "other/ecs-task-id");
+    let r = req(&other, "kms:Decrypt", KMS_KEY_ARN);
+    assert_eq!(
+        evaluate_with_resource_policy(&[kms_identity_allow()], Some(&key_policy), &r, KMS_ACCT),
+        Decision::ImplicitDeny
+    );
+}
+
+#[test]
+fn principal_arn_for_conditions_resolves_the_role_path() {
+    let mut state = IamState::new(ACCT_A);
+    state.roles.insert(
+        "svc".into(),
+        crate::state::IamRole {
+            role_name: "svc".into(),
+            role_id: "AROASVC".into(),
+            arn: "arn:aws:iam::111111111111:role/team/svc".into(),
+            path: "/team/".into(),
+            assume_role_policy_document: "{}".into(),
+            created_at: chrono::Utc::now(),
+            description: None,
+            max_session_duration: 3600,
+            tags: Vec::new(),
+            permissions_boundary: None,
+        },
+    );
+    let pathed = assumed_role_principal(ACCT_A, "svc/task-1");
+    assert_eq!(
+        principal_arn_for_conditions(Some(&state), &pathed),
+        "arn:aws:iam::111111111111:role/team/svc"
+    );
+    assert_eq!(
+        principal_arn_for_conditions(None, &pathed),
+        "arn:aws:iam::111111111111:role/svc"
+    );
+    let unknown = assumed_role_principal(ACCT_A, "gone/task-1");
+    assert_eq!(
+        principal_arn_for_conditions(Some(&state), &unknown),
+        "arn:aws:iam::111111111111:role/gone"
+    );
+    let user = principal_in(ACCT_A, "alice");
+    assert_eq!(principal_arn_for_conditions(Some(&state), &user), user.arn);
+}

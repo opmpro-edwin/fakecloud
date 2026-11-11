@@ -51,7 +51,7 @@ impl IamPolicyEvaluator for IamPolicyEvaluatorImpl {
             principal,
             action: action.action_string(),
             resource: action.resource.clone(),
-            context: context.clone(),
+            context: with_role_principal_arn(context, state, principal),
         };
         decision_to_core(evaluator::evaluate_with_gates_and_scps(
             &identity_policies,
@@ -84,7 +84,7 @@ impl IamPolicyEvaluator for IamPolicyEvaluatorImpl {
             principal,
             action: action.action_string(),
             resource: action.resource.clone(),
-            context: context.clone(),
+            context: with_role_principal_arn(context, state, principal),
         };
         let resource_policy = resource_policy_json.map(evaluator::PolicyDocument::parse);
         decision_to_core(evaluator::evaluate_with_resource_policy_and_gates_and_scps(
@@ -144,6 +144,24 @@ impl IamPolicyEvaluator for IamPolicyEvaluatorImpl {
         let policy = evaluator::PolicyDocument::parse(json);
         decision_to_core(evaluator::evaluate_resource_policy_only(&policy, &request))
     }
+}
+
+/// `context` with `aws:PrincipalArn` of an assumed-role caller set to its
+/// role's IAM ARN, path included (`state` is the caller's account). Dispatch
+/// only knows the session ARN, which carries no role path.
+fn with_role_principal_arn(
+    context: &ConditionContext,
+    state: &crate::state::IamState,
+    principal: &Principal,
+) -> ConditionContext {
+    let mut context = context.clone();
+    if principal.principal_type == PrincipalType::AssumedRole {
+        context.aws_principal_arn = Some(evaluator::principal_arn_for_conditions(
+            Some(state),
+            principal,
+        ));
+    }
+    context
 }
 
 /// A synthetic principal standing in for an unsigned (anonymous) caller.
@@ -776,6 +794,124 @@ mod tests {
                 None
             ),
             IamDecision::ImplicitDeny
+        );
+    }
+
+    // --- aws:PrincipalArn of a role session is the role ARN (G2) --------
+
+    fn add_role(state: &mut IamState, name: &str, path: &str) {
+        let arn = format!("arn:aws:iam::123456789012:role{path}{name}");
+        state.roles.insert(
+            name.into(),
+            crate::state::IamRole {
+                role_name: name.into(),
+                role_id: format!("AROA{name}"),
+                arn,
+                path: path.into(),
+                assume_role_policy_document: "{}".into(),
+                created_at: Utc::now(),
+                description: None,
+                max_session_duration: 3600,
+                tags: Vec::new(),
+                permissions_boundary: None,
+            },
+        );
+        state
+            .role_inline_policies
+            .entry(name.into())
+            .or_default()
+            .insert(
+                "s3".into(),
+                r#"{"Statement":[{"Effect":"Allow","Action":"s3:*","Resource":"*"}]}"#.into(),
+            );
+    }
+
+    fn session(role: &str, session: &str) -> Principal {
+        Principal {
+            arn: format!("arn:aws:sts::123456789012:assumed-role/{role}/{session}"),
+            user_id: format!("AROA{role}:{session}"),
+            account_id: "123456789012".into(),
+            principal_type: PrincipalType::AssumedRole,
+            source_identity: None,
+            tags: None,
+        }
+    }
+
+    /// The `OnlyVault` bucket-policy shape: deny object access to every
+    /// principal whose `aws:PrincipalArn` is not one of the vault roles.
+    fn only_vault_policy(allowed: &[&str]) -> String {
+        serde_json::json!({
+            "Statement": [{
+                "Effect": "Deny",
+                "Principal": "*",
+                "Action": ["s3:GetObject", "s3:PutObject"],
+                "Resource": "arn:aws:s3:::bucket/*",
+                "Condition": {"ArnNotEquals": {"aws:PrincipalArn": allowed}}
+            }]
+        })
+        .to_string()
+    }
+
+    fn eval_only_vault(eval: &IamPolicyEvaluatorImpl, p: &Principal, policy: &str) -> IamDecision {
+        let action = IamAction {
+            service: "s3",
+            action: "GetObject",
+            resource: "arn:aws:s3:::bucket/key".into(),
+        };
+        // Dispatch builds the context from the principal; it knows only
+        // the path-less role ARN.
+        let context = ConditionContext {
+            aws_principal_arn: Some(p.condition_principal_arn()),
+            ..Default::default()
+        };
+        eval.evaluate_with_resource_policy(
+            p,
+            &action,
+            &context,
+            Some(policy),
+            "123456789012",
+            &[],
+            None,
+        )
+    }
+
+    #[test]
+    fn principal_arn_condition_sees_the_role_arn_of_a_session() {
+        let shared = setup();
+        {
+            let mut mas = shared.write();
+            let state = mas.get_or_create("123456789012");
+            add_role(state, "app", "/");
+            add_role(state, "other", "/");
+        }
+        let eval = IamPolicyEvaluatorImpl::new(shared);
+        let policy = only_vault_policy(&["arn:aws:iam::123456789012:role/app"]);
+        assert_eq!(
+            eval_only_vault(&eval, &session("app", "task-1"), &policy),
+            IamDecision::Allow
+        );
+        assert_eq!(
+            eval_only_vault(&eval, &session("other", "task-1"), &policy),
+            IamDecision::ExplicitDeny
+        );
+    }
+
+    #[test]
+    fn principal_arn_condition_includes_the_role_path() {
+        let shared = setup();
+        {
+            let mut mas = shared.write();
+            let state = mas.get_or_create("123456789012");
+            add_role(state, "app", "/team/");
+        }
+        let eval = IamPolicyEvaluatorImpl::new(shared);
+        let vault = session("app", "task-1");
+        let pathed = only_vault_policy(&["arn:aws:iam::123456789012:role/team/app"]);
+        assert_eq!(eval_only_vault(&eval, &vault, &pathed), IamDecision::Allow);
+        let pathless = only_vault_policy(&["arn:aws:iam::123456789012:role/app"]);
+        assert_eq!(
+            eval_only_vault(&eval, &vault, &pathless),
+            IamDecision::ExplicitDeny
         );
     }
 }

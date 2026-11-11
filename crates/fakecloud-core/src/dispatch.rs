@@ -943,7 +943,10 @@ async fn dispatch_inner(
                                     // existing tooling that decodes deny
                                     // reasons works against fakecloud.
                                     let context_summary = serde_json::json!({
-                                        "aws:PrincipalArn": principal.arn,
+                                        "aws:PrincipalArn": condition_context
+                                            .aws_principal_arn
+                                            .clone()
+                                            .unwrap_or_else(|| principal.arn.clone()),
                                         "aws:PrincipalAccount": principal.account_id,
                                         "aws:RequestedRegion": condition_context
                                             .aws_requested_region
@@ -2220,7 +2223,9 @@ fn build_condition_context(
     ConditionContext {
         aws_username: aws_username_from_principal(principal),
         aws_userid: Some(principal.user_id.clone()),
-        aws_principal_arn: Some(principal.arn.clone()),
+        // A role session's `aws:PrincipalArn` is the role's ARN, not the
+        // session ARN, as on AWS.
+        aws_principal_arn: Some(principal.condition_principal_arn()),
         aws_principal_account: Some(principal.account_id.clone()),
         aws_principal_type: Some(principal_type_label(principal.principal_type).to_string()),
         aws_source_ip: remote_addr.map(|sa| sa.ip()),
@@ -2778,6 +2783,26 @@ mod tests {
         assert_eq!(ctx.aws_secure_transport, Some(false));
         assert!(ctx.aws_current_time.is_some());
         assert!(ctx.aws_epoch_time.is_some());
+    }
+
+    #[test]
+    fn build_condition_context_principal_arn_of_a_session_is_its_role() {
+        let p = Principal {
+            arn: "arn:aws:sts::123456789012:assumed-role/app/task-1".into(),
+            user_id: "AROAVAULT:task-1".into(),
+            account_id: "123456789012".into(),
+            principal_type: PrincipalType::AssumedRole,
+            source_identity: None,
+            tags: None,
+        };
+        let ctx = build_condition_context(&p, None, "us-east-1", false);
+        assert_eq!(
+            ctx.aws_principal_arn.as_deref(),
+            Some("arn:aws:iam::123456789012:role/app")
+        );
+        // aws:userid keeps the session's id.
+        assert_eq!(ctx.aws_userid.as_deref(), Some("AROAVAULT:task-1"));
+        assert_eq!(ctx.aws_principal_type.as_deref(), Some("AssumedRole"));
     }
 
     #[test]

@@ -792,6 +792,10 @@ fn evaluate_inner_scoped(
     ignore_account_wide: bool,
 ) -> Decision {
     let mut allowed = false;
+    // The IAM role behind an assumed-role caller: a role ARN in a resource
+    // policy's Principal names every session of that role.
+    let session_role = session_role_arn(request);
+    let session_role = session_role.as_deref();
     for policy in policies {
         for statement in &policy.statements {
             // Principal / NotPrincipal gate. Identity policies never
@@ -813,7 +817,12 @@ fn evaluate_inner_scoped(
                     }
                 }
                 PrincipalPattern::Principal(refs) => {
-                    if !principal_matches_scoped(refs, request.principal, ignore_account_wide) {
+                    if !principal_matches_scoped(
+                        refs,
+                        request.principal,
+                        session_role,
+                        ignore_account_wide,
+                    ) {
                         continue;
                     }
                 }
@@ -827,7 +836,7 @@ fn evaluate_inner_scoped(
                         continue;
                     }
                     // NotPrincipal: statement applies when caller does NOT match any entry.
-                    if principal_matches(refs, request.principal) {
+                    if principal_matches_scoped(refs, request.principal, session_role, false) {
                         continue;
                     }
                 }
@@ -866,17 +875,19 @@ fn evaluate_inner_scoped(
 /// Check whether any entry in a parsed `Principal` list matches the
 /// calling principal. An empty list never matches — that's how we
 /// keep unrecognized principal types from silently granting.
-fn principal_matches(refs: &[PrincipalRef], principal: &Principal) -> bool {
-    principal_matches_scoped(refs, principal, false)
-}
-
-/// As [`principal_matches`], but when `ignore_account_wide` is set the
-/// account-wide entries (`"AWS": "*"` and `arn:aws:iam::<acct>:root`) do not
-/// match. KMS evaluation uses this to tell a *direct* grant of a specific
-/// principal apart from the default "Enable IAM" account-root delegation.
+///
+/// `session_role` is the IAM role ARN behind an assumed-role caller (see
+/// [`session_role_arn`]): as on AWS, a role ARN entry matches every session
+/// of that role, while a session ARN entry matches only that session.
+///
+/// When `ignore_account_wide` is set the account-wide entries (`"AWS": "*"`
+/// and `arn:aws:iam::<acct>:root`) do not match. KMS evaluation uses this to
+/// tell a *direct* grant of a specific principal apart from the default
+/// "Enable IAM" account-root delegation.
 fn principal_matches_scoped(
     refs: &[PrincipalRef],
     principal: &Principal,
+    session_role: Option<&str>,
     ignore_account_wide: bool,
 ) -> bool {
     refs.iter().any(|r| match r {
@@ -884,7 +895,7 @@ fn principal_matches_scoped(
         PrincipalRef::AwsAccountRoot(account) => {
             !ignore_account_wide && &principal.account_id == account
         }
-        PrincipalRef::AwsArn(arn) => &principal.arn == arn,
+        PrincipalRef::AwsArn(arn) => &principal.arn == arn || session_role == Some(arn.as_str()),
         PrincipalRef::Service(service) => principal_is_service(principal, service),
         PrincipalRef::Federated(provider) => principal_is_federated(principal, provider),
         PrincipalRef::CanonicalUser(id) => principal_is_canonical_user(principal, id),
@@ -1247,6 +1258,58 @@ fn role_name_from_assumed_role_arn(arn: &str) -> Option<&str> {
     // `arn:aws:sts::<account>:assumed-role/<role-name>/<session>`
     let after = arn.rsplit_once(":assumed-role/")?.1;
     Some(after.split('/').next().unwrap_or(after))
+}
+
+/// `aws:PrincipalArn` for `principal`, as AWS reports it: for an assumed-role
+/// session the IAM ARN of its role, including the role's path when `state`
+/// (the session's account) holds the role; every other principal reports its
+/// own ARN.
+pub fn principal_arn_for_conditions(state: Option<&IamState>, principal: &Principal) -> String {
+    if principal.principal_type == PrincipalType::AssumedRole {
+        if let Some(pathless) = fakecloud_core::auth::assumed_role_iam_arn(&principal.arn) {
+            let stored = role_name_from_assumed_role_arn(&principal.arn)
+                .and_then(|name| state?.roles.get(name))
+                .map(|role| role.arn.clone())
+                .filter(|arn| same_role(arn, &pathless));
+            return stored.unwrap_or(pathless);
+        }
+    }
+    principal.arn.clone()
+}
+
+/// The IAM role ARN behind an assumed-role caller, or `None` for any other
+/// principal. The session ARN carries no role path, so the path-aware role ARN
+/// the IAM adapter writes into `aws:PrincipalArn` (see
+/// [`principal_arn_for_conditions`]) is used when it names the same role;
+/// otherwise the path-less role ARN.
+fn session_role_arn(request: &EvalRequest<'_>) -> Option<String> {
+    if request.principal.principal_type != PrincipalType::AssumedRole {
+        return None;
+    }
+    let pathless = fakecloud_core::auth::assumed_role_iam_arn(&request.principal.arn)?;
+    Some(
+        request
+            .context
+            .aws_principal_arn
+            .as_deref()
+            .filter(|arn| same_role(arn, &pathless))
+            .map_or(pathless.clone(), str::to_string),
+    )
+}
+
+/// True when the IAM role ARN `arn` (any path) names the same role as the
+/// path-less `arn:<partition>:iam::<acct>:role/<name>` ARN `pathless`.
+fn same_role(arn: &str, pathless: &str) -> bool {
+    let Some((prefix, name)) = pathless.rsplit_once(":role/") else {
+        return false;
+    };
+    let Some(rest) = arn
+        .strip_prefix(prefix)
+        .and_then(|r| r.strip_prefix(":role/"))
+    else {
+        return false;
+    };
+    rest.rsplit('/').next() == Some(name)
 }
 
 #[cfg(test)]

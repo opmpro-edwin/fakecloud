@@ -166,8 +166,14 @@ impl StsService {
                 },
             };
 
+            // A role session chaining into another role is evaluated with
+            // its role's ARN as `aws:PrincipalArn`, as on AWS.
+            let caller_condition_arn = crate::evaluator::principal_arn_for_conditions(
+                accounts.get(&caller_principal.account_id),
+                &caller_principal,
+            );
             let mut context = RequestContext {
-                aws_principal_arn: Some(caller_principal.arn.clone()),
+                aws_principal_arn: Some(caller_condition_arn),
                 aws_principal_account: Some(caller_principal.account_id.clone()),
                 aws_principal_type: Some(caller_principal.principal_type.as_str().to_string()),
                 aws_mfa_present: Some(mfa_present),

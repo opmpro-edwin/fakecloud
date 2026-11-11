@@ -110,6 +110,46 @@ impl Principal {
     pub fn is_root(&self) -> bool {
         matches!(self.principal_type, PrincipalType::Root) || self.arn.ends_with(":root")
     }
+
+    /// The value AWS reports as `aws:PrincipalArn` for this caller. For an
+    /// assumed-role session it is the role's IAM ARN, not the session ARN
+    /// (`arn:aws:sts::<acct>:assumed-role/<role>/<session>` ->
+    /// `arn:aws:iam::<acct>:role/<role>`); every other principal reports its
+    /// own ARN. A session ARN does not carry the role's path, so this is the
+    /// path-less form; the IAM evaluator substitutes the stored role ARN
+    /// (path included) when it knows the role.
+    pub fn condition_principal_arn(&self) -> String {
+        if self.principal_type == PrincipalType::AssumedRole {
+            if let Some(role_arn) = assumed_role_iam_arn(&self.arn) {
+                return role_arn;
+            }
+        }
+        self.arn.clone()
+    }
+}
+
+/// The path-less IAM role ARN behind an assumed-role session ARN:
+/// `arn:<partition>:sts::<acct>:assumed-role/<role>/<session>` ->
+/// `arn:<partition>:iam::<acct>:role/<role>`. `None` for anything that is not
+/// a well-formed assumed-role session ARN.
+pub fn assumed_role_iam_arn(session_arn: &str) -> Option<String> {
+    let mut parts = session_arn.splitn(6, ':');
+    let (Some("arn"), Some(partition), Some("sts"), Some(_region), Some(account), Some(resource)) = (
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    ) else {
+        return None;
+    };
+    let rest = resource.strip_prefix("assumed-role/")?;
+    let (role_name, session) = rest.split_once('/')?;
+    if partition.is_empty() || account.is_empty() || role_name.is_empty() || session.is_empty() {
+        return None;
+    }
+    Some(format!("arn:{partition}:iam::{account}:role/{role_name}"))
 }
 
 /// Credentials resolved from an access key ID.
@@ -1147,6 +1187,54 @@ mod tests {
             PrincipalType::from_arn("arn:aws:iam::123456789012:root"),
             PrincipalType::Root
         );
+    }
+
+    #[test]
+    fn assumed_role_iam_arn_maps_session_to_role() {
+        assert_eq!(
+            assumed_role_iam_arn("arn:aws:sts::123456789012:assumed-role/app/task-1")
+                .as_deref(),
+            Some("arn:aws:iam::123456789012:role/app")
+        );
+        assert_eq!(
+            assumed_role_iam_arn("arn:aws-cn:sts::123456789012:assumed-role/R/s").as_deref(),
+            Some("arn:aws-cn:iam::123456789012:role/R")
+        );
+        assert_eq!(
+            assumed_role_iam_arn("arn:aws:iam::123456789012:role/R"),
+            None
+        );
+        assert_eq!(
+            assumed_role_iam_arn("arn:aws:sts::123456789012:assumed-role/R"),
+            None
+        );
+        assert_eq!(
+            assumed_role_iam_arn("arn:aws:sts::123456789012:federated-user/bob"),
+            None
+        );
+    }
+
+    #[test]
+    fn condition_principal_arn_is_role_arn_only_for_sessions() {
+        let mk = |arn: &str| Principal {
+            arn: arn.to_string(),
+            user_id: "id".into(),
+            account_id: "123456789012".into(),
+            principal_type: PrincipalType::from_arn(arn),
+            source_identity: None,
+            tags: None,
+        };
+        assert_eq!(
+            mk("arn:aws:sts::123456789012:assumed-role/app/t").condition_principal_arn(),
+            "arn:aws:iam::123456789012:role/app"
+        );
+        for arn in [
+            "arn:aws:iam::123456789012:user/alice",
+            "arn:aws:iam::123456789012:root",
+            "arn:aws:sts::123456789012:federated-user/bob",
+        ] {
+            assert_eq!(mk(arn).condition_principal_arn(), arn);
+        }
     }
 
     #[test]
