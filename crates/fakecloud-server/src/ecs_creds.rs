@@ -292,12 +292,19 @@ fn is_link_local_host(headers: &axum::http::HeaderMap) -> bool {
 
 /// Answer a request addressed to the agent's link-local address the way the
 /// agent does: task-role credentials at `/v2/credentials/<task-id>` (a missing
-/// ID is `NoIdInRequest`), and nothing else.
+/// ID is `NoIdInRequest`), task metadata at `/v3/<task-id>` and
+/// `/v4/<task-id>` (`ECS_CONTAINER_METADATA_URI[_V4]`, the same documents as
+/// `/_fakecloud/ecs/v3|v4/<task-id>`), and nothing else.
 fn respond_link_local(
     creds: &EcsTaskCredentials,
     method: &axum::http::Method,
     path: &str,
 ) -> Response {
+    if crate::ecs_metadata::is_link_local_path(path) {
+        return get_or_head(method, || {
+            crate::ecs_metadata::link_local_response(&creds.ecs, path)
+        });
+    }
     let Some(rest) = path.strip_prefix(V2_CREDENTIALS_PATH) else {
         return (StatusCode::NOT_FOUND, "404 page not found\n").into_response();
     };
@@ -309,15 +316,20 @@ fn respond_link_local(
             None => return (StatusCode::NOT_FOUND, "404 page not found\n").into_response(),
         },
     };
+    get_or_head(method, || creds.respond_relative(task_id))
+}
+
+/// `respond()` for a GET; for a HEAD, its status and headers with no body;
+/// any other method is not allowed (and `respond` is not called).
+fn get_or_head(method: &axum::http::Method, respond: impl FnOnce() -> Response) -> Response {
     if method == axum::http::Method::HEAD {
-        // Same status and headers as GET, no body.
-        let (parts, _) = creds.respond_relative(task_id).into_parts();
+        let (parts, _) = respond().into_parts();
         return Response::from_parts(parts, axum::body::Body::empty());
     }
     if method != axum::http::Method::GET {
         return StatusCode::METHOD_NOT_ALLOWED.into_response();
     }
-    creds.respond_relative(task_id)
+    respond()
 }
 
 /// The `Authorization` header of a credentials request, where the AWS SDKs
@@ -332,12 +344,14 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// Serve the ECS agent's link-local credentials surface on the main listener.
+/// Serve the ECS agent's link-local surface (task-role credentials and task
+/// metadata) on the main listener.
 ///
 /// Task containers reach fakecloud at `169.254.170.2:80`: the task's network
 /// namespace NATs that address to fakecloud's port (see the ECS runtime), so
 /// the request arrives here with `Host: 169.254.170.2`. Such requests are
-/// answered from the agent's surface; everything else falls through.
+/// answered from the agent's surface ([`respond_link_local`]); everything
+/// else falls through.
 pub async fn link_local_host_middleware(
     axum::extract::State(creds): axum::extract::State<Arc<EcsTaskCredentials>>,
     req: axum::extract::Request,
@@ -352,7 +366,7 @@ pub async fn link_local_host_middleware(
             tracing::warn!(
                 target: "fakecloud::iam::audit",
                 peer = ?peer,
-                "agent credentials request on the main port from outside a container network; refused under --iam strict"
+                "agent link-local request on the main port from outside a container network; refused under --iam strict"
             );
             return CredentialsError::Unauthorized.into_response();
         }
@@ -809,6 +823,102 @@ mod tests {
             .is_none());
         let (status, body) = call(&app, "HEAD", "169.254.170.2", "/v2/credentials/nope").await;
         assert_eq!((status, body.as_str()), (StatusCode::BAD_REQUEST, ""));
+    }
+
+    #[tokio::test]
+    async fn link_local_host_serves_the_task_metadata_paths() {
+        let (ecs, _iam, endpoint) = setup();
+        add_task(&ecs, ACCOUNT, "task1", Some(ROLE));
+        let app = app(endpoint);
+
+        for host in ["169.254.170.2", "169.254.170.2:80"] {
+            for (path, document) in [
+                (
+                    "/v3/task1",
+                    crate::ecs_metadata::v3_response as fn(&_, &_) -> _,
+                ),
+                ("/v4/task1", crate::ecs_metadata::v4_response),
+            ] {
+                let (status, body) = call(&app, "GET", host, path).await;
+                assert_eq!(status, StatusCode::OK, "{host}{path}: {body}");
+                let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(
+                    json["TaskARN"],
+                    "arn:aws:ecs:us-east-1:123456789012:task/c/task1"
+                );
+                assert_eq!(json["Cluster"], "c");
+                // The same document as the `/_fakecloud/ecs/v3|v4/<id>` route.
+                let expected = document(&ecs, "task1");
+                let expected = axum::body::to_bytes(expected.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                assert_eq!(body.as_bytes(), &expected[..], "{path}");
+            }
+        }
+        // v4 carries the v4-only fields; v3 doesn't.
+        let (_, v4) = call(&app, "GET", "169.254.170.2", "/v4/task1").await;
+        assert!(v4.contains("\"Limits\""), "{v4}");
+        let (_, v3) = call(&app, "GET", "169.254.170.2", "/v3/task1").await;
+        assert!(!v3.contains("\"Limits\""), "{v3}");
+
+        // Unknown task: the `/_fakecloud/ecs/...` route's 404.
+        let (status, body) = call(&app, "GET", "169.254.170.2", "/v4/nope").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body.contains("task not found"), "{body}");
+        // HEAD: GET's status, no body; other methods are refused.
+        let (status, body) = call(&app, "HEAD", "169.254.170.2", "/v3/task1").await;
+        assert_eq!((status, body.as_str()), (StatusCode::OK, ""));
+        let (status, _) = call(&app, "POST", "169.254.170.2", "/v4/task1").await;
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+        // Paths fakecloud doesn't serve stay 404 on the link-local address.
+        for path in [
+            "/v4/",
+            "/v4",
+            "/v3/task1/",
+            "/v4/task1/stats",
+            "/v5/task1",
+            "/v4task1",
+        ] {
+            let (status, _) = call(&app, "GET", "169.254.170.2", path).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+        }
+        // Other hosts still fall through to the app.
+        let (status, body) = call(&app, "GET", "localhost:4566", "/v4/task1").await;
+        assert_eq!((status, body.as_str()), (StatusCode::OK, "fallthrough"));
+    }
+
+    #[tokio::test]
+    async fn strict_middleware_restricts_the_metadata_paths_like_credentials() {
+        use tower::ServiceExt;
+        let (ecs, iam, _) = setup();
+        let endpoint = EcsTaskCredentials::with_authorization(ecs.clone(), iam, ACCOUNT, true);
+        add_task(&ecs, ACCOUNT, "t", Some(ROLE));
+        let app = app(endpoint);
+        let req = |path: &str, peer: &str| {
+            let mut r = axum::http::Request::builder()
+                .uri(path)
+                .header(axum::http::header::HOST, LINK_LOCAL_HOST)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            r.extensions_mut().insert(axum::extract::ConnectInfo(
+                peer.parse::<std::net::SocketAddr>().unwrap(),
+            ));
+            r
+        };
+        for path in ["/v3/t", "/v4/t"] {
+            let resp = app
+                .clone()
+                .oneshot(req(path, "127.0.0.1:5555"))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{path}");
+            let resp = app
+                .clone()
+                .oneshot(req(path, "172.17.0.2:5555"))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{path}");
+        }
     }
 
     #[tokio::test]

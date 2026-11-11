@@ -20,6 +20,7 @@ mod dns;
 mod dynamodb_streams_lambda_poller;
 mod ec2_imds;
 mod ecs_creds;
+mod ecs_metadata;
 mod imds;
 mod introspection;
 mod kinesis_lambda_poller;
@@ -11024,97 +11025,26 @@ async fn main() {
             }),
         )
         .route(
+            // Task metadata (`ECS_CONTAINER_METADATA_URI_V4` when the task's
+            // network can't reach the agent's `169.254.170.2`; otherwise the
+            // link-local `/v4/<task-id>`, see `ecs_creds`).
             "/_fakecloud/ecs/v4/{task_id}",
             axum::routing::get({
                 let ec = ecs_introspection_state.clone();
                 move |axum::extract::Path(task_id): axum::extract::Path<String>| {
                     let ec = ec.clone();
-                    async move {
-                        let accounts = ec.read();
-                        for (_, state) in accounts.iter() {
-                            if let Some(t) = state.tasks.get(&task_id) {
-                                let body = serde_json::json!({
-                                    "Cluster": t.cluster_name,
-                                    "TaskARN": t.task_arn,
-                                    "Family": t.family,
-                                    "Revision": t.revision,
-                                    "DesiredStatus": t.desired_status,
-                                    "KnownStatus": t.last_status,
-                                    "Limits": {
-                                        "CPU": t.cpu.as_ref().and_then(|c| c.parse::<f64>().ok()),
-                                        "Memory": t.memory.as_ref().and_then(|m| m.parse::<i64>().ok()),
-                                    },
-                                    "PullStartedAt": t.pull_started_at.map(|d| d.to_rfc3339()),
-                                    "PullStoppedAt": t.pull_stopped_at.map(|d| d.to_rfc3339()),
-                                    "CreatedAt": t.created_at.to_rfc3339(),
-                                    "StartedAt": t.started_at.map(|d| d.to_rfc3339()),
-                                    "StoppedAt": t.stopped_at.map(|d| d.to_rfc3339()),
-                                    "AvailabilityZone": "us-east-1a",
-                                    "Containers": t.containers.iter().map(|c| serde_json::json!({
-                                        "DockerId": c.runtime_id,
-                                        "Name": c.name,
-                                        "DockerName": c.runtime_id.as_ref().map(|id| format!("ecs-{}", id)),
-                                        "Image": c.image,
-                                        "ImageID": c.image_digest,
-                                        "Ports": c.network_bindings,
-                                        "Labels": {},
-                                        "DesiredStatus": c.last_status,
-                                        "KnownStatus": c.last_status,
-                                        "ExitCode": c.exit_code,
-                                        "Health": {
-                                            "status": c.health_status.as_deref().unwrap_or("UNKNOWN"),
-                                        },
-                                    })).collect::<Vec<_>>(),
-                                });
-                                return (axum::http::StatusCode::OK, axum::Json(body));
-                            }
-                        }
-                        (
-                            axum::http::StatusCode::NOT_FOUND,
-                            axum::Json(serde_json::json!({"error": "task not found"})),
-                        )
-                    }
+                    async move { ecs_metadata::v4_response(&ec, &task_id) }
                 }
             }),
         )
         .route(
+            // Task metadata v3 (`ECS_CONTAINER_METADATA_URI`), as above.
             "/_fakecloud/ecs/v3/{task_id}",
             axum::routing::get({
                 let ec = ecs_introspection_state.clone();
                 move |axum::extract::Path(task_id): axum::extract::Path<String>| {
                     let ec = ec.clone();
-                    async move {
-                        let accounts = ec.read();
-                        for (_, state) in accounts.iter() {
-                            if let Some(t) = state.tasks.get(&task_id) {
-                                let body = serde_json::json!({
-                                    "Cluster": t.cluster_name,
-                                    "TaskARN": t.task_arn,
-                                    "Family": t.family,
-                                    "Revision": t.revision,
-                                    "DesiredStatus": t.desired_status,
-                                    "KnownStatus": t.last_status,
-                                    "Containers": t.containers.iter().map(|c| serde_json::json!({
-                                        "DockerId": c.runtime_id,
-                                        "Name": c.name,
-                                        "DockerName": c.runtime_id.as_ref().map(|id| format!("ecs-{}", id)),
-                                        "Image": c.image,
-                                        "ImageID": c.image_digest,
-                                        "Ports": c.network_bindings,
-                                        "Labels": {},
-                                        "DesiredStatus": c.last_status,
-                                        "KnownStatus": c.last_status,
-                                        "ExitCode": c.exit_code,
-                                    })).collect::<Vec<_>>(),
-                                });
-                                return (axum::http::StatusCode::OK, axum::Json(body));
-                            }
-                        }
-                        (
-                            axum::http::StatusCode::NOT_FOUND,
-                            axum::Json(serde_json::json!({"error": "task not found"})),
-                        )
-                    }
+                    async move { ecs_metadata::v3_response(&ec, &task_id) }
                 }
             }),
         )
@@ -12825,9 +12755,9 @@ async fn main() {
             cloudfront_viewer_middleware,
         ))
         // Outermost: ECS task containers reach the agent's link-local
-        // credentials address (`169.254.170.2:80`), which their network
-        // namespace NATs to this listener; those requests
-        // (`Host: 169.254.170.2`) get the agent's `/v2/credentials/<task-id>`
+        // address (`169.254.170.2:80`), which their network namespace NATs
+        // to this listener; those requests (`Host: 169.254.170.2`) get the
+        // agent's `/v2/credentials/<task-id>` and `/v3|v4/<task-id>` metadata
         // surface, nothing else, and never reach CloudFront or the AWS API.
         .layer(axum::middleware::from_fn_with_state(
             ecs_task_credentials.clone(),
