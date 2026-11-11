@@ -726,6 +726,20 @@ fn in_container_mode(env_value: Option<String>) -> bool {
         .unwrap_or(false)
 }
 
+/// Basic credentials (`AWS:<password>`) fakecloud's own container runtimes
+/// (ECS tasks, Lambda image functions) pull from its ECR registry with.
+///
+/// The password is a random secret minted once per server process and known
+/// only to it, so the registry can tell these pulls apart from a client's
+/// `docker login`: under `--verify-sigv4` it accepts only this credential or a
+/// token its `GetAuthorizationToken` issued.
+pub fn registry_runtime_basic_credentials() -> String {
+    static PASSWORD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let password =
+        PASSWORD.get_or_init(|| format!("fakecloud-runtime-{}", uuid::Uuid::new_v4().simple()));
+    format!("AWS:{password}")
+}
+
 /// Hostnames fakecloud's bundled ECR/OCI registry can be addressed from a
 /// sibling container or the host, each at `server_port`.
 ///
@@ -974,6 +988,15 @@ mod tests {
             elapsed < CLI_PROBE_TIMEOUT + std::time::Duration::from_secs(5),
             "probe took {elapsed:?}, expected it bounded near {CLI_PROBE_TIMEOUT:?}"
         );
+    }
+
+    #[test]
+    fn registry_runtime_credentials_are_a_stable_per_process_secret() {
+        let a = registry_runtime_basic_credentials();
+        assert_eq!(a, registry_runtime_basic_credentials());
+        let password = a.strip_prefix("AWS:").expect("AWS user");
+        assert!(password.starts_with("fakecloud-runtime-"));
+        assert!(password.len() > "fakecloud-runtime-".len() + 16);
     }
 
     #[test]

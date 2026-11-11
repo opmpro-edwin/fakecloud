@@ -1732,7 +1732,8 @@ fn snapshot_task(state: &SharedEcsState, account_id: &str, task_id: &str) -> Opt
 /// 2026-06-20, 0.B2).
 fn build_local_registry_docker_config(server_port: u16) -> Option<TempDir> {
     let dir = TempDir::new().ok()?;
-    let auth = base64::engine::general_purpose::STANDARD.encode("AWS:fakecloud-ecs-runtime");
+    let auth = base64::engine::general_purpose::STANDARD
+        .encode(fakecloud_core::container_net::registry_runtime_basic_credentials());
     let auths: serde_json::Map<String, serde_json::Value> =
         fakecloud_core::container_net::registry_auth_hosts(server_port)
             .into_iter()

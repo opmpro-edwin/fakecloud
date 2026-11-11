@@ -26,11 +26,21 @@ impl EcrService {
         };
         let endpoint = accounts.endpoint().to_string();
         drop(accounts);
-        let expires_at = (Utc::now() + chrono::Duration::hours(12)).timestamp();
+        let expires = crate::registry_auth::token_expiry(Utc::now());
+        let expires_at = expires.timestamp();
         let authorization_data: Vec<Value> = targets
             .into_iter()
             .map(|_registry_id| {
-                let token = B64.encode(format!("AWS:{}", Uuid::new_v4()).as_bytes());
+                // The token stands for the caller: the registry serves the
+                // caller's account to whoever presents it.
+                let password = Uuid::new_v4().to_string();
+                self.registry_auth().issue(
+                    &password,
+                    &request.account_id,
+                    request.principal.clone(),
+                    expires,
+                );
+                let token = B64.encode(format!("AWS:{password}").as_bytes());
                 json!({
                     "authorizationToken": token,
                     "expiresAt": expires_at,

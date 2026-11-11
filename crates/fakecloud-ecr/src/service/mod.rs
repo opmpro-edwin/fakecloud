@@ -90,6 +90,9 @@ pub struct EcrService {
     /// blobs encrypted under the configured CMK via
     /// `fakecloud_kms::api::encrypt_blob` / `decrypt_blob`.
     kms_state: Option<fakecloud_kms::SharedKmsState>,
+    /// Registry (`/v2/...`) authentication: issued `GetAuthorizationToken`
+    /// tokens and whether they are enforced (`--verify-sigv4`).
+    registry_auth: crate::registry_auth::RegistryAuth,
 }
 
 mod images;
@@ -112,7 +115,21 @@ impl EcrService {
             snapshot_store: None,
             snapshot_lock: Arc::new(AsyncMutex::new(())),
             kms_state: None,
+            registry_auth: Default::default(),
         }
+    }
+
+    /// Enforce registry credentials (`--verify-sigv4`): the registry accepts
+    /// only `AWS:<token>` with an unexpired token this server's
+    /// `GetAuthorizationToken` issued (or fakecloud's own runtime
+    /// credential), and the token decides the account served.
+    pub fn with_verified_registry_auth(mut self, verified: bool) -> Self {
+        self.registry_auth.set_verified(verified);
+        self
+    }
+
+    pub(crate) fn registry_auth(&self) -> &crate::registry_auth::RegistryAuth {
+        &self.registry_auth
     }
 
     pub fn with_snapshot_store(mut self, store: Arc<dyn SnapshotStore>) -> Self {
@@ -225,6 +242,14 @@ impl AwsService for EcrService {
                 if let Some(stream) = request.take_body_stream() {
                     request.body = fakecloud_core::service::drain_request_stream(stream).await?;
                 }
+            }
+            // A verified registry token speaks for the identity that
+            // requested it: serve its account, attribute to its principal.
+            if let Ok(Some(crate::registry_auth::RegistryCaller::Token(token))) =
+                crate::oci::registry_caller(self, &request)
+            {
+                request.account_id = token.account_id;
+                request.principal = token.principal;
             }
             let result = crate::oci::dispatch(self, &request).await;
             // POST/PUT/PATCH/DELETE always mutate. GET to a `blobs/<digest>`

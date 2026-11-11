@@ -1,6 +1,7 @@
 pub mod lifecycle_ticker;
 pub mod oci;
 pub(crate) mod pull_through;
+pub(crate) mod registry_auth;
 pub mod scanner;
 pub(crate) mod service;
 pub mod signing;

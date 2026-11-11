@@ -21,6 +21,7 @@ use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError, Response
 
 use std::path::{Path, PathBuf};
 
+use crate::registry_auth::{basic_credentials, BasicCredentials, RegistryCaller};
 use crate::service::EcrService;
 use crate::state::{Image, Layer, LayerUpload};
 
@@ -155,7 +156,7 @@ pub(crate) async fn dispatch(
         .collect();
     // API version probe: `/v2/` or `/v2`.
     if segs.len() == 1 && segs[0] == "v2" {
-        if !authorized(request)? {
+        if !authorized(service, request)? {
             return Err(unauthorized());
         }
         return Ok(base_response(
@@ -167,7 +168,7 @@ pub(crate) async fn dispatch(
     if segs.is_empty() || segs[0] != "v2" {
         return Err(not_found());
     }
-    if !authorized(request)? {
+    if !authorized(service, request)? {
         return Err(unauthorized());
     }
 
@@ -235,43 +236,46 @@ fn split_name(segs: &[&str]) -> Option<(String, Vec<String>)> {
     None
 }
 
-/// Accept Basic Auth with any token fakecloud issued via
-/// `GetAuthorizationToken`, or the `test*` dev-bypass used elsewhere.
-/// A missing `Authorization` header returns 401 with a
-/// `WWW-Authenticate` challenge so the Docker CLI's two-phase login
-/// flow (`GET /v2/` -> 401 -> Basic retry) works. Wire format:
-/// `Authorization: Basic base64("AWS:<token>")`.
-fn authorized(request: &AwsRequest) -> Result<bool, AwsServiceError> {
-    let Some(header) = request.headers.get("authorization") else {
-        return Ok(false);
-    };
-    let value = header.to_str().map_err(|_| {
-        AwsServiceError::aws_error(
-            StatusCode::BAD_REQUEST,
-            "UNAUTHORIZED",
-            "Bad Authorization header",
-        )
-    })?;
-    if let Some(rest) = value.strip_prefix("Basic ") {
-        let decoded = B64.decode(rest.trim().as_bytes()).map_err(|_| {
+/// Who the registry request authenticated as, or `None` when its
+/// credentials are missing or refused (the caller answers 401 with a
+/// `WWW-Authenticate` challenge so the Docker CLI's two-phase login flow
+/// works: `GET /v2/` -> 401 -> Basic retry). Wire format:
+/// `Authorization: Basic base64("AWS:<token>")`; see
+/// [`crate::registry_auth`] for what each mode accepts.
+pub(crate) fn registry_caller(
+    service: &EcrService,
+    request: &AwsRequest,
+) -> Result<Option<RegistryCaller>, AwsServiceError> {
+    let header = match request.headers.get("authorization") {
+        None => None,
+        Some(v) => Some(v.to_str().map_err(|_| {
             AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
                 "UNAUTHORIZED",
-                "Bad Basic credentials",
+                "Bad Authorization header",
             )
-        })?;
-        let pair = String::from_utf8_lossy(&decoded);
-        let mut parts = pair.splitn(2, ':');
-        let user = parts.next().unwrap_or("");
-        let _pass = parts.next().unwrap_or("");
-        // AWS emits `AWS:<token>`; the legacy CLI uses `AWS:<bearer>`.
-        // Dev bypass: user starts with `test`.
-        return Ok(user == "AWS" || user.starts_with("test"));
+        })?),
+    };
+    match basic_credentials(header) {
+        BasicCredentials::Present { user, password } => {
+            Ok(service.registry_auth().authenticate(&user, &password))
+        }
+        BasicCredentials::Malformed => Err(AwsServiceError::aws_error(
+            StatusCode::BAD_REQUEST,
+            "UNAUTHORIZED",
+            "Bad Basic credentials",
+        )),
+        // SigV4-signed requests (shouldn't happen on /v2/ but allow it --
+        // under `--verify-sigv4` dispatch already verified the signature
+        // and the request runs as its signer).
+        BasicCredentials::Absent => Ok(header
+            .filter(|v| v.starts_with("AWS4-HMAC-SHA256"))
+            .map(|_| RegistryCaller::Signed)),
     }
-    // SigV4-signed requests (shouldn't happen on /v2/ but allow it —
-    // the main dispatcher already validated the signature upstream if
-    // verify_sigv4 is on).
-    Ok(value.starts_with("AWS4-HMAC-SHA256"))
+}
+
+fn authorized(service: &EcrService, request: &AwsRequest) -> Result<bool, AwsServiceError> {
+    Ok(registry_caller(service, request)?.is_some())
 }
 
 fn base_response(status: StatusCode, content_type: &str, body: Vec<u8>) -> AwsResponse {
@@ -1468,54 +1472,142 @@ mod kms_region_tests {
 }
 
 /// `docker login` against the registry under `--verify-sigv4`: the Basic
-/// credentials skip SigV4 verification in dispatch and the registry handler
-/// itself decides.
+/// credentials skip SigV4 verification in dispatch and the registry
+/// authenticates them itself -- an issued, unexpired token whose identity
+/// decides the account served.
 #[cfg(test)]
 mod verify_sigv4_registry_auth_tests {
     use crate::service::EcrService;
-    use crate::state::SharedEcrState;
+    use crate::state::{Repository, SharedEcrState};
     use axum::body::Body;
     use base64::Engine as _;
-    use fakecloud_core::auth::{CredentialResolver, ResolvedCredential};
+    use fakecloud_core::auth::{CredentialResolver, Principal, PrincipalType, ResolvedCredential};
     use fakecloud_core::dispatch::{dispatch_to_service, DispatchConfig};
     use fakecloud_core::multi_account::MultiAccountState;
     use fakecloud_core::registry::ServiceRegistry;
+    use fakecloud_core::service::AwsService;
     use http::{Request, StatusCode};
     use parking_lot::RwLock;
     use std::sync::Arc;
 
-    const ACCT: &str = "111111111111";
+    /// The server's default account (an unauthenticated request lands here).
+    const DEFAULT: &str = "000000000000";
+    /// The account that requested the token.
+    const OWNER: &str = "111111111111";
+    /// Another account, whose key the B1 attack names in a presign query.
+    const VICTIM: &str = "222222222222";
 
-    struct NoKeys;
-    impl CredentialResolver for NoKeys {
-        fn resolve(&self, _: &str) -> Option<ResolvedCredential> {
-            None
+    fn principal(account: &str, name: &str) -> Principal {
+        Principal {
+            arn: format!("arn:aws:iam::{account}:user/{name}"),
+            user_id: format!("AIDA{name}"),
+            account_id: account.to_string(),
+            principal_type: PrincipalType::User,
+            source_identity: None,
+            tags: None,
         }
     }
 
-    fn setup() -> (Arc<ServiceRegistry>, Arc<DispatchConfig>) {
-        let mas: MultiAccountState<crate::state::EcrState> =
-            MultiAccountState::new(ACCT, "us-east-1", "http://localhost:4566");
-        let state: SharedEcrState = Arc::new(RwLock::new(mas));
-        let mut registry = ServiceRegistry::new();
-        registry.register(Arc::new(EcrService::new(state)));
-        let mut cfg = DispatchConfig::new("us-east-1", ACCT);
-        cfg.verify_sigv4 = true;
-        cfg.credential_resolver = Some(Arc::new(NoKeys));
-        (Arc::new(registry), Arc::new(cfg))
+    /// Resolves only the victim's key: the B1 attack names it unsigned.
+    struct VictimKey;
+    impl CredentialResolver for VictimKey {
+        fn resolve(&self, akid: &str) -> Option<ResolvedCredential> {
+            (akid == "AKIAVICTIM").then(|| ResolvedCredential {
+                secret_access_key: "victim-secret".into(),
+                session_token: None,
+                principal: principal(VICTIM, "victim"),
+                session_policies: Vec::new(),
+                mfa_present: false,
+                token_issued_at: None,
+                federated_provider: None,
+            })
+        }
     }
 
-    async fn send(
-        registry: &Arc<ServiceRegistry>,
-        cfg: &Arc<DispatchConfig>,
-        request: Request<Body>,
-    ) -> (StatusCode, String) {
-        let resp = dispatch_to_service("ecr", registry.clone(), cfg.clone(), request).await;
-        let status = resp.status();
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        (status, String::from_utf8_lossy(&body).into_owned())
+    struct Setup {
+        registry: Arc<ServiceRegistry>,
+        cfg: Arc<DispatchConfig>,
+        ecr: Arc<EcrService>,
+    }
+
+    fn setup(verified: bool) -> Setup {
+        let mut mas: MultiAccountState<crate::state::EcrState> =
+            MultiAccountState::new(DEFAULT, "us-east-1", "http://localhost:4566");
+        for (account, repo) in [(DEFAULT, "default-app"), (OWNER, "app"), (VICTIM, "secret")] {
+            let s = mas.get_or_create(account);
+            let arn = s.repository_arn("us-east-1", repo);
+            s.repositories.insert(
+                repo.to_string(),
+                Repository::new(repo, arn, account, "localhost:4566"),
+            );
+        }
+        let state: SharedEcrState = Arc::new(RwLock::new(mas));
+        let ecr = Arc::new(EcrService::new(state).with_verified_registry_auth(verified));
+        let mut registry = ServiceRegistry::new();
+        registry.register(ecr.clone());
+        let mut cfg = DispatchConfig::new("us-east-1", DEFAULT);
+        cfg.verify_sigv4 = true;
+        cfg.credential_resolver = Some(Arc::new(VictimKey));
+        Setup {
+            registry: Arc::new(registry),
+            cfg: Arc::new(cfg),
+            ecr,
+        }
+    }
+
+    impl Setup {
+        async fn send(&self, uri: &str, auth: &str) -> (StatusCode, String) {
+            let request = Request::builder()
+                .method("GET")
+                .uri(uri)
+                .header("authorization", auth)
+                .body(Body::empty())
+                .unwrap();
+            let resp =
+                dispatch_to_service("ecr", self.registry.clone(), self.cfg.clone(), request).await;
+            let status = resp.status();
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (status, String::from_utf8_lossy(&body).into_owned())
+        }
+
+        /// `aws ecr get-login-password` as `OWNER`'s user: the Basic header
+        /// `docker login -u AWS -p <password>` then sends.
+        async fn login(&self) -> String {
+            let token_request = fakecloud_core::service::AwsRequest {
+                service: "ecr".into(),
+                action: "GetAuthorizationToken".into(),
+                region: "us-east-1".into(),
+                account_id: OWNER.into(),
+                request_id: "req-1".into(),
+                headers: http::HeaderMap::new(),
+                query_params: std::collections::HashMap::new(),
+                body: bytes::Bytes::from_static(b"{}"),
+                body_stream: parking_lot::Mutex::new(None),
+                path_segments: vec![],
+                raw_path: "/".into(),
+                raw_query: String::new(),
+                method: http::Method::POST,
+                is_query_protocol: false,
+                access_key_id: Some("AKIAOWNER".into()),
+                principal: Some(principal(OWNER, "dev")),
+            };
+            let resp = self.ecr.handle(token_request).await.unwrap();
+            let body = match resp.body {
+                fakecloud_core::service::ResponseBody::Bytes(b) => b,
+                _ => panic!("expected a buffered body"),
+            };
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let token = json["authorizationData"][0]["authorizationToken"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            let expires_at = json["authorizationData"][0]["expiresAt"].as_i64().unwrap();
+            let in_12h = (chrono::Utc::now() + chrono::Duration::hours(12)).timestamp();
+            assert!((expires_at - in_12h).abs() <= 5, "12 h validity");
+            format!("Basic {token}")
+        }
     }
 
     fn basic(credentials: &str) -> String {
@@ -1526,80 +1618,99 @@ mod verify_sigv4_registry_auth_tests {
     }
 
     #[tokio::test]
-    async fn docker_login_basic_auth_reaches_the_registry() {
-        let (registry, cfg) = setup();
-        // `aws ecr get-login-password`: GetAuthorizationToken on the ECR API.
-        let ecr = registry.get("ecr").unwrap().clone();
-        let token_request = fakecloud_core::service::AwsRequest {
-            service: "ecr".into(),
-            action: "GetAuthorizationToken".into(),
-            region: "us-east-1".into(),
-            account_id: ACCT.into(),
-            request_id: "req-1".into(),
-            headers: http::HeaderMap::new(),
-            query_params: std::collections::HashMap::new(),
-            body: bytes::Bytes::from_static(b"{}"),
-            body_stream: parking_lot::Mutex::new(None),
-            path_segments: vec![],
-            raw_path: "/".into(),
-            raw_query: String::new(),
-            method: http::Method::POST,
-            is_query_protocol: false,
-            access_key_id: None,
-            principal: None,
-        };
-        let resp = ecr.handle(token_request).await.unwrap();
-        let body = match resp.body {
-            fakecloud_core::service::ResponseBody::Bytes(b) => {
-                String::from_utf8_lossy(&b).into_owned()
-            }
-            _ => panic!("expected a buffered body"),
-        };
-        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
-        let token = json["authorizationData"][0]["authorizationToken"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        let decoded = String::from_utf8(
-            base64::engine::general_purpose::STANDARD
-                .decode(&token)
-                .unwrap(),
-        )
-        .unwrap();
-        assert!(decoded.starts_with("AWS:"));
-
-        let probe = |auth: String| {
-            Request::builder()
-                .method("GET")
-                .uri("/v2/")
-                .header("authorization", auth)
-                .body(Body::empty())
-                .unwrap()
-        };
-        // `docker login -u AWS -p <password>` sends Basic base64("AWS:<password>").
-        let (status, body) = send(&registry, &cfg, probe(format!("Basic {token}"))).await;
+    async fn issued_token_authenticates_as_its_account() {
+        let t = setup(true);
+        let auth = t.login().await;
+        let (status, body) = t.send("/v2/", &auth).await;
         assert_eq!(status, StatusCode::OK, "{body}");
+        // The token's account is served, not the server default.
+        let (status, body) = t.send("/v2/app/tags/list", &auth).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, _) = t.send("/v2/default-app/tags/list", &auth).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        // The scheme is case-insensitive end to end.
+        let lower = auth.replacen("Basic", "basic", 1);
+        let (status, body) = t.send("/v2/app/tags/list", &lower).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
 
-        // Credentials the registry refuses get its 401 challenge, not a
-        // SigV4 403.
-        let (status, body) = send(&registry, &cfg, probe(basic("bob:not-a-token"))).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
-        assert!(!body.contains("IncompleteSignature"), "{body}");
+    #[tokio::test]
+    async fn refused_credentials_get_the_registry_401() {
+        let t = setup(true);
+        let _ = t.login().await;
+        // Expired token.
+        t.ecr.registry_auth().issue(
+            "expired-token",
+            OWNER,
+            None,
+            chrono::Utc::now() - chrono::Duration::seconds(1),
+        );
+        for (what, auth) in [
+            ("expired", basic("AWS:expired-token")),
+            ("forged", basic("AWS:not-a-token")),
+            ("test* user", basic("test:test")),
+            ("other user", basic("bob:not-a-token")),
+        ] {
+            for uri in ["/v2/", "/v2/app/tags/list"] {
+                let (status, body) = t.send(uri, &auth).await;
+                assert_eq!(status, StatusCode::UNAUTHORIZED, "{what} {uri}: {body}");
+                assert!(!body.contains("IncompleteSignature"), "{body}");
+            }
+        }
+    }
 
-        // A repository path under /v2 takes the same route.
-        let tags = Request::builder()
-            .method("GET")
-            .uri("/v2/app/tags/list")
-            .header("authorization", basic("bob:not-a-token"))
-            .body(Body::empty())
-            .unwrap();
-        let (status, _) = send(&registry, &cfg, tags).await;
+    #[tokio::test]
+    async fn runtime_pull_credential_is_accepted() {
+        let t = setup(true);
+        let auth = basic(&fakecloud_core::container_net::registry_runtime_basic_credentials());
+        let (status, body) = t.send("/v2/default-app/tags/list", &auth).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    /// B1: an unverified presign query riding along with Basic credentials
+    /// must not lend its access key's identity or account.
+    #[tokio::test]
+    async fn presign_query_beside_basic_auth_names_no_one() {
+        let t = setup(true);
+        let presign = "X-Amz-Algorithm=AWS4-HMAC-SHA256\
+            &X-Amz-Credential=AKIAVICTIM%2F20240101%2Fus-east-1%2Fecr%2Faws4_request\
+            &X-Amz-Date=20240101T000000Z&X-Amz-Expires=300&X-Amz-SignedHeaders=host\
+            &X-Amz-Signature=junk";
+        let auth = t.login().await;
+        let (status, _) = t
+            .send(&format!("/v2/secret/tags/list?{presign}"), &auth)
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "victim repo must stay out of reach"
+        );
+        let (status, body) = t.send(&format!("/v2/app/tags/list?{presign}"), &auth).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        // A forged password with the presign is still refused.
+        let (status, _) = t
+            .send(
+                &format!("/v2/secret/tags/list?{presign}"),
+                &basic("AWS:forged"),
+            )
+            .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn without_verification_the_registry_stays_lenient() {
+        let t = setup(false);
+        for auth in [basic("AWS:anything"), basic("test:test")] {
+            let (status, body) = t.send("/v2/default-app/tags/list", &auth).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+        let (status, _) = t.send("/v2/", &basic("bob:x")).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
     async fn basic_auth_on_the_ecr_api_is_still_a_bad_signature() {
-        let (registry, cfg) = setup();
+        let t = setup(true);
         let request = Request::builder()
             .method("POST")
             .uri("/")
@@ -1611,7 +1722,12 @@ mod verify_sigv4_registry_auth_tests {
             .header("content-type", "application/x-amz-json-1.1")
             .body(Body::from("{}"))
             .unwrap();
-        let (status, body) = send(&registry, &cfg, request).await;
+        let resp = dispatch_to_service("ecr", t.registry.clone(), t.cfg.clone(), request).await;
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
         assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
         assert!(body.contains("IncompleteSignature"), "{body}");
     }

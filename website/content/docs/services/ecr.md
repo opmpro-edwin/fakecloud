@@ -25,7 +25,7 @@ fakecloud implements Amazon Elastic Container Registry (ECR) with full API cover
 
 The OCI v2 Distribution endpoints (`/v2/<name>/blobs/<digest>`, `/v2/<name>/manifests/<ref>`, `/v2/<name>/blobs/uploads/`, etc.) are wired to the same content-addressed blob store the AWS JSON ops read and write. A layer pushed by Docker is visible via `BatchCheckLayerAvailability`; an image created via `PutImage` can be `docker pull`ed.
 
-`GetAuthorizationToken` returns `base64("AWS:<token>")` with a 12h expiry matching real AWS, and the `/v2/` endpoints honor the Basic Auth flow:
+`GetAuthorizationToken` returns `base64("AWS:<token>")` with a 12h expiry matching real AWS, and the `/v2/` endpoints honor the Basic Auth flow. Under `--verify-sigv4` the registry accepts only such a token (unexpired, issued by this server) and serves the account of the identity that requested it; without it any `AWS:*` credential passes:
 
 ```sh
 aws --endpoint-url http://localhost:4566 ecr get-login-password \

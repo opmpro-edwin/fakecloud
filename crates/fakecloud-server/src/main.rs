@@ -3568,7 +3568,12 @@ async fn main() {
         } else {
             None
         };
-    let mut ecr_service = EcrService::new(ecr_state.clone()).with_kms(kms_state.clone());
+    // Under --verify-sigv4 the registry (`/v2/...`) authenticates `docker
+    // login` tokens for real: only a GetAuthorizationToken token (or the
+    // server's own runtime pull credential) passes.
+    let mut ecr_service = EcrService::new(ecr_state.clone())
+        .with_kms(kms_state.clone())
+        .with_verified_registry_auth(cli.verify_sigv4);
     if let Some(store) = ecr_snapshot_store.clone() {
         ecr_service = ecr_service.with_snapshot_store(store);
     }

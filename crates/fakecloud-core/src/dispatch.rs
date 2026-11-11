@@ -441,7 +441,24 @@ async fn dispatch_inner(
     } else {
         None
     };
-    let sigv4_info = header_info.or(presigned_info);
+    // ECR's registry API (OCI Distribution, `/v2/...`) authenticates
+    // `docker login` / pull / push with `Authorization: Basic
+    // base64("AWS:<token>")`, a `GetAuthorizationToken` token, not SigV4. AWS
+    // accepts it whatever SigV4 checks the ECR API applies, so under
+    // `--verify-sigv4` signature verification is skipped for it below and the
+    // ECR registry handler authenticates the token (401 for a bad one); the
+    // token, not the request, then decides the caller's account. Nothing the
+    // request carries besides the Basic credentials may name the caller: a
+    // SigV4 / SigV2 presign query riding along is unverified, so its access
+    // key is ignored entirely. A Basic header on any other path is still
+    // verified (and rejected) below.
+    let registry_basic_auth = config.verify_sigv4
+        && detected.service == "ecr"
+        && is_oci_registry_path(parts.uri.path())
+        && is_basic_authorization(auth_header);
+    let sigv4_info = header_info
+        .or(presigned_info)
+        .filter(|_| !registry_basic_auth);
     // SigV2 presigned URLs (`AWSAccessKeyId` + `Signature` + `Expires` query
     // parameters) carry the access key outside the SigV4 grammar, so the SigV4
     // parsers above return None. Recover the key here so a SigV2-presigned
@@ -450,7 +467,8 @@ async fn dispatch_inner(
     let access_key_id = sigv4_info
         .as_ref()
         .map(|info| info.access_key.clone())
-        .or_else(|| sigv2_presigned_access_key(&query_params));
+        .or_else(|| sigv2_presigned_access_key(&query_params))
+        .filter(|_| !registry_basic_auth);
 
     // Host-header routing hint: LocalStack-shaped
     // `<svc>.<region>.localhost.localstack.cloud[:port]`, real-AWS
@@ -510,9 +528,6 @@ async fn dispatch_inner(
     // signature verification here; the ECR registry handler validates the
     // credentials and answers 401 for bad ones. A Basic header on any other
     // path is still verified (and rejected) below.
-    let registry_basic_auth = detected.service == "ecr"
-        && is_oci_registry_path(parts.uri.path())
-        && is_basic_authorization(auth_header);
     if config.verify_sigv4
         && !is_fully_anonymous
         && !registry_basic_auth
@@ -1802,6 +1817,19 @@ fn sanitize_header_value(s: &str) -> String {
     out.trim().to_string()
 }
 
+/// The ECR registry (OCI Distribution v2) surface: `/v2` and `/v2/...`.
+fn is_oci_registry_path(path: &str) -> bool {
+    path == "/v2" || path.starts_with("/v2/")
+}
+
+/// `Authorization: Basic <credentials>` (the scheme is case-insensitive,
+/// RFC 7617).
+fn is_basic_authorization(header: &str) -> bool {
+    header
+        .get(..6)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("basic "))
+}
+
 /// Build the [`ConditionContext`] passed to the IAM evaluator for one
 /// request. Populates the 10 global condition keys from the resolved
 /// principal + the HTTP request. Service-specific keys are deferred to
@@ -1821,19 +1849,6 @@ fn sanitize_header_value(s: &str) -> String {
 /// and `Expires`; all three must be present for the URL to be a SigV2 presign.
 /// Returns None for SigV4 presigns (which use `X-Amz-Credential`) or unsigned
 /// requests.
-/// The ECR registry (OCI Distribution v2) surface: `/v2` and `/v2/...`.
-fn is_oci_registry_path(path: &str) -> bool {
-    path == "/v2" || path.starts_with("/v2/")
-}
-
-/// `Authorization: Basic <credentials>` (the scheme is case-insensitive,
-/// RFC 7617).
-fn is_basic_authorization(header: &str) -> bool {
-    header
-        .get(..6)
-        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("basic "))
-}
-
 fn sigv2_presigned_access_key(query_params: &HashMap<String, String>) -> Option<String> {
     if query_params.contains_key("Signature") && query_params.contains_key("Expires") {
         query_params.get("AWSAccessKeyId").cloned()
@@ -2922,6 +2937,97 @@ mod tests {
         // A non-Basic, non-SigV4 header on the registry is still verified.
         let resp = send("GET", "/v2/", "Bearer abc", None).await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// B1: under `--verify-sigv4` a registry Basic request skips SigV4, so
+    /// nothing else it carries may name the caller: a resolvable access key
+    /// in an (unverified) presign query is ignored -- no principal, no
+    /// account, no key.
+    #[tokio::test]
+    async fn registry_basic_auth_ignores_a_presign_access_key() {
+        use crate::service::{AwsResponse, AwsServiceError};
+        type Seen = parking_lot::Mutex<Vec<(Option<String>, Option<String>, String)>>;
+        struct Registry(Arc<Seen>);
+        #[async_trait::async_trait]
+        impl crate::service::AwsService for Registry {
+            fn service_name(&self) -> &str {
+                "ecr"
+            }
+            async fn handle(&self, req: AwsRequest) -> Result<AwsResponse, AwsServiceError> {
+                self.0.lock().push((
+                    req.access_key_id.clone(),
+                    req.principal.as_ref().map(|p| p.arn.clone()),
+                    req.account_id.clone(),
+                ));
+                Ok(AwsResponse::ok_json(serde_json::json!({})))
+            }
+            fn supported_actions(&self) -> &[&str] {
+                &[]
+            }
+        }
+        struct VictimKey;
+        impl crate::auth::CredentialResolver for VictimKey {
+            fn resolve(&self, akid: &str) -> Option<crate::auth::ResolvedCredential> {
+                (akid == "AKIAVICTIM").then(|| crate::auth::ResolvedCredential {
+                    secret_access_key: "s".into(),
+                    session_token: None,
+                    principal: Principal {
+                        arn: "arn:aws:iam::222222222222:user/victim".into(),
+                        user_id: "AIDAVICTIM".into(),
+                        account_id: "222222222222".into(),
+                        principal_type: PrincipalType::User,
+                        source_identity: None,
+                        tags: None,
+                    },
+                    session_policies: Vec::new(),
+                    mfa_present: false,
+                    token_issued_at: None,
+                    federated_provider: None,
+                })
+            }
+        }
+        let seen = Arc::new(Seen::default());
+        let mut registry = ServiceRegistry::new();
+        registry.register(Arc::new(Registry(seen.clone())));
+        let registry = Arc::new(registry);
+        let mut cfg = DispatchConfig::new("us-east-1", "000000000000");
+        cfg.verify_sigv4 = true;
+        cfg.credential_resolver = Some(Arc::new(VictimKey));
+        let cfg = Arc::new(cfg);
+        let mut query = HashMap::new();
+        for (k, v) in [
+            ("X-Amz-Algorithm", "AWS4-HMAC-SHA256"),
+            (
+                "X-Amz-Credential",
+                "AKIAVICTIM/20240101/us-east-1/ecr/aws4_request",
+            ),
+            ("X-Amz-Date", "20240101T000000Z"),
+            ("X-Amz-Expires", "300"),
+            ("X-Amz-SignedHeaders", "host"),
+            ("X-Amz-Signature", "junk"),
+        ] {
+            query.insert(k.to_string(), v.to_string());
+        }
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v2/secret/manifests/latest?X-Amz-Credential=AKIAVICTIM")
+            .header("authorization", "Basic QVdTOng=")
+            .body(Body::empty())
+            .unwrap();
+        let resp = dispatch_inner(
+            "127.0.0.1:5000".parse().unwrap(),
+            registry,
+            cfg,
+            query,
+            request,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            *seen.lock(),
+            vec![(None, None, "000000000000".to_string())],
+            "the presign key must not name the caller"
+        );
     }
 
     #[test]

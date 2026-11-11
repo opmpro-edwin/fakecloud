@@ -683,7 +683,8 @@ pub fn extract_zip(zip_bytes: &[u8], dest: &Path) -> Result<(), RuntimeError> {
 
 fn build_local_registry_docker_config(server_port: u16) -> Option<TempDir> {
     let dir = TempDir::new().ok()?;
-    let auth = base64::engine::general_purpose::STANDARD.encode("AWS:fakecloud-lambda-runtime");
+    let auth = base64::engine::general_purpose::STANDARD
+        .encode(fakecloud_core::container_net::registry_runtime_basic_credentials());
     // Authorize every hostname fakecloud's ECR can be addressed by:
     // `127.0.0.1` on the host, `host.docker.internal` (Docker) and
     // `host.containers.internal` (podman) when fakecloud runs in a container and
