@@ -104,8 +104,8 @@ struct DataPlane {
     rr_counters: Arc<Mutex<BTreeMap<String, usize>>>,
     /// Sticky-session map: `AWSALB` cookie value -> `tg_arn|target_id|target_port`.
     sticky_targets: Arc<Mutex<BTreeMap<String, String>>>,
-    /// Client to the targets (see [`upstream_client`]).
-    upstream: reqwest::Client,
+    /// Clients to the targets (see [`UpstreamClients`]).
+    upstream: UpstreamClients,
     /// Address used to reach loopback-published sibling targets (EC2 instances
     /// and ECS bridge-mode tasks publish their ports on the host daemon).
     /// `127.0.0.1` when fakecloud runs on the host; the host alias
@@ -115,18 +115,66 @@ struct DataPlane {
     sibling_host: String,
 }
 
-/// The HTTP client the data plane forwards plain requests with. It accepts
-/// any target certificate, as an ALB does not verify the certificates of
-/// HTTPS targets, and sets no timeout for the whole exchange: a streamed
-/// answer may last as long as it keeps moving. Idleness is timed per load
-/// balancer in `forward_action`.
-fn upstream_client() -> reqwest::Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        // Disable redirects so we surface them as the upstream sees them.
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(CONNECT_TIMEOUT)
-        .build()
+/// The HTTP clients the data plane forwards plain requests with, one per
+/// target HTTP version. Both accept any target certificate, as an ALB does
+/// not verify the certificates of HTTPS targets, and set no timeout for the
+/// whole exchange: a streamed answer may last as long as it keeps moving.
+/// Idleness is timed per load balancer in `forward_action`.
+#[derive(Clone)]
+struct UpstreamClients {
+    http1: reqwest::Client,
+    http2: reqwest::Client,
+}
+
+/// The HTTP version an ALB speaks to a target group's targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TargetHttpVersion {
+    /// `ProtocolVersion` `HTTP1`, the default: HTTP/1.1 only.
+    Http1,
+    /// `ProtocolVersion` `HTTP2` or `GRPC`: HTTP/2 allowed (negotiated over
+    /// TLS with ALPN).
+    Http2,
+}
+
+impl TargetHttpVersion {
+    fn of(tg: &TargetGroup) -> Self {
+        match tg.protocol_version.as_deref() {
+            Some(v) if v.eq_ignore_ascii_case("HTTP2") || v.eq_ignore_ascii_case("GRPC") => {
+                Self::Http2
+            }
+            _ => Self::Http1,
+        }
+    }
+}
+
+impl UpstreamClients {
+    fn new() -> reqwest::Result<Self> {
+        Ok(Self {
+            http1: Self::build(TargetHttpVersion::Http1)?,
+            http2: Self::build(TargetHttpVersion::Http2)?,
+        })
+    }
+
+    fn build(version: TargetHttpVersion) -> reqwest::Result<reqwest::Client> {
+        let mut builder = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            // Disable redirects so we surface them as the upstream sees them.
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(CONNECT_TIMEOUT);
+        if version == TargetHttpVersion::Http1 {
+            // Offer only `http/1.1` to TLS targets, so one that prefers h2
+            // still gets HTTP/1.1, as from an ALB.
+            builder = builder.http1_only();
+        }
+        builder.build()
+    }
+
+    fn client(&self, version: TargetHttpVersion) -> &reqwest::Client {
+        match version {
+            TargetHttpVersion::Http1 => &self.http1,
+            TargetHttpVersion::Http2 => &self.http2,
+        }
+    }
 }
 
 /// The load balancer's idle timeout: its `idle_timeout.timeout_seconds`
@@ -161,7 +209,7 @@ pub fn spawn_dataplane_with_delivery(
         debug!("ELBv2 data plane disabled via {ENV_DISABLE}");
         return None;
     }
-    let upstream = match upstream_client() {
+    let upstream = match UpstreamClients::new() {
         Ok(c) => c,
         Err(e) => {
             warn!("ELBv2 data plane: failed to build reqwest client: {e}");
@@ -1235,7 +1283,10 @@ async fn forward_action(
 
     // Forward via reqwest. Strip hop-by-hop headers; AWS adds
     // X-Forwarded-* headers.
-    let mut req_builder = dp.upstream.request(reqwest_method(&method), &upstream_url);
+    let mut req_builder = dp
+        .upstream
+        .client(TargetHttpVersion::of(tg))
+        .request(reqwest_method(&method), &upstream_url);
     let mut forwarded_headers = headers.clone();
     strip_hop_by_hop(&mut forwarded_headers);
     forwarded.apply(&mut forwarded_headers);
@@ -2259,15 +2310,22 @@ mod forward_tests {
         assert_eq!(headers["x-forwarded-for"], "2001:db8::7");
     }
 
-    /// A target that answers each request with the scheme it was reached over
-    /// and the `X-Forwarded-*` headers it got, takes WebSocket upgrades and
-    /// then echoes bytes, and never answers `/slow`.
+    /// A target that answers each request with the scheme and HTTP version it
+    /// was reached over and the `X-Forwarded-*` headers it got, takes
+    /// WebSocket upgrades and then echoes bytes, and never answers `/slow`.
     async fn spawn_target(tls: bool) -> u16 {
+        spawn_target_with(tls, false).await
+    }
+
+    /// [`spawn_target`], whose TLS listener, with `offer_h2`, advertises
+    /// `h2, http/1.1` over ALPN (as many servers do) and serves HTTP/2 when the
+    /// client picks it.
+    async fn spawn_target_with(tls: bool, offer_h2: bool) -> u16 {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let acceptor = tls.then(|| {
             let key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-            let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
                 rustls::crypto::ring::default_provider(),
             ))
             .with_safe_default_protocol_versions()
@@ -2278,6 +2336,9 @@ mod forward_tests {
                 rustls::pki_types::PrivateKeyDer::Pkcs8(key.key_pair.serialize_der().into()),
             )
             .unwrap();
+            if offer_h2 {
+                config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+            }
             tokio_rustls::TlsAcceptor::from(Arc::new(config))
         });
         tokio::spawn(async move {
@@ -2295,6 +2356,14 @@ mod forward_tests {
                             let Ok(s) = a.accept(sock).await else {
                                 return;
                             };
+                            if s.get_ref().1.alpn_protocol() == Some(b"h2") {
+                                let _ = hyper::server::conn::http2::Builder::new(
+                                    hyper_util::rt::TokioExecutor::new(),
+                                )
+                                .serve_connection(TokioIo::new(s), svc)
+                                .await;
+                                return;
+                            }
                             let _ = builder
                                 .serve_connection(TokioIo::new(s), svc)
                                 .with_upgrades()
@@ -2350,7 +2419,8 @@ mod forward_tests {
                 .to_string()
         };
         let body = format!(
-            "scheme={scheme} xff={} proto={} port={}",
+            "scheme={scheme} version={:?} xff={} proto={} port={}",
+            req.version(),
             h("x-forwarded-for"),
             h("x-forwarded-proto"),
             h("x-forwarded-port")
@@ -2387,6 +2457,19 @@ mod forward_tests {
     /// loopback port. `lb_attributes` are applied with
     /// ModifyLoadBalancerAttributes.
     async fn alb(tg_protocol: &str, lb_attributes: &[(&str, &str)]) -> Alb {
+        alb_with(tg_protocol, &[], "HTTP", "80", lb_attributes).await
+    }
+
+    /// [`alb`] with extra CreateTargetGroup parameters and a listener of
+    /// `listener_protocol` on `listener_port` (an HTTPS one gets a
+    /// certificate ARN).
+    async fn alb_with(
+        tg_protocol: &str,
+        tg_params: &[(&str, &str)],
+        listener_protocol: &str,
+        listener_port: &str,
+        lb_attributes: &[(&str, &str)],
+    ) -> Alb {
         let state: SharedElbv2State = Arc::new(RwLock::new(Elbv2Accounts::new()));
         let svc = Elbv2Service::new(Arc::clone(&state));
         svc.handle(req(
@@ -2395,16 +2478,13 @@ mod forward_tests {
         ))
         .await
         .unwrap();
-        svc.handle(req(
-            "CreateTargetGroup",
-            &[
-                ("Name", "dp-tg"),
-                ("Protocol", tg_protocol),
-                ("Port", "443"),
-            ],
-        ))
-        .await
-        .unwrap();
+        let mut tg_req = vec![
+            ("Name", "dp-tg"),
+            ("Protocol", tg_protocol),
+            ("Port", "443"),
+        ];
+        tg_req.extend_from_slice(tg_params);
+        svc.handle(req("CreateTargetGroup", &tg_req)).await.unwrap();
         let (lb_arn, tg_arn) = {
             let accs = state.read();
             let st = accs.get(ACCOUNT).unwrap();
@@ -2413,18 +2493,22 @@ mod forward_tests {
                 st.target_groups.keys().next().unwrap().clone(),
             )
         };
-        svc.handle(req(
-            "CreateListener",
-            &[
-                ("LoadBalancerArn", &lb_arn),
-                ("Protocol", "HTTP"),
-                ("Port", "80"),
-                ("DefaultActions.member.1.Type", "forward"),
-                ("DefaultActions.member.1.TargetGroupArn", &tg_arn),
-            ],
-        ))
-        .await
-        .unwrap();
+        let mut listener_req = vec![
+            ("LoadBalancerArn", lb_arn.as_str()),
+            ("Protocol", listener_protocol),
+            ("Port", listener_port),
+            ("DefaultActions.member.1.Type", "forward"),
+            ("DefaultActions.member.1.TargetGroupArn", tg_arn.as_str()),
+        ];
+        if listener_protocol.eq_ignore_ascii_case("HTTPS") {
+            listener_req.push((
+                "Certificates.member.1.CertificateArn",
+                "arn:aws:acm:us-east-1:123456789012:certificate/0f6d1d5e-dp",
+            ));
+        }
+        svc.handle(req("CreateListener", &listener_req))
+            .await
+            .unwrap();
         for (i, (k, v)) in lb_attributes.iter().enumerate() {
             let key = format!("Attributes.member.{}.Key", i + 1);
             let value = format!("Attributes.member.{}.Value", i + 1);
@@ -2442,7 +2526,7 @@ mod forward_tests {
             waf_count_metrics: Arc::new(Mutex::new(BTreeMap::new())),
             rr_counters: Arc::new(Mutex::new(BTreeMap::new())),
             sticky_targets: Arc::new(Mutex::new(BTreeMap::new())),
-            upstream: upstream_client().unwrap(),
+            upstream: UpstreamClients::new().unwrap(),
             sibling_host: "127.0.0.1".to_string(),
         };
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
@@ -2475,6 +2559,40 @@ mod forward_tests {
         assert!(body.starts_with("scheme=https "), "{body}");
         // The listener is HTTP:80 and the client connected from loopback.
         assert!(body.contains("xff=127.0.0.1 proto=http port=80"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn default_target_group_speaks_http1_to_an_h2_capable_target() {
+        // ProtocolVersion defaults to HTTP1: the ALB sends HTTP/1.1 even to a
+        // TLS target that advertises h2 first.
+        let alb = alb("HTTPS", &[]).await;
+        let target_port = spawn_target_with(true, true).await;
+        alb.set_targets(vec![target("127.0.0.1", target_port, "healthy")]);
+        let (status, body) = get(&alb.url("/")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.starts_with("scheme=https version=HTTP/1.1 "), "{body}");
+    }
+
+    #[tokio::test]
+    async fn http2_target_group_may_speak_h2_to_its_targets() {
+        let alb = alb_with("HTTPS", &[("ProtocolVersion", "HTTP2")], "HTTP", "80", &[]).await;
+        let target_port = spawn_target_with(true, true).await;
+        alb.set_targets(vec![target("127.0.0.1", target_port, "healthy")]);
+        let (status, body) = get(&alb.url("/")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.starts_with("scheme=https version=HTTP/2.0 "), "{body}");
+    }
+
+    #[tokio::test]
+    async fn https_listener_forwards_proto_https_and_its_port() {
+        // An HTTPS-only load balancer: the target is told the
+        // request came in over https on the listener's port.
+        let alb = alb_with("HTTPS", &[], "HTTPS", "443", &[]).await;
+        let target_port = spawn_target(true).await;
+        alb.set_targets(vec![target("127.0.0.1", target_port, "healthy")]);
+        let (status, body) = get(&alb.url("/")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.ends_with("proto=https port=443"), "{body}");
     }
 
     #[tokio::test]
