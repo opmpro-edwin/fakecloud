@@ -224,6 +224,58 @@ pub(crate) fn credentials_env(
     }
 }
 
+/// The ECS agent's link-local address, where tasks reach its credentials and
+/// metadata endpoints.
+pub(crate) const AGENT_LINK_LOCAL_BASE: &str = "http://169.254.170.2";
+
+/// The task metadata env vars a task container gets
+/// (`ECS_CONTAINER_METADATA_URI` for v3, `ECS_CONTAINER_METADATA_URI_V4`).
+/// As on ECS they point at the agent's `169.254.170.2` (`/v3/<id>`,
+/// `/v4/<id>`) when that address reaches fakecloud inside the container --
+/// the same condition as the relative credentials URI -- else at fakecloud's
+/// own `/_fakecloud/ecs/v3|v4/<id>` under `fakecloud_base` (no trailing
+/// slash).
+pub(crate) fn metadata_env(
+    task_id: &str,
+    link_local: bool,
+    fakecloud_base: &str,
+) -> Vec<(String, String)> {
+    let (v3, v4) = if link_local {
+        (
+            format!("{AGENT_LINK_LOCAL_BASE}/v3/{task_id}"),
+            format!("{AGENT_LINK_LOCAL_BASE}/v4/{task_id}"),
+        )
+    } else {
+        (
+            format!("{fakecloud_base}/_fakecloud/ecs/v3/{task_id}"),
+            format!("{fakecloud_base}/_fakecloud/ecs/v4/{task_id}"),
+        )
+    };
+    vec![
+        ("ECS_CONTAINER_METADATA_URI".into(), v3),
+        ("ECS_CONTAINER_METADATA_URI_V4".into(), v4),
+    ]
+}
+
+/// Every agent variable a Docker / Podman task container gets: the task
+/// metadata URIs and, for a task-role container, its credentials. They name
+/// the agent's `169.254.170.2` when the container's namespace holder routes
+/// it (`holder_installed`), and also in `none` mode, which has no network at
+/// all, as on ECS; otherwise fakecloud's endpoints under `fakecloud_base`.
+pub(crate) fn agent_env(
+    plan: &ContainerPlan,
+    task_id: &str,
+    holder_installed: bool,
+    fakecloud_base: &str,
+) -> Vec<(String, String)> {
+    let link_local = holder_installed || is_none_network(plan);
+    let mut env = metadata_env(task_id, link_local, fakecloud_base);
+    if plan.has_task_role {
+        env.extend(credentials_env(task_id, link_local, fakecloud_base));
+    }
+    env
+}
+
 /// The operator's helper image override, if set.
 pub(crate) fn helper_image_override() -> Option<String> {
     std::env::var(HELPER_IMAGE_ENV)
@@ -679,6 +731,95 @@ mod tests {
                     "AWS_CONTAINER_AUTHORIZATION_TOKEN".to_string(),
                     task_credentials_token("abc")
                 ),
+            ]
+        );
+    }
+
+    #[test]
+    fn metadata_env_uses_the_agents_link_local_address_when_routed() {
+        assert_eq!(
+            metadata_env("abc", true, "http://host.docker.internal:4566"),
+            vec![
+                (
+                    "ECS_CONTAINER_METADATA_URI".to_string(),
+                    "http://169.254.170.2/v3/abc".to_string()
+                ),
+                (
+                    "ECS_CONTAINER_METADATA_URI_V4".to_string(),
+                    "http://169.254.170.2/v4/abc".to_string()
+                ),
+            ]
+        );
+        assert_eq!(
+            metadata_env("abc", false, "http://host.docker.internal:4566"),
+            vec![
+                (
+                    "ECS_CONTAINER_METADATA_URI".to_string(),
+                    "http://host.docker.internal:4566/_fakecloud/ecs/v3/abc".to_string()
+                ),
+                (
+                    "ECS_CONTAINER_METADATA_URI_V4".to_string(),
+                    "http://host.docker.internal:4566/_fakecloud/ecs/v4/abc".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn agent_env_points_at_the_link_local_agent_only_through_a_holder() {
+        let base = "http://host.docker.internal:4566";
+        let get = |env: &[(String, String)], name: &str| {
+            env.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone())
+        };
+        // Holder installed: metadata and credentials at 169.254.170.2.
+        let env = agent_env(&plan(Some("awsvpc")), "t1", true, base);
+        assert_eq!(
+            get(&env, "ECS_CONTAINER_METADATA_URI").as_deref(),
+            Some("http://169.254.170.2/v3/t1")
+        );
+        assert_eq!(
+            get(&env, "ECS_CONTAINER_METADATA_URI_V4").as_deref(),
+            Some("http://169.254.170.2/v4/t1")
+        );
+        assert_eq!(
+            get(&env, "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI").as_deref(),
+            Some("/v2/credentials/t1")
+        );
+        assert_eq!(get(&env, "AWS_CONTAINER_CREDENTIALS_FULL_URI"), None);
+        // No holder: fakecloud's own endpoints, as before.
+        let env = agent_env(&plan(Some("awsvpc")), "t1", false, base);
+        assert_eq!(
+            get(&env, "ECS_CONTAINER_METADATA_URI").as_deref(),
+            Some("http://host.docker.internal:4566/_fakecloud/ecs/v3/t1")
+        );
+        assert_eq!(
+            get(&env, "ECS_CONTAINER_METADATA_URI_V4").as_deref(),
+            Some("http://host.docker.internal:4566/_fakecloud/ecs/v4/t1")
+        );
+        assert_eq!(
+            get(&env, "AWS_CONTAINER_CREDENTIALS_FULL_URI").as_deref(),
+            Some("http://host.docker.internal:4566/_fakecloud/ecs/creds/t1")
+        );
+        assert_eq!(get(&env, "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"), None);
+        // `none` mode: the agent's URIs with nothing behind them, as on ECS.
+        let env = agent_env(&plan(Some("none")), "t1", false, base);
+        assert_eq!(
+            get(&env, "ECS_CONTAINER_METADATA_URI_V4").as_deref(),
+            Some("http://169.254.170.2/v4/t1")
+        );
+        assert_eq!(
+            get(&env, "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI").as_deref(),
+            Some("/v2/credentials/t1")
+        );
+        // A role-less container gets metadata but no credentials.
+        let mut roleless = plan(None);
+        roleless.has_task_role = false;
+        let env = agent_env(&roleless, "t1", false, base);
+        assert_eq!(
+            env.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+            [
+                "ECS_CONTAINER_METADATA_URI",
+                "ECS_CONTAINER_METADATA_URI_V4"
             ]
         );
     }

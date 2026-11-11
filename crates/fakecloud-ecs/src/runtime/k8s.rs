@@ -393,9 +393,11 @@ fn creds_init_started(pod: &Pod) -> bool {
         })
 }
 
-/// `resolved` with the task-role credentials variable added to each
-/// task-role container: the agent's relative URI when the Pod routes
-/// `169.254.170.2`, else fakecloud's full URI under `base`.
+/// `resolved` with the agent variables added after each container's own
+/// env: the task metadata URIs on every container and the credentials
+/// variable on each task-role container. They name the agent's
+/// `169.254.170.2` (metadata at `/v3|v4/<id>`, the relative credentials URI)
+/// when the Pod routes that address, else fakecloud's endpoints under `base`.
 fn with_credentials_env(
     resolved: &[(ContainerPlan, Vec<(String, String)>)],
     task_id: &str,
@@ -406,6 +408,7 @@ fn with_credentials_env(
         .iter()
         .map(|(plan, env)| {
             let mut env = env.clone();
+            env.extend(task_creds::metadata_env(task_id, link_local, base));
             if plan.has_task_role {
                 env.extend(task_creds::credentials_env(task_id, link_local, base));
             }
@@ -450,15 +453,9 @@ impl EcsRuntime {
                     self.resolve_secret(account_id, &region, value_from)?,
                 ));
             }
+            // The metadata and credentials variables are added per launch,
+            // once it is known whether the Pod routes `169.254.170.2`.
             let base = backend.self_url.trim_end_matches('/');
-            env.push((
-                "ECS_CONTAINER_METADATA_URI".into(),
-                format!("{base}/_fakecloud/ecs/v3/{task_id}"),
-            ));
-            env.push((
-                "ECS_CONTAINER_METADATA_URI_V4".into(),
-                format!("{base}/_fakecloud/ecs/v4/{task_id}"),
-            ));
             super::aws_env::push_aws_sdk_env(&mut env, base, &region);
             resolved.push((plan, env));
         }
@@ -1502,7 +1499,59 @@ mod tests {
             true,
             "http://fakecloud.fc.svc:4566",
         );
-        assert!(resolved[0].1.is_empty());
+        assert_eq!(
+            resolved[0]
+                .1
+                .iter()
+                .map(|(k, _)| k.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "ECS_CONTAINER_METADATA_URI",
+                "ECS_CONTAINER_METADATA_URI_V4"
+            ]
+        );
+    }
+
+    #[test]
+    fn metadata_uris_follow_the_pods_link_local_route() {
+        let env = |link_local| {
+            with_credentials_env(
+                &[(plan("web", true), vec![("APP".into(), "1".into())])],
+                "task-1",
+                link_local,
+                "http://fakecloud.fc.svc:4566",
+            )
+            .remove(0)
+            .1
+        };
+        // The task's own env first, the agent variables after it.
+        assert_eq!(
+            env(true),
+            vec![
+                ("APP".to_string(), "1".to_string()),
+                (
+                    "ECS_CONTAINER_METADATA_URI".to_string(),
+                    "http://169.254.170.2/v3/task-1".to_string()
+                ),
+                (
+                    "ECS_CONTAINER_METADATA_URI_V4".to_string(),
+                    "http://169.254.170.2/v4/task-1".to_string()
+                ),
+            ]
+        );
+        assert_eq!(
+            env(false)[1..],
+            [
+                (
+                    "ECS_CONTAINER_METADATA_URI".to_string(),
+                    "http://fakecloud.fc.svc:4566/_fakecloud/ecs/v3/task-1".to_string()
+                ),
+                (
+                    "ECS_CONTAINER_METADATA_URI_V4".to_string(),
+                    "http://fakecloud.fc.svc:4566/_fakecloud/ecs/v4/task-1".to_string()
+                ),
+            ]
+        );
     }
 
     #[test]

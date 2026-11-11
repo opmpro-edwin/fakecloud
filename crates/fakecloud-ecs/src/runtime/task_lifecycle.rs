@@ -71,24 +71,10 @@ impl EcsRuntime {
             // the container reaches them via the platform host alias —
             // `host.docker.internal` for docker, `host.containers.internal`
             // for podman (issue #1539).
-            // The task-role credentials variable is added at launch, once we
-            // know whether the container's namespace reaches the agent's
-            // link-local address (see `task_creds`).
+            // The task-role credentials and task metadata variables are added
+            // at launch, once we know whether the container's namespace
+            // reaches the agent's link-local address (see `task_creds`).
             let host_alias = &self.net.host_alias;
-            env.push((
-                "ECS_CONTAINER_METADATA_URI".into(),
-                format!(
-                    "http://{host_alias}:{}/_fakecloud/ecs/v3/{}",
-                    self.server_port, task_id
-                ),
-            ));
-            env.push((
-                "ECS_CONTAINER_METADATA_URI_V4".into(),
-                format!(
-                    "http://{host_alias}:{}/_fakecloud/ecs/v4/{}",
-                    self.server_port, task_id
-                ),
-            ));
             super::aws_env::push_aws_sdk_env(
                 &mut env,
                 &format!("http://{host_alias}:{}", self.server_port),
@@ -320,15 +306,14 @@ impl EcsRuntime {
             if extra_ca.is_some() {
                 super::extra_ca::push_ssl_cert_file(&mut env);
             }
-            if rp.plan.has_task_role {
-                // A `none`-mode container gets the agent's relative URI with
-                // nothing behind it, as on ECS (it has no network).
-                env.extend(super::task_creds::credentials_env(
-                    task_id,
-                    holder.is_some() || !wants_holder,
-                    &format!("http://{}:{}", self.net.host_alias, self.server_port),
-                ));
-            }
+            // fakecloud's agent variables go last, after the task's own env
+            // (the engine keeps the last `-e` of a name).
+            env.extend(super::task_creds::agent_env(
+                &rp.plan,
+                task_id,
+                holder.is_some(),
+                &format!("http://{}:{}", self.net.host_alias, self.server_port),
+            ));
             let network = match holder.as_deref() {
                 Some(holder) => ContainerNetwork::Joined { holder },
                 None => ContainerNetwork::Own {

@@ -269,7 +269,9 @@ async fn ecs_task_role_credentials_at_link_local_address_with_podman() {
                     "echo RELATIVE_URI=[$AWS_CONTAINER_CREDENTIALS_RELATIVE_URI]; \
                      wget -qO- \"http://169.254.170.2$AWS_CONTAINER_CREDENTIALS_RELATIVE_URI\" \
                      | grep -o '\"RoleArn\":\"[^\"]*\"'; \
-                     wget -qO- \"$ECS_CONTAINER_METADATA_URI_V4\" >/dev/null && echo META=ok",
+                     echo META_URI_V4=[$ECS_CONTAINER_METADATA_URI_V4]; \
+                     wget -qO- \"$ECS_CONTAINER_METADATA_URI_V4\" >/dev/null && echo META=ok; \
+                     wget -qO- \"$AWS_ENDPOINT_URL/_fakecloud/health\" >/dev/null && echo HOST_ALIAS=ok",
                 )
                 .build(),
         )
@@ -343,8 +345,14 @@ async fn ecs_task_role_credentials_at_link_local_address_with_podman() {
         text.contains(&format!("\"RoleArn\":\"{role_arn}\"")),
         "task logs: {logs}"
     );
-    // The host alias still resolves inside the holder's namespace.
+    // Task metadata comes from the agent's address, as on ECS.
+    assert!(
+        text.contains(&format!("META_URI_V4=[http://169.254.170.2/v4/{task_id}]")),
+        "task logs: {logs}"
+    );
     assert!(text.contains("META=ok"), "task logs: {logs}");
+    // The host alias still resolves inside the holder's namespace.
+    assert!(text.contains("HOST_ALIAS=ok"), "task logs: {logs}");
 
     let holders = podman(&[
         "ps",

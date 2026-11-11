@@ -583,18 +583,37 @@ async fn run_role_task_to_completion(
     )
 }
 
-/// Fetches the credentials at the agent address + relative URI and the task
-/// metadata at `ECS_CONTAINER_METADATA_URI_V4`, which names fakecloud by the
-/// runtime's host alias: a container joining its holder's namespace shares
-/// the holder's `/etc/hosts`, `--add-host` entry included.
+/// Fetches the credentials at the agent address + relative URI, the task
+/// metadata at `ECS_CONTAINER_METADATA_URI_V4` (the agent's
+/// `169.254.170.2/v4/<task-id>`, as on ECS), and fakecloud by the runtime's
+/// host alias (`AWS_ENDPOINT_URL`): a container joining its holder's
+/// namespace shares the holder's `/etc/hosts`, `--add-host` entry included.
 const LINK_LOCAL_PROBE: &str =
     "wget -qO- \"http://169.254.170.2$AWS_CONTAINER_CREDENTIALS_RELATIVE_URI\" \
      | grep -o '\"RoleArn\":\"[^\"]*\"'; \
      echo RELATIVE_URI=[$AWS_CONTAINER_CREDENTIALS_RELATIVE_URI]; \
-     wget -qO- \"$ECS_CONTAINER_METADATA_URI_V4\" >/dev/null && echo META=ok";
+     echo META_URI=[$ECS_CONTAINER_METADATA_URI] META_URI_V4=[$ECS_CONTAINER_METADATA_URI_V4]; \
+     wget -qO- \"$ECS_CONTAINER_METADATA_URI_V4\" >/dev/null && echo META=ok; \
+     wget -qO- \"$ECS_CONTAINER_METADATA_URI\" >/dev/null && echo META_V3=ok; \
+     wget -qO- \"$AWS_ENDPOINT_URL/_fakecloud/health\" >/dev/null && echo HOST_ALIAS=ok";
+
+/// What [`LINK_LOCAL_PROBE`] prints when the agent's link-local surface
+/// serves the task's metadata and the host alias still reaches fakecloud.
+fn assert_link_local_metadata(logs: &str, task_id: &str) {
+    assert!(
+        logs.contains(&format!(
+            "META_URI=[http://169.254.170.2/v3/{task_id}] \
+             META_URI_V4=[http://169.254.170.2/v4/{task_id}]"
+        )),
+        "{logs}"
+    );
+    assert!(logs.contains("META=ok"), "{logs}");
+    assert!(logs.contains("META_V3=ok"), "{logs}");
+    assert!(logs.contains("HOST_ALIAS=ok"), "{logs}");
+}
 
 /// A bridge-mode task-role container keeps reaching fakecloud by the host
-/// alias (task metadata) while its credentials come from 169.254.170.2.
+/// alias while its credentials and task metadata come from 169.254.170.2.
 #[tokio::test]
 async fn bridge_task_reaches_the_link_local_endpoint_and_the_host_alias() {
     if !require_docker_or_skip("bridge_task_reaches_the_link_local_endpoint_and_the_host_alias") {
@@ -616,7 +635,7 @@ async fn bridge_task_reaches_the_link_local_endpoint_and_the_host_alias() {
         logs.contains(&format!("RELATIVE_URI=[/v2/credentials/{task_id}]")),
         "{logs}"
     );
-    assert!(logs.contains("META=ok"), "{logs}");
+    assert_link_local_metadata(&logs, &task_id);
 }
 
 /// A `none`-mode task has no network: as on ECS it gets the relative URI but
@@ -711,7 +730,7 @@ async fn awsvpc_task_reaches_the_link_local_endpoint() {
         LINK_LOCAL_PROBE,
     )
     .await;
-    assert!(logs.contains("META=ok"), "{logs}");
+    assert_link_local_metadata(&logs, &task_id);
     assert!(
         logs.contains("\"RoleArn\":\"arn:aws:iam::123456789012:role/awsvpc-creds-role\""),
         "{logs}"
