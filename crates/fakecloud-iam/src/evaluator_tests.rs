@@ -2563,10 +2563,7 @@ fn role_arn_principal_deny_applies_to_every_session_of_the_role() {
 
 #[test]
 fn session_arn_principal_matches_only_that_session() {
-    let policy = bucket_policy_for(
-        "Allow",
-        "arn:aws:sts::111111111111:assumed-role/app/task-1",
-    );
+    let policy = bucket_policy_for("Allow", "arn:aws:sts::111111111111:assumed-role/app/task-1");
     let same = assumed_role_principal(ACCT_A, "app/task-1");
     assert_eq!(eval_bucket(&policy, &same, ACCT_A), Decision::Allow);
     let sibling = assumed_role_principal(ACCT_A, "app/task-2");
@@ -2636,10 +2633,7 @@ fn role_prefix_names_do_not_collide() {
     // A role and its suffixed namesake: a grant to `app` is not a grant to
     // `app-break-glass`, and the other way round.
     let vault = bucket_policy_for("Allow", "arn:aws:iam::111111111111:role/app");
-    let glass = bucket_policy_for(
-        "Allow",
-        "arn:aws:iam::111111111111:role/app-break-glass",
-    );
+    let glass = bucket_policy_for("Allow", "arn:aws:iam::111111111111:role/app-break-glass");
     let vault_s = assumed_role_principal(ACCT_A, "app/x");
     let glass_s = assumed_role_principal(ACCT_A, "app-break-glass/x");
     assert_eq!(eval_bucket(&vault, &vault_s, ACCT_A), Decision::Allow);
@@ -2676,10 +2670,8 @@ fn role_arn_grant_is_capped_by_session_policy_and_boundary() {
     let p = assumed_role_principal(ACCT_A, "app/task-1");
     let r = req(&p, "s3:GetObject", "arn:aws:s3:::bucket/key");
     let role_grant = bucket_policy_for("Allow", "arn:aws:iam::111111111111:role/app");
-    let session_grant = bucket_policy_for(
-        "Allow",
-        "arn:aws:sts::111111111111:assumed-role/app/task-1",
-    );
+    let session_grant =
+        bucket_policy_for("Allow", "arn:aws:sts::111111111111:assumed-role/app/task-1");
     let cap = allows_only_sqs();
     let s3_ok = vec![doc(allow_get_wildcard())];
     for (name, boundary, session) in [

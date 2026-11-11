@@ -1192,8 +1192,7 @@ mod tests {
     #[test]
     fn assumed_role_iam_arn_maps_session_to_role() {
         assert_eq!(
-            assumed_role_iam_arn("arn:aws:sts::123456789012:assumed-role/app/task-1")
-                .as_deref(),
+            assumed_role_iam_arn("arn:aws:sts::123456789012:assumed-role/app/task-1").as_deref(),
             Some("arn:aws:iam::123456789012:role/app")
         );
         assert_eq!(
