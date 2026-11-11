@@ -40,7 +40,7 @@ Verification failures return protocol-correct AWS errors before business logic r
 | Clock skew > 15 min | `RequestTimeTooSkewed` |
 | Malformed auth header | `IncompleteSignature` |
 
-Header-based `Authorization: AWS4-HMAC-SHA256 ...` and query-string (presigned URL) signatures are both supported. STS temporary credentials from `AssumeRole`, `GetSessionToken`, and `GetFederationToken` are persisted per-request and verified against the secret key the client received when it called STS.
+Header-based `Authorization: AWS4-HMAC-SHA256 ...` and query-string (presigned URL) signatures are both supported. The ECR registry API (`/v2/...`) is not SigV4-signed: `docker login` sends `Authorization: Basic base64("AWS:<token>")` with a `GetAuthorizationToken` token, so a Basic header there skips signature verification and the registry checks it, answering 401 for credentials it refuses, as on AWS. A Basic header on any other path is still `IncompleteSignature`. STS temporary credentials from `AssumeRole`, `GetSessionToken`, and `GetFederationToken` are persisted per-request and verified against the secret key the client received when it called STS.
 
 ## `--iam off|soft|strict`
 

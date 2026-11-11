@@ -316,7 +316,7 @@ async fn dispatch_inner(
                         action: String::new(),
                         protocol: AwsProtocol::Rest,
                     }
-                } else if parts.uri.path() == "/v2" || parts.uri.path().starts_with("/v2/") {
+                } else if is_oci_registry_path(parts.uri.path()) {
                     // OCI Distribution v2 protocol. Docker CLI / OCI clients
                     // use Basic auth (not SigV4) and GET /v2/ with no body,
                     // so this must be matched before the apigateway fallback.
@@ -503,8 +503,19 @@ async fn dispatch_inner(
     let is_fully_anonymous = auth_header.is_empty()
         && !query_params.contains_key("X-Amz-Credential")
         && sigv2_presigned_access_key(&query_params).is_none();
+    // ECR's registry API (OCI Distribution, `/v2/...`) authenticates
+    // `docker login` / pull / push with `Authorization: Basic
+    // base64("AWS:<token>")`, a `GetAuthorizationToken` token, not SigV4. AWS
+    // accepts it whatever SigV4 checks the ECR API applies, so it skips
+    // signature verification here; the ECR registry handler validates the
+    // credentials and answers 401 for bad ones. A Basic header on any other
+    // path is still verified (and rejected) below.
+    let registry_basic_auth = detected.service == "ecr"
+        && is_oci_registry_path(parts.uri.path())
+        && is_basic_authorization(auth_header);
     if config.verify_sigv4
         && !is_fully_anonymous
+        && !registry_basic_auth
         && !is_root_bypass(caller_akid)
         && config.credential_resolver.is_some()
     {
@@ -1810,6 +1821,19 @@ fn sanitize_header_value(s: &str) -> String {
 /// and `Expires`; all three must be present for the URL to be a SigV2 presign.
 /// Returns None for SigV4 presigns (which use `X-Amz-Credential`) or unsigned
 /// requests.
+/// The ECR registry (OCI Distribution v2) surface: `/v2` and `/v2/...`.
+fn is_oci_registry_path(path: &str) -> bool {
+    path == "/v2" || path.starts_with("/v2/")
+}
+
+/// `Authorization: Basic <credentials>` (the scheme is case-insensitive,
+/// RFC 7617).
+fn is_basic_authorization(header: &str) -> bool {
+    header
+        .get(..6)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("basic "))
+}
+
 fn sigv2_presigned_access_key(query_params: &HashMap<String, String>) -> Option<String> {
     if query_params.contains_key("Signature") && query_params.contains_key("Expires") {
         query_params.get("AWSAccessKeyId").cloned()
@@ -2803,6 +2827,101 @@ mod tests {
         // aws:userid keeps the session's id.
         assert_eq!(ctx.aws_userid.as_deref(), Some("AROAVAULT:task-1"));
         assert_eq!(ctx.aws_principal_type.as_deref(), Some("AssumedRole"));
+    }
+
+    /// Under `--verify-sigv4`, a Basic-authenticated request to the ECR
+    /// registry (`/v2/...`) skips SigV4 verification and reaches ECR, which
+    /// owns the credential check; Basic anywhere else is still refused as a
+    /// malformed signature.
+    #[tokio::test]
+    async fn verify_sigv4_lets_basic_auth_reach_the_ecr_registry_only() {
+        use crate::service::{AwsResponse, AwsServiceError};
+        struct Registry;
+        #[async_trait::async_trait]
+        impl crate::service::AwsService for Registry {
+            fn service_name(&self) -> &str {
+                "ecr"
+            }
+            async fn handle(&self, req: AwsRequest) -> Result<AwsResponse, AwsServiceError> {
+                // Stand-in for the registry's own credential check.
+                let auth = req
+                    .headers
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                if is_basic_authorization(auth) && auth[6..] == *"QVdTOmdvb2Q=" {
+                    Ok(AwsResponse::ok_json(serde_json::json!({})))
+                } else {
+                    Err(AwsServiceError::aws_error(
+                        StatusCode::UNAUTHORIZED,
+                        "UNAUTHORIZED",
+                        "authentication required",
+                    ))
+                }
+            }
+            fn supported_actions(&self) -> &[&str] {
+                &[]
+            }
+        }
+        struct NoKeys;
+        impl crate::auth::CredentialResolver for NoKeys {
+            fn resolve(&self, _: &str) -> Option<crate::auth::ResolvedCredential> {
+                None
+            }
+        }
+        let mut registry = ServiceRegistry::new();
+        registry.register(Arc::new(Registry));
+        let registry = Arc::new(registry);
+        let mut cfg = DispatchConfig::new("us-east-1", "123456789012");
+        cfg.verify_sigv4 = true;
+        cfg.credential_resolver = Some(Arc::new(NoKeys));
+        let cfg = Arc::new(cfg);
+        let send = |method: &str, uri: &str, auth: &str, target: Option<&str>| {
+            let mut builder = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("authorization", auth);
+            if let Some(t) = target {
+                builder = builder
+                    .header("x-amz-target", t)
+                    .header("content-type", "application/x-amz-json-1.1");
+            }
+            let request = builder.body(Body::empty()).unwrap();
+            dispatch_inner(
+                "127.0.0.1:5000".parse().unwrap(),
+                registry.clone(),
+                cfg.clone(),
+                HashMap::new(),
+                request,
+            )
+        };
+        // `base64("AWS:good")`: the registry accepts it.
+        for uri in ["/v2/", "/v2", "/v2/app/manifests/latest"] {
+            let resp = send("GET", uri, "Basic QVdTOmdvb2Q=", None).await;
+            assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+        }
+        // The scheme is case-insensitive.
+        let resp = send("GET", "/v2/", "basic QVdTOmdvb2Q=", None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        // A bad credential is the registry's 401, not a SigV4 403.
+        let resp = send("GET", "/v2/", "Basic QVdTOmJhZA==", None).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        // Basic on the ECR API (not the registry) is still verified.
+        let resp = send(
+            "POST",
+            "/",
+            "Basic QVdTOmdvb2Q=",
+            Some("AmazonEC2ContainerRegistry_V20150921.DescribeRepositories"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("IncompleteSignature"));
+        // A non-Basic, non-SigV4 header on the registry is still verified.
+        let resp = send("GET", "/v2/", "Bearer abc", None).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
     #[test]
