@@ -205,7 +205,7 @@ The resource's owning account is parsed from the ARN. S3 ARNs have an empty acco
 | `"Principal": {"AWS": "arn:aws:iam::ACCOUNT:root"}` | Any principal whose account ID is `ACCOUNT` |
 | `"Principal": {"AWS": "ACCOUNT"}` | 12-digit account ID shorthand, equivalent to `...:root` |
 | `"Principal": {"AWS": "arn:aws:iam::ACCOUNT:user/alice"}` | Exact principal ARN match |
-| `"Principal": {"AWS": "arn:aws:iam::ACCOUNT:role/<path><name>"}` | The role's every assumed-role session (`arn:aws:sts::ACCOUNT:assumed-role/<name>/*`); a session ARN entry matches only that session. Same in `NotPrincipal` |
+| `"Principal": {"AWS": "arn:aws:iam::ACCOUNT:role/<path><name>"}` | The role's every assumed-role session (`arn:aws:sts::ACCOUNT:assumed-role/<name>/*`); a session ARN entry matches only that session. Granted through the role, so the session policy and the role's permissions boundary still limit it (a session-ARN grant is not limited), as on AWS. In `NotPrincipal` matching is exact: a role ARN does not exempt its sessions, list the session ARN |
 | `"Principal": {"AWS": [...]}` | List form — any entry matches |
 | `"Principal": {"Service": "events.amazonaws.com"}` | Matches the service principal itself when fakecloud makes a request as that service (CloudFront fetching an S3 origin through an origin access control, see below), and an assumed-role session of a service-linked role for that service (path `aws-service-role/<service>/`) |
 | `"Principal": {"Federated": "<provider>"}` | Matches a federated session minted by `AssumeRoleWithSAML` / `AssumeRoleWithWebIdentity` whose provider ARN equals `<provider>`. Used by IAM role trust policies. |

@@ -2603,27 +2603,151 @@ fn pathed_role_principal_needs_the_role_path() {
 }
 
 #[test]
-fn not_principal_role_arn_exempts_its_sessions() {
-    let policy = doc(json!({
-        "Statement": [{
-            "Effect": "Deny",
-            "NotPrincipal": {"AWS": "arn:aws:iam::111111111111:role/app"},
-            "Action": "s3:GetObject",
-            "Resource": "arn:aws:s3:::bucket/key"
-        }]
-    }));
+fn not_principal_matches_exact_arns_only() {
+    // AWS: a role ARN in NotPrincipal does not exempt the role's sessions;
+    // the session ARN itself must be listed.
+    let deny_except = |arn: &str| {
+        doc(json!({
+            "Statement": [{
+                "Effect": "Deny",
+                "NotPrincipal": {"AWS": arn},
+                "Action": "s3:GetObject",
+                "Resource": "arn:aws:s3:::bucket/key"
+            }]
+        }))
+    };
     let identity = doc(allow_get_wildcard());
     let vault = assumed_role_principal(ACCT_A, "app/task-1");
     let r = req(&vault, "s3:GetObject", "arn:aws:s3:::bucket/key");
+    let role_only = deny_except("arn:aws:iam::111111111111:role/app");
     assert_eq!(
-        evaluate_with_resource_policy(&[identity.clone()], Some(&policy), &r, ACCT_A),
+        evaluate_with_resource_policy(&[identity.clone()], Some(&role_only), &r, ACCT_A),
+        Decision::ExplicitDeny
+    );
+    let session = deny_except("arn:aws:sts::111111111111:assumed-role/app/task-1");
+    assert_eq!(
+        evaluate_with_resource_policy(&[identity], Some(&session), &r, ACCT_A),
         Decision::Allow
     );
-    let other = assumed_role_principal(ACCT_A, "other/task-1");
-    let r = req(&other, "s3:GetObject", "arn:aws:s3:::bucket/key");
+}
+
+#[test]
+fn role_prefix_names_do_not_collide() {
+    // A role and its suffixed namesake: a grant to `app` is not a grant to
+    // `app-break-glass`, and the other way round.
+    let vault = bucket_policy_for("Allow", "arn:aws:iam::111111111111:role/app");
+    let glass = bucket_policy_for(
+        "Allow",
+        "arn:aws:iam::111111111111:role/app-break-glass",
+    );
+    let vault_s = assumed_role_principal(ACCT_A, "app/x");
+    let glass_s = assumed_role_principal(ACCT_A, "app-break-glass/x");
+    assert_eq!(eval_bucket(&vault, &vault_s, ACCT_A), Decision::Allow);
     assert_eq!(
-        evaluate_with_resource_policy(&[identity], Some(&policy), &r, ACCT_A),
-        Decision::ExplicitDeny
+        eval_bucket(&vault, &glass_s, ACCT_A),
+        Decision::ImplicitDeny
+    );
+    assert_eq!(eval_bucket(&glass, &glass_s, ACCT_A), Decision::Allow);
+    assert_eq!(
+        eval_bucket(&glass, &vault_s, ACCT_A),
+        Decision::ImplicitDeny
+    );
+    // Nor through a (server-built) aws:PrincipalArn naming the other role.
+    let mut r = req(&glass_s, "s3:GetObject", "arn:aws:s3:::bucket/key");
+    r.context.aws_principal_arn = Some("arn:aws:iam::111111111111:role/app".into());
+    assert_eq!(
+        evaluate_with_resource_policy(&[], Some(&vault), &r, ACCT_A),
+        Decision::ImplicitDeny
+    );
+}
+
+/// A session policy / permissions boundary that does not allow S3.
+fn allows_only_sqs() -> Vec<PolicyDocument> {
+    vec![doc(json!({
+        "Statement": [{"Effect": "Allow", "Action": "sqs:SendMessage", "Resource": "*"}]
+    }))]
+}
+
+#[test]
+fn role_arn_grant_is_capped_by_session_policy_and_boundary() {
+    // AWS: a resource-policy grant to the role ARN is limited by the session
+    // policy and the role's permissions boundary; one to the session ARN is
+    // not.
+    let p = assumed_role_principal(ACCT_A, "app/task-1");
+    let r = req(&p, "s3:GetObject", "arn:aws:s3:::bucket/key");
+    let role_grant = bucket_policy_for("Allow", "arn:aws:iam::111111111111:role/app");
+    let session_grant = bucket_policy_for(
+        "Allow",
+        "arn:aws:sts::111111111111:assumed-role/app/task-1",
+    );
+    let cap = allows_only_sqs();
+    let s3_ok = vec![doc(allow_get_wildcard())];
+    for (name, boundary, session) in [
+        ("session policy", None, Some(cap.as_slice())),
+        ("boundary", Some(cap.as_slice()), None),
+    ] {
+        assert_eq!(
+            evaluate_with_resource_policy_and_gates(
+                &[],
+                boundary,
+                session,
+                Some(&role_grant),
+                &r,
+                ACCT_A
+            ),
+            Decision::ImplicitDeny,
+            "role grant under a {name} that does not allow it"
+        );
+        assert_eq!(
+            evaluate_with_resource_policy_and_gates(
+                &[],
+                boundary,
+                session,
+                Some(&session_grant),
+                &r,
+                ACCT_A
+            ),
+            Decision::Allow,
+            "session grant under a {name}"
+        );
+    }
+    // Layers that allow the action let the role grant through.
+    assert_eq!(
+        evaluate_with_resource_policy_and_gates(
+            &[],
+            Some(&s3_ok),
+            Some(&s3_ok),
+            Some(&role_grant),
+            &r,
+            ACCT_A
+        ),
+        Decision::Allow
+    );
+    // Same for a KMS key policy's direct role grant.
+    let kp = assumed_role_principal(KMS_ACCT, "app/task-1");
+    let kr = req(&kp, "kms:Decrypt", KMS_KEY_ARN);
+    let key_policy = doc(json!({
+        "Statement": [{
+            "Effect": "Allow",
+            "Principal": {"AWS": "arn:aws:iam::123456789012:role/app"},
+            "Action": "kms:Decrypt",
+            "Resource": "*"
+        }]
+    }));
+    assert_eq!(
+        evaluate_with_resource_policy_and_gates(
+            &[],
+            None,
+            Some(&cap),
+            Some(&key_policy),
+            &kr,
+            KMS_ACCT
+        ),
+        Decision::ImplicitDeny
+    );
+    assert_eq!(
+        evaluate_with_resource_policy_and_gates(&[], None, None, Some(&key_policy), &kr, KMS_ACCT),
+        Decision::Allow
     );
 }
 
@@ -2689,4 +2813,17 @@ fn principal_arn_for_conditions_resolves_the_role_path() {
     );
     let user = principal_in(ACCT_A, "alice");
     assert_eq!(principal_arn_for_conditions(Some(&state), &user), user.arn);
+    // Another account's or partition's session of a same-named role never
+    // borrows this account's role path.
+    let foreign = assumed_role_principal(ACCT_B, "svc/task-1");
+    assert_eq!(
+        principal_arn_for_conditions(Some(&state), &foreign),
+        "arn:aws:iam::222222222222:role/svc"
+    );
+    let mut china = assumed_role_principal(ACCT_A, "svc/task-1");
+    china.arn = "arn:aws-cn:sts::111111111111:assumed-role/svc/task-1".into();
+    assert_eq!(
+        principal_arn_for_conditions(Some(&state), &china),
+        "arn:aws-cn:iam::111111111111:role/svc"
+    );
 }

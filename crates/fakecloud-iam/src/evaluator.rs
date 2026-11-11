@@ -709,7 +709,7 @@ pub fn evaluate_with_resource_policy_and_gates_and_scps(
         .is_some_and(|(svc, _)| svc.eq_ignore_ascii_case("kms"));
     if same_account && is_kms {
         if let Some(policy) = resource_policy {
-            return evaluate_kms_same_account(policy, identity_gated, request);
+            return evaluate_kms_same_account(policy, identity_gated, boundary, session, request);
         }
     }
     // Same-account with no resource policy: preserve the identity-only
@@ -718,7 +718,13 @@ pub fn evaluate_with_resource_policy_and_gates_and_scps(
         return identity_gated;
     }
     let resource = match resource_policy {
-        Some(policy) => evaluate_inner(std::slice::from_ref(policy), request, true),
+        Some(policy) => evaluate_resource_grant(
+            std::slice::from_ref(policy),
+            request,
+            false,
+            boundary,
+            session,
+        ),
         None => Decision::ImplicitDeny,
     };
     if matches!(resource, Decision::ExplicitDeny) {
@@ -753,15 +759,19 @@ pub fn evaluate_with_resource_policy_and_gates_and_scps(
 fn evaluate_kms_same_account(
     key_policy: &PolicyDocument,
     identity_gated: Decision,
+    boundary: Option<&[PolicyDocument]>,
+    session: Option<&[PolicyDocument]>,
     request: &EvalRequest<'_>,
 ) -> Decision {
     let policies = std::slice::from_ref(key_policy);
-    let full = evaluate_inner_scoped(policies, request, true, false);
+    let full = evaluate_inner_scoped(policies, request, true, false, true);
     if matches!(full, Decision::ExplicitDeny) {
         return Decision::ExplicitDeny;
     }
-    // Direct grant ignores the account-wide delegation entries.
-    let direct = evaluate_inner_scoped(policies, request, true, true);
+    // Direct grant ignores the account-wide delegation entries. A grant to
+    // the caller's role (not its session) is still capped by the session
+    // policy and permissions boundary.
+    let direct = evaluate_resource_grant(policies, request, true, boundary, session);
     if matches!(direct, Decision::Allow) {
         return Decision::Allow;
     }
@@ -778,23 +788,62 @@ fn evaluate_inner(
     request: &EvalRequest<'_>,
     is_resource_policy: bool,
 ) -> Decision {
-    evaluate_inner_scoped(policies, request, is_resource_policy, false)
+    evaluate_inner_scoped(policies, request, is_resource_policy, false, true)
+}
+
+/// A resource policy's decision for `request`, honoring how AWS caps a grant
+/// to a role. A statement naming the caller's own ARN -- the session ARN for
+/// an assumed role -- grants on its own. A statement that matches only
+/// because it names the session's *role* ARN grants through the role, so the
+/// session policy and the role's permissions boundary still limit it: the
+/// grant holds only if every present layer allows the request. Denies apply
+/// either way.
+fn evaluate_resource_grant(
+    policies: &[PolicyDocument],
+    request: &EvalRequest<'_>,
+    ignore_account_wide: bool,
+    boundary: Option<&[PolicyDocument]>,
+    session: Option<&[PolicyDocument]>,
+) -> Decision {
+    let with_roles = evaluate_inner_scoped(policies, request, true, ignore_account_wide, true);
+    if !matches!(with_roles, Decision::Allow) {
+        return with_roles;
+    }
+    if matches!(
+        evaluate_inner_scoped(policies, request, true, ignore_account_wide, false),
+        Decision::Allow
+    ) {
+        return Decision::Allow;
+    }
+    let layer_allows = |layer: Option<&[PolicyDocument]>| {
+        layer.is_none_or(|docs| matches!(evaluate_inner(docs, request, false), Decision::Allow))
+    };
+    if layer_allows(boundary) && layer_allows(session) {
+        Decision::Allow
+    } else {
+        Decision::ImplicitDeny
+    }
 }
 
 /// As [`evaluate_inner`], but when `ignore_account_wide` is set, account-wide
 /// resource-policy principals (`"AWS": "*"` / account root) do not match. KMS
 /// evaluation uses this to isolate a direct grant of a specific principal from
-/// the account-root delegation entry.
+/// the account-root delegation entry. When `match_role_sessions` is set, a
+/// role ARN in a `Principal` matches every session of that role (see
+/// [`evaluate_resource_grant`] for why a caller may want it off).
 fn evaluate_inner_scoped(
     policies: &[PolicyDocument],
     request: &EvalRequest<'_>,
     is_resource_policy: bool,
     ignore_account_wide: bool,
+    match_role_sessions: bool,
 ) -> Decision {
     let mut allowed = false;
     // The IAM role behind an assumed-role caller: a role ARN in a resource
     // policy's Principal names every session of that role.
-    let session_role = session_role_arn(request);
+    let session_role = match_role_sessions
+        .then(|| session_role_arn(request))
+        .flatten();
     let session_role = session_role.as_deref();
     for policy in policies {
         for statement in &policy.statements {
@@ -836,7 +885,10 @@ fn evaluate_inner_scoped(
                         continue;
                     }
                     // NotPrincipal: statement applies when caller does NOT match any entry.
-                    if principal_matches_scoped(refs, request.principal, session_role, false) {
+                    // Matching is exact: a role ARN here does not exempt the
+                    // role's sessions -- AWS requires the session ARN itself
+                    // to be listed.
+                    if principal_matches_scoped(refs, request.principal, None, false) {
                         continue;
                     }
                 }
