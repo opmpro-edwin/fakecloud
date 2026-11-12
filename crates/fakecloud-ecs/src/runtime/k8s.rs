@@ -791,6 +791,8 @@ impl EcsRuntime {
             final_stop_code,
             final_reason.clone(),
         );
+        // No early deregistration on this backend: the targets go now.
+        self.deregister_lb_targets(state, account_id, task_id);
         self.release_task_network(state, account_id, task_id);
         let reason_msg = final_reason.unwrap_or_else(|| format!("Exit code {primary}"));
         self.emit_state_change(

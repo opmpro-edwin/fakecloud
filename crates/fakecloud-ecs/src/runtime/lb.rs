@@ -54,16 +54,19 @@ impl EcsRuntime {
         }
     }
 
-    /// A `STOPPED` task's network goes: its load balancer targets (if a stop
-    /// that never passed `STOPPING` left them), its published awsvpc ports
-    /// and its ENI, as on ECS.
+    /// A `STOPPED` task's published awsvpc ports and its ENI go, as on ECS.
+    /// Its load balancer targets are not touched: on the Docker backend they
+    /// went when it started stopping ([`Self::begin_stopping`]), and its
+    /// containers are already gone, so a replacement may by now have taken
+    /// the same `host:port` target (bridge / host mode with a fixed host
+    /// port) -- deregistering again would remove the replacement's. The
+    /// Kubernetes backend deregisters on its own before calling this.
     pub(super) fn release_task_network(
         &self,
         state: &SharedEcsState,
         account_id: &str,
         task_id: &str,
     ) {
-        self.deregister_lb_targets(state, account_id, task_id);
         let accounts = state.read();
         let Some(task) = accounts.get(account_id).and_then(|s| s.tasks.get(task_id)) else {
             return;
@@ -83,6 +86,25 @@ impl EcsRuntime {
     /// that is not RUNNING (already stopping, or stopped before it ran).
     pub(super) fn begin_stopping(&self, state: &SharedEcsState, account_id: &str, task_id: &str) {
         if mark_stopping(state, account_id, task_id) {
+            self.deregister_lb_targets(state, account_id, task_id);
+        }
+    }
+
+    /// Register a task that just went RUNNING with its load balancers,
+    /// unless a stop has landed meanwhile. A stop between the RUNNING
+    /// transition and this registration already moved the task to
+    /// `STOPPING` (deregistering nothing), and nothing would take the new
+    /// targets out again while its containers drain: re-check after
+    /// registering and deregister such a task.
+    pub(super) fn register_lb_targets_unless_stopping(
+        &self,
+        state: &SharedEcsState,
+        account_id: &str,
+        task_id: &str,
+    ) {
+        self.register_lb_targets(state, account_id, task_id);
+        if task_desired_stopped(state, account_id, task_id) {
+            mark_stopping(state, account_id, task_id);
             self.deregister_lb_targets(state, account_id, task_id);
         }
     }

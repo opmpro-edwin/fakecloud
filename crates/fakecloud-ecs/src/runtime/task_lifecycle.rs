@@ -469,7 +469,7 @@ impl EcsRuntime {
         }
 
         mark_running_multi(state, account_id, task_id, &started);
-        self.register_lb_targets(state, account_id, task_id);
+        self.register_lb_targets_unless_stopping(state, account_id, task_id);
         self.emit_state_change(state, account_id, task_id, "RUNNING", None);
         // Persist the PENDING->RUNNING transition so DescribeTasks reports
         // RUNNING after a restart without waiting on restart reconciliation.

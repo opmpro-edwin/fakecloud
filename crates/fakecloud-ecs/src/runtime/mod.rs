@@ -4195,10 +4195,95 @@ mod tests {
             );
             assert!(stopping.await.unwrap());
 
-            // At STOPPED the ENI goes; deregistering again is harmless.
+            // At STOPPED the ENI goes.
             rt.release_task_network(&state, "000000000000", "t1");
             assert_eq!(*net.deleted_enis.lock(), ["eni-0task"]);
             assert!(net.targets.lock().is_empty());
+        }
+
+        /// The runtime with [`Net`] on its bus, and the target-group fixture.
+        fn net_runtime() -> (Arc<Net>, EcsRuntime, SharedEcsState) {
+            let net = Arc::new(Net::default());
+            let bus = DeliveryBus::new()
+                .with_elbv2_target_registration(net.clone())
+                .with_ec2_network_lookup(net.clone());
+            let rt = EcsRuntime::bare_for_tests().with_delivery_bus(Arc::new(bus));
+            let state: SharedEcsState = Arc::new(RwLock::new(awsvpc_task_behind_a_target_group()));
+            (net, rt, state)
+        }
+
+        fn set_status(state: &SharedEcsState, last: &str, desired: &str) {
+            let mut accounts = state.write();
+            let t = accounts
+                .get_mut("000000000000")
+                .unwrap()
+                .tasks
+                .get_mut("t1")
+                .unwrap();
+            t.last_status = last.into();
+            t.desired_status = desired.into();
+        }
+
+        /// A stop landing between the RUNNING transition and the target
+        /// registration found nothing to deregister and already moved the task
+        /// to STOPPING: the registration must not leave it routable.
+        #[test]
+        fn a_task_stopped_before_its_registration_is_not_left_a_target() {
+            let (net, rt, state) = net_runtime();
+            // StopTask's `begin_stopping` ran first: STOPPING, no targets yet.
+            set_status(&state, "RUNNING", "STOPPED");
+            rt.begin_stopping(&state, "000000000000", "t1");
+            assert!(net.targets.lock().is_empty());
+            rt.register_lb_targets_unless_stopping(&state, "000000000000", "t1");
+            assert!(net.targets.lock().is_empty(), "a stopping task is routable");
+
+            // A task nobody stopped is registered.
+            let (net, rt, state) = net_runtime();
+            set_status(&state, "RUNNING", "RUNNING");
+            rt.register_lb_targets_unless_stopping(&state, "000000000000", "t1");
+            assert_eq!(net.targets.lock().len(), 1);
+
+            // A stop between the RUNNING transition and the registration
+            // that `begin_stopping` has not seen yet: still deregistered, and
+            // the task shows STOPPING.
+            let (net, rt, state) = net_runtime();
+            set_status(&state, "RUNNING", "STOPPED");
+            rt.register_lb_targets_unless_stopping(&state, "000000000000", "t1");
+            assert!(net.targets.lock().is_empty());
+            assert_eq!(
+                state.read().get("000000000000").unwrap().tasks["t1"].last_status,
+                "STOPPING"
+            );
+        }
+
+        /// A replacement that took the stopped task's `host:port` target (its
+        /// containers gone, the port free) keeps it through the old task's
+        /// STOPPED cleanup.
+        #[test]
+        fn stopped_cleanup_leaves_a_replacements_target_alone() {
+            let (net, rt, state) = net_runtime();
+            set_status(&state, "RUNNING", "STOPPED");
+            rt.register_lb_targets(&state, "000000000000", "t1");
+            rt.begin_stopping(&state, "000000000000", "t1");
+            assert!(net.targets.lock().is_empty());
+            // The replacement registers the same target.
+            let same = {
+                let accounts = state.read();
+                let s = accounts.get("000000000000").unwrap();
+                compute_elbv2_targets(s, &s.tasks["t1"])
+            };
+            for (tg, targets) in same {
+                fakecloud_core::delivery::Elbv2TargetRegistration::register_targets(
+                    &*net,
+                    "000000000000",
+                    &tg,
+                    targets,
+                );
+            }
+            assert_eq!(net.targets.lock().len(), 1);
+            rt.release_task_network(&state, "000000000000", "t1");
+            assert_eq!(net.targets.lock().len(), 1, "the replacement's target went");
+            assert_eq!(*net.deleted_enis.lock(), ["eni-0task"]);
         }
 
         /// fakecloud's reset kills a task's containers instead of waiting out their
