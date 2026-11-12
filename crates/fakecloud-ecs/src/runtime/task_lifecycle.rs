@@ -365,7 +365,11 @@ impl EcsRuntime {
                 .write()
                 .entry(task_id.to_string())
                 .or_default()
-                .push((rp.plan.container_name.clone(), container_id.clone()));
+                .push((
+                    rp.plan.container_name.clone(),
+                    container_id.clone(),
+                    rp.plan.stop_timeout,
+                ));
             started.push(RunningContainer {
                 name: rp.plan.container_name.clone(),
                 container_id,
@@ -384,11 +388,23 @@ impl EcsRuntime {
         // marking the task RUNNING with a live workload the user asked to
         // kill. Mirrors the k8s backend, which observes a 404 from the
         // StopTask-deleted Pod and finalizes the same way.
+        // Each container's own stop timeout, by container name.
+        let stop_timeout_of = |name: &str| {
+            resolved_plans
+                .iter()
+                .find(|rp| rp.plan.container_name == name)
+                .map_or(DEFAULT_STOP_TIMEOUT_SECS, |rp| rp.plan.stop_timeout)
+        };
         if task_desired_stopped(state, account_id, task_id) {
+            mark_stopping(state, account_id, task_id);
+            self.stop_containers(
+                started
+                    .iter()
+                    .map(|rc| (rc.container_id.clone(), stop_timeout_of(&rc.name)))
+                    .collect(),
+            )
+            .await;
             for rc in &started {
-                let _ = self
-                    .cli_output(["stop", "--time", "10", &rc.container_id], CLI_CALL_TIMEOUT)
-                    .await;
                 let _ = self
                     .cli_output(["rm", "-f", &rc.container_id], CLI_CALL_TIMEOUT)
                     .await;
@@ -454,7 +470,9 @@ impl EcsRuntime {
 
         // Stop and reap any sidecars still running. Best-effort — failures
         // here shouldn't keep the task from transitioning to STOPPED.
+        mark_stopping(state, account_id, task_id);
         let mut final_containers = started.clone();
+        let mut stragglers: Vec<usize> = Vec::new();
         for (i, rc) in started.iter().enumerate() {
             if Some(i) == wait_outcome.exited_index {
                 final_containers[i].exit_code = Some(wait_outcome.exit_code);
@@ -492,19 +510,31 @@ impl EcsRuntime {
                 _ => false,
             };
             if still_running {
-                let _ = self
-                    .cli_output(["stop", "--time", "10", &rc.container_id], CLI_CALL_TIMEOUT)
-                    .await;
-                let wait_out = self
-                    .cli_output(["wait", &rc.container_id], CLI_CALL_TIMEOUT)
-                    .await;
-                if let Ok(out) = wait_out {
-                    let code: i64 = String::from_utf8_lossy(&out.stdout)
-                        .trim()
-                        .parse()
-                        .unwrap_or(-1);
-                    final_containers[i].exit_code = Some(code);
-                }
+                stragglers.push(i);
+            }
+        }
+        // Every straggler gets its stop signal at once and its own stop
+        // timeout, as the ECS agent stops a task's containers.
+        self.stop_containers(
+            stragglers
+                .iter()
+                .map(|&i| {
+                    let rc = &started[i];
+                    (rc.container_id.clone(), stop_timeout_of(&rc.name))
+                })
+                .collect(),
+        )
+        .await;
+        for i in stragglers {
+            let wait_out = self
+                .cli_output(["wait", &started[i].container_id], CLI_CALL_TIMEOUT)
+                .await;
+            if let Ok(out) = wait_out {
+                let code: i64 = String::from_utf8_lossy(&out.stdout)
+                    .trim()
+                    .parse()
+                    .unwrap_or(-1);
+                final_containers[i].exit_code = Some(code);
             }
         }
 
@@ -695,10 +725,13 @@ impl EcsRuntime {
         });
     }
 
-    /// Kill every container behind a task with the configured stop
-    /// timeout. Returns true if at least one container was killed. Called
-    /// synchronously from `StopTask`; the wait loop in `run_task_inner`
-    /// observes the exits and transitions the task to `STOPPED`.
+    /// Stop every container behind a task: each gets its stop signal at
+    /// once and is killed after its own stop timeout (`stopTimeout`, see
+    /// [`effective_stop_timeout`]). Returns true if the task had containers
+    /// to stop, once they have stopped; API handlers run it in the
+    /// background. The wait loop in `run_task_inner` shows the task
+    /// `STOPPING` meanwhile, observes the exits and transitions it to
+    /// `STOPPED`.
     pub async fn stop_task(&self, task_id: &str, reason: &str) -> bool {
         if let Some(k) = &self.k8s {
             tracing::info!(task = %task_id, reason = %reason, "ecs task stop requested (k8s)");
@@ -714,14 +747,32 @@ impl EcsRuntime {
         if list.is_empty() {
             return false;
         }
-        // `docker stop` sends SIGTERM then SIGKILL after a timeout.
-        for (_name, id) in &list {
-            let _ = self
-                .cli_output(["stop", "--time", "10", id], CLI_CALL_TIMEOUT)
-                .await;
+        if let Some(wake) = self.stop_requests.lock().get(task_id) {
+            wake.notify_one();
         }
         tracing::info!(task = %task_id, reason = %reason, "ecs task stop requested");
+        self.stop_containers(
+            list.iter()
+                .map(|(_name, id, secs)| (id.clone(), *secs))
+                .collect(),
+        )
+        .await;
         true
+    }
+
+    /// `stop` each `(container id, stop timeout)` concurrently and wait for
+    /// all of them: the stop signal now, `SIGKILL` after that container's
+    /// timeout. Best-effort.
+    pub(super) async fn stop_containers(&self, targets: Vec<(String, u32)>) {
+        let mut stops = tokio::task::JoinSet::new();
+        for (id, secs) in targets {
+            let cli = self.container_cli();
+            stops.spawn(async move {
+                let (args, budget) = stop_container_args(&id, secs);
+                let _ = cli.output(args, budget).await;
+            });
+        }
+        stops.join_all().await;
     }
 
     /// Kill every running container the runtime owns. Called on reset /
@@ -737,7 +788,7 @@ impl EcsRuntime {
             .containers
             .read()
             .values()
-            .flat_map(|list| list.iter().map(|(_, id)| id.clone()))
+            .flat_map(|list| list.iter().map(|(_, id, _)| id.clone()))
             .collect();
         for id in ids {
             let _ = self.cli_output(["kill", &id], CLI_CALL_TIMEOUT).await;

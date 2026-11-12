@@ -111,8 +111,13 @@ pub async fn cfn_launch_service_tasks(
             .clone()
             .run_task(state.clone(), id, account_id.clone());
     }
+    // Each stop waits out its containers' stop timeouts: run them in the
+    // background, side by side.
     for (id, reason) in stop_task_ids {
-        runtime.stop_task(&id, &reason).await;
+        let runtime = runtime.clone();
+        tokio::spawn(async move {
+            runtime.stop_task(&id, &reason).await;
+        });
     }
 }
 
@@ -149,11 +154,20 @@ pub async fn cfn_stop_service_tasks(
         ids
     };
 
-    for id in &task_ids {
-        runtime.stop_task(id, "CloudFormation stack deletion").await;
-        let mut accounts = state.write();
-        if let Some(st) = accounts.get_mut(&account_id) {
-            st.tasks.remove(id);
-        }
+    // Each stop waits out its containers' stop timeouts: stop the tasks side
+    // by side.
+    let mut stops = tokio::task::JoinSet::new();
+    for id in task_ids {
+        let (state, runtime, account_id) = (state.clone(), runtime.clone(), account_id.clone());
+        stops.spawn(async move {
+            runtime
+                .stop_task(&id, "CloudFormation stack deletion")
+                .await;
+            let mut accounts = state.write();
+            if let Some(st) = accounts.get_mut(&account_id) {
+                st.tasks.remove(&id);
+            }
+        });
     }
+    stops.join_all().await;
 }

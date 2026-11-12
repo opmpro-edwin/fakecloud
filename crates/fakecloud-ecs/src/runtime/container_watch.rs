@@ -513,11 +513,27 @@ impl super::EcsRuntime {
         // A container that exited before it was registered sends no event.
         watch.refresh(Some(&ids)).await;
 
+        // StopTask and the scheduler wake the wait to show `STOPPING`.
+        let stop_requested = std::sync::Arc::new(tokio::sync::Notify::new());
+        self.stop_requests
+            .lock()
+            .insert(task_id.to_string(), stop_requested.clone());
+        struct Unregister<'a>(&'a super::EcsRuntime, &'a str);
+        impl Drop for Unregister<'_> {
+            fn drop(&mut self) {
+                self.0.stop_requests.lock().remove(self.1);
+            }
+        }
+        let _unregister = Unregister(self, task_id);
+
         let any_essential = started.iter().any(|c| c.essential);
         let mut working: Vec<super::RunningContainer> = started.to_vec();
         let mut first_exited: Option<usize> = None;
         let mut health_shown: Vec<Option<&'static str>> = vec![None; started.len()];
         loop {
+            if super::task_desired_stopped(state, account_id, task_id) {
+                super::mark_stopping(state, account_id, task_id);
+            }
             let observed: Vec<Option<Observed>> = ids.iter().map(|id| watch.observed(id)).collect();
             // Health first, so a container that turns unhealthy and exits
             // leaves its last health status on the task.
@@ -574,7 +590,10 @@ impl super::EcsRuntime {
                     },
                 });
             }
-            registration.changed().await;
+            tokio::select! {
+                () = registration.changed() => {}
+                () = stop_requested.notified() => {}
+            }
         }
     }
 }

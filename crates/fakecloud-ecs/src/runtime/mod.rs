@@ -25,7 +25,7 @@ use tokio::process::Command;
 use crate::state::{LifecycleEvent, SharedEcsState};
 
 /// Budget for a container-CLI call that only talks to the local daemon
-/// (`inspect`, `logs`, `rm`, `tag`, `network create`, `stop --time 10`, ...):
+/// (`inspect`, `logs`, `rm`, `tag`, `network create`, ...):
 /// seconds when the daemon is healthy, so a minute only ever runs out on a
 /// wedged one.
 pub(crate) const CLI_CALL_TIMEOUT: Duration = Duration::from_secs(60);
@@ -34,6 +34,48 @@ pub(crate) const CLI_CALL_TIMEOUT: Duration = Duration::from_secs(60);
 /// create plus start, which on a loaded Podman host (network namespace,
 /// rootless port forwarder) can take far longer than a lookup.
 pub(crate) const CONTAINER_RUN_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// A container's stop timeout when its definition sets no `stopTimeout`:
+/// 30 seconds, the Fargate default and the ECS container agent's
+/// `ECS_CONTAINER_STOP_TIMEOUT` default on EC2.
+pub(crate) const DEFAULT_STOP_TIMEOUT_SECS: u32 = 30;
+
+/// The `stopTimeout` values Fargate takes, in seconds.
+const FARGATE_STOP_TIMEOUT_SECS: std::ops::RangeInclusive<u32> = 2..=120;
+
+/// How long a container gets between its stop signal and `SIGKILL`: the
+/// definition's `stopTimeout`, else [`DEFAULT_STOP_TIMEOUT_SECS`]. A
+/// Fargate task's value is held to Fargate's 2-120 s range; on EC2 the agent
+/// waits as long as the definition says.
+pub(crate) fn effective_stop_timeout(defined: Option<u64>, fargate: bool) -> u32 {
+    let secs = defined
+        .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
+        .unwrap_or(DEFAULT_STOP_TIMEOUT_SECS);
+    if fargate {
+        secs.clamp(
+            *FARGATE_STOP_TIMEOUT_SECS.start(),
+            *FARGATE_STOP_TIMEOUT_SECS.end(),
+        )
+    } else {
+        secs
+    }
+}
+
+/// `stop` arguments for container `id` with a stop timeout of `secs`, and
+/// the CLI budget for them: the timeout itself plus [`CLI_CALL_TIMEOUT`].
+/// `stop` sends the image's `STOPSIGNAL` (`SIGTERM` by default), as the ECS
+/// agent's Docker `StopContainer` call does, then `SIGKILL` after `secs`.
+pub(crate) fn stop_container_args(id: &str, secs: u32) -> ([String; 4], Duration) {
+    (
+        [
+            "stop".to_string(),
+            "--time".to_string(),
+            secs.to_string(),
+            id.to_string(),
+        ],
+        Duration::from_secs(u64::from(secs)) + CLI_CALL_TIMEOUT,
+    )
+}
 
 /// How long an `ExecuteCommand` command may run before it is killed. ECS
 /// returns from the API as soon as the Session Manager session opens; the
@@ -55,6 +97,10 @@ pub(crate) const MAX_EXECS_PER_TASK: usize = 8;
 /// realistic local workload, well under the process and descriptor limits
 /// of a default host.
 pub(crate) const MAX_EXECS: usize = 64;
+
+/// A launched container of a task, as `stop_task` needs it:
+/// `(container_name, docker_container_id, stop_timeout_secs)`.
+type TaskContainer = (String, String, u32);
 
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeError {
@@ -98,7 +144,7 @@ pub struct EcsRuntime {
     /// `stop_task` can kill every container backing a task — multi-container
     /// task definitions launch one docker container per `containerDefinitions`
     /// entry, all of which must be torn down on stop.
-    containers: RwLock<std::collections::HashMap<String, Vec<(String, String)>>>,
+    containers: RwLock<std::collections::HashMap<String, Vec<TaskContainer>>>,
     /// Cross-service delivery bus — emits `aws.ecs` EventBridge events
     /// on task state transitions when wired. `None` if the server started
     /// without EventBridge configured (or for unit tests).
@@ -142,6 +188,10 @@ pub struct EcsRuntime {
     /// (see [`EcsRuntime::spawn_exec_command`]); aborted when the task stops.
     exec_sessions:
         parking_lot::Mutex<std::collections::HashMap<String, Vec<tokio::task::JoinHandle<()>>>>,
+    /// Wakes a running task's exit wait when a stop is requested for it, so
+    /// the task shows `STOPPING` while its containers get their stop
+    /// timeout. Keyed by task ID; present while the wait runs.
+    stop_requests: parking_lot::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Notify>>>,
 }
 
 mod aws_env;
@@ -191,6 +241,7 @@ impl EcsRuntime {
             registry_host,
             docker_config,
             containers: RwLock::new(std::collections::HashMap::new()),
+            stop_requests: parking_lot::Mutex::new(std::collections::HashMap::new()),
             delivery_bus: None,
             logs_state: None,
             secretsmanager_state: None,
@@ -223,6 +274,7 @@ impl EcsRuntime {
             registry_host: String::new(),
             docker_config: None,
             containers: RwLock::new(std::collections::HashMap::new()),
+            stop_requests: parking_lot::Mutex::new(std::collections::HashMap::new()),
             delivery_bus: None,
             logs_state: None,
             secretsmanager_state: None,
@@ -335,8 +387,10 @@ pub(crate) struct ContainerPlan {
     /// `--cap-add`, `--cap-drop`, `--device`, `--init`, `--shm-size`,
     /// `--sysctl`, `--tmpfs`, `--privileged`, and `--read-only` flags.
     pub(crate) linux_parameters: Option<LinuxParameters>,
-    /// `stopTimeout` in seconds. Becomes `--stop-timeout <N>` on `docker run`.
-    pub(crate) stop_timeout: Option<u32>,
+    /// Seconds between the stop signal and `SIGKILL`: the definition's
+    /// `stopTimeout` resolved by [`effective_stop_timeout`]. Becomes
+    /// `--stop-timeout <N>` on `docker run` and `stop --time <N>` on stop.
+    pub(crate) stop_timeout: u32,
     /// `user` from the container definition. Becomes `--user <value>`.
     pub(crate) user: Option<String>,
     /// `workingDirectory` from the container definition. Becomes `--workdir`.
@@ -592,6 +646,22 @@ pub(crate) fn task_desired_stopped(
     }
 }
 
+/// A running task whose stop was requested shows `STOPPING` while its
+/// containers get their stop signal and stop timeout, as on ECS; `STOPPED`
+/// follows once they have exited. Other statuses are left alone.
+pub(crate) fn mark_stopping(state: &SharedEcsState, account_id: &str, task_id: &str) {
+    let mut accounts = state.write();
+    if let Some(task) = accounts
+        .get_mut(account_id)
+        .and_then(|s| s.tasks.get_mut(task_id))
+    {
+        if task.last_status == "RUNNING" {
+            task.last_status = "STOPPING".into();
+            task.stopping_at = task.stopping_at.or(Some(Utc::now()));
+        }
+    }
+}
+
 /// The region a task runs in: the region its ARN names, else the ECS state's
 /// region.
 pub(super) fn task_region(state: &SharedEcsState, account_id: &str, task_id: &str) -> String {
@@ -629,6 +699,11 @@ fn build_container_plans(
         .get(&task.family)
         .and_then(|revs| revs.get(&task.revision));
     let network_mode = task_def.and_then(|td| td.network_mode.clone());
+    let fargate = task.launch_type == "FARGATE"
+        || task
+            .capacity_provider_name
+            .as_deref()
+            .is_some_and(|cp| cp.starts_with("FARGATE"));
     // Index `volumes[]` by name so each container's `mountPoints[]` can
     // resolve its volume in O(1). Real ECS rejects mountPoints that
     // reference an undeclared volume at register time; we don't yet, so
@@ -723,11 +798,11 @@ fn build_container_plans(
             .as_ref()
             .and_then(|d| d.get("linuxParameters"))
             .and_then(parse_linux_parameters);
-        let stop_timeout = def.as_ref().and_then(|d| {
-            d.get("stopTimeout")
-                .and_then(|v| v.as_u64())
-                .map(|n| n as u32)
-        });
+        let stop_timeout = effective_stop_timeout(
+            def.as_ref()
+                .and_then(|d| d.get("stopTimeout").and_then(|v| v.as_u64())),
+            fargate,
+        );
         let user = def
             .as_ref()
             .and_then(|d| d.get("user").and_then(|v| v.as_str()).map(String::from));
@@ -1555,10 +1630,10 @@ pub(crate) fn build_run_argv(
             argv.push("--privileged".into());
         }
     }
-    if let Some(timeout) = plan.stop_timeout {
-        argv.push("--stop-timeout".into());
-        argv.push(format!("{}", timeout));
-    }
+    // Always set, so a stop that does not name a timeout (the engine's own,
+    // or one by hand) waits as long as ECS would.
+    argv.push("--stop-timeout".into());
+    argv.push(plan.stop_timeout.to_string());
     if let Some(ref user) = plan.user {
         argv.push("--user".into());
         argv.push(user.clone());
@@ -2091,6 +2166,7 @@ impl EcsRuntime {
             registry_host: String::new(),
             docker_config: None,
             containers: RwLock::new(std::collections::HashMap::new()),
+            stop_requests: parking_lot::Mutex::new(std::collections::HashMap::new()),
             delivery_bus: None,
             logs_state: None,
             secretsmanager_state: None,
@@ -2184,7 +2260,7 @@ sleep 1000 & echo $! >> "$d/pids"; wait
             volume_mounts: Vec::new(),
             ulimits: Vec::new(),
             linux_parameters: None,
-            stop_timeout: None,
+            stop_timeout: crate::runtime::DEFAULT_STOP_TIMEOUT_SECS,
             user: None,
             working_directory: None,
             tty: false,
@@ -2753,7 +2829,7 @@ mod tests {
             volume_mounts: Vec::new(),
             ulimits: Vec::new(),
             linux_parameters: None,
-            stop_timeout: None,
+            stop_timeout: DEFAULT_STOP_TIMEOUT_SECS,
             user: None,
             working_directory: None,
             tty: false,
@@ -2915,7 +2991,7 @@ mod tests {
             volume_mounts: Vec::new(),
             ulimits: Vec::new(),
             linux_parameters: None,
-            stop_timeout: None,
+            stop_timeout: DEFAULT_STOP_TIMEOUT_SECS,
             user: None,
             working_directory: None,
             tty: false,
@@ -2959,7 +3035,7 @@ mod tests {
             volume_mounts: Vec::new(),
             ulimits: Vec::new(),
             linux_parameters: None,
-            stop_timeout: None,
+            stop_timeout: DEFAULT_STOP_TIMEOUT_SECS,
             user: None,
             working_directory: None,
             tty: false,
@@ -3033,7 +3109,7 @@ mod tests {
             }],
             ulimits: Vec::new(),
             linux_parameters: None,
-            stop_timeout: None,
+            stop_timeout: DEFAULT_STOP_TIMEOUT_SECS,
             user: None,
             working_directory: None,
             tty: false,
@@ -3360,7 +3436,7 @@ mod tests {
                 hard_limit: 2048,
             }],
             linux_parameters: None,
-            stop_timeout: None,
+            stop_timeout: DEFAULT_STOP_TIMEOUT_SECS,
             user: None,
             working_directory: None,
             tty: false,
@@ -3410,7 +3486,7 @@ mod tests {
                 }],
                 privileged: true,
             }),
-            stop_timeout: Some(30),
+            stop_timeout: 45,
             user: Some("1000:1000".into()),
             working_directory: Some("/app".into()),
             tty: true,
@@ -3431,8 +3507,8 @@ mod tests {
         assert!(argv.contains(&"net.ipv4.ip_forward=1".to_string()));
         assert!(argv.contains(&"--tmpfs".to_string()));
         assert!(argv.contains(&"--privileged".to_string()));
-        assert!(argv.contains(&"--stop-timeout".to_string()));
-        assert!(argv.contains(&"30".to_string()));
+        let at = argv.iter().position(|a| a == "--stop-timeout").unwrap();
+        assert_eq!(argv[at + 1], "45");
         assert!(argv.contains(&"--user".to_string()));
         assert!(argv.contains(&"1000:1000".to_string()));
         assert!(argv.contains(&"--workdir".to_string()));
@@ -3813,5 +3889,195 @@ mod tests {
             Some(std::process::id()),
             "reaper must be able to parse the owning pid out of {label}",
         );
+    }
+
+    mod stop_timeout_tests {
+        use super::*;
+        use crate::state::TaskDefinition;
+        use std::time::Instant;
+
+        /// A fake container CLI that logs each call to `calls.log` and takes
+        /// one second to `stop` a container.
+        fn stop_cli() -> (tempfile::TempDir, String) {
+            fakecloud_core::test_support::fake_cli(
+                "cli",
+                r#"d=$(dirname "$0")
+    [ "$1" = warmup ] && exit 0
+    echo "$*" >> "$d/calls.log"
+    [ "$1" = stop ] && sleep 1
+    exit 0
+    "#,
+            )
+        }
+
+        fn calls(dir: &tempfile::TempDir) -> Vec<String> {
+            std::fs::read_to_string(dir.path().join("calls.log"))
+                .unwrap_or_default()
+                .lines()
+                .map(String::from)
+                .collect()
+        }
+
+        #[test]
+        fn stop_timeout_defaults_to_30s_and_fargate_holds_to_2_to_120() {
+            for fargate in [false, true] {
+                assert_eq!(effective_stop_timeout(None, fargate), 30);
+                assert_eq!(effective_stop_timeout(Some(5), fargate), 5);
+                assert_eq!(effective_stop_timeout(Some(120), fargate), 120);
+            }
+            // Fargate takes 2-120 s.
+            assert_eq!(effective_stop_timeout(Some(300), true), 120);
+            assert_eq!(effective_stop_timeout(Some(0), true), 2);
+            // The EC2 agent waits as long as the definition says.
+            assert_eq!(effective_stop_timeout(Some(300), false), 300);
+            assert_eq!(effective_stop_timeout(Some(0), false), 0);
+        }
+
+        #[test]
+        fn stop_runs_with_the_containers_timeout_and_a_budget_past_it() {
+            let (args, budget) = stop_container_args("c1", 90);
+            assert_eq!(args, ["stop", "--time", "90", "c1"]);
+            assert!(budget > Duration::from_secs(90));
+        }
+
+        fn task_def(containers: Vec<serde_json::Value>) -> TaskDefinition {
+            TaskDefinition {
+                family: "app".into(),
+                revision: 1,
+                task_definition_arn: "arn:aws:ecs:us-east-1:000000000000:task-definition/app:1"
+                    .into(),
+                container_definitions: containers,
+                status: "ACTIVE".into(),
+                task_role_arn: None,
+                execution_role_arn: None,
+                network_mode: None,
+                requires_compatibilities: Vec::new(),
+                compatibilities: Vec::new(),
+                cpu: None,
+                memory: None,
+                pid_mode: None,
+                ipc_mode: None,
+                volumes: Vec::new(),
+                placement_constraints: Vec::new(),
+                proxy_configuration: None,
+                inference_accelerators: Vec::new(),
+                ephemeral_storage: None,
+                runtime_platform: None,
+                requires_attributes: Vec::new(),
+                registered_at: chrono::Utc::now(),
+                registered_by: None,
+                deregistered_at: None,
+                tags: Vec::new(),
+                enable_fault_injection: None,
+            }
+        }
+
+        /// Plans for a task of `launch_type` whose containers are `slow`
+        /// (`stopTimeout: 200`), `quick` (`stopTimeout: 5`) and `plain` (unset).
+        fn plans_for(launch_type: &str) -> Vec<ContainerPlan> {
+            let mut accounts: MultiAccountState<EcsState> =
+                MultiAccountState::new("000000000000", "us-east-1", "http://localhost:4566");
+            let acct = accounts.get_or_create("000000000000");
+            acct.task_definitions.insert(
+                "app".into(),
+                std::iter::once((
+                    1,
+                    task_def(vec![
+                        serde_json::json!({"name": "slow", "image": "alpine", "stopTimeout": 200}),
+                        serde_json::json!({"name": "quick", "image": "alpine", "stopTimeout": 5}),
+                        serde_json::json!({"name": "plain", "image": "alpine"}),
+                    ]),
+                ))
+                .collect(),
+            );
+            let mut task = make_task("t1");
+            task.launch_type = launch_type.into();
+            task.containers = ["slow", "quick", "plain"]
+                .iter()
+                .map(|n| make_container(n, true))
+                .collect();
+            acct.tasks.insert("t1".into(), task);
+            let state: SharedEcsState = Arc::new(RwLock::new(accounts));
+            build_container_plans(&state, "000000000000", "t1", 0).unwrap()
+        }
+
+        #[test]
+        fn plans_carry_each_containers_stop_timeout() {
+            let timeouts = |plans: Vec<ContainerPlan>| -> Vec<(String, u32)> {
+                plans
+                    .into_iter()
+                    .map(|p| (p.container_name, p.stop_timeout))
+                    .collect()
+            };
+            assert_eq!(
+                timeouts(plans_for("EC2")),
+                [
+                    ("slow".to_string(), 200),
+                    ("quick".to_string(), 5),
+                    ("plain".to_string(), 30)
+                ]
+            );
+            assert_eq!(
+                timeouts(plans_for("FARGATE")),
+                [
+                    ("slow".to_string(), 120),
+                    ("quick".to_string(), 5),
+                    ("plain".to_string(), 30)
+                ]
+            );
+            // `docker run` records it on the container too.
+            let plan = plans_for("EC2").remove(1);
+            let argv = build_run_argv(&plan, &[], "t1", "host.docker.internal", OWN_NET, "alpine");
+            let at = argv.iter().position(|a| a == "--stop-timeout").unwrap();
+            assert_eq!(argv[at + 1], "5");
+        }
+
+        /// StopTask stops every container of the task at once, each with its
+        /// own stop timeout.
+        #[tokio::test]
+        async fn stop_task_stops_each_container_with_its_own_timeout_at_once() {
+            let (dir, cli) = stop_cli();
+            let rt = EcsRuntime::with_cli_for_tests(&cli);
+            rt.containers.write().insert(
+                "t1".into(),
+                vec![
+                    ("app".into(), "c-app".into(), 5),
+                    ("sidecar".into(), "c-sidecar".into(), 30),
+                ],
+            );
+            let started = Instant::now();
+            assert!(rt.stop_task("t1", "test").await);
+            // Two one-second stops side by side, not one after the other.
+            assert!(
+                started.elapsed() < Duration::from_millis(1900),
+                "{:?}",
+                started.elapsed()
+            );
+            let mut calls = calls(&dir);
+            calls.sort();
+            assert_eq!(calls, ["stop --time 30 c-sidecar", "stop --time 5 c-app"]);
+        }
+
+        #[test]
+        fn mark_stopping_moves_only_a_running_task() {
+            let mut accounts: MultiAccountState<EcsState> =
+                MultiAccountState::new("000000000000", "us-east-1", "http://localhost:4566");
+            let acct = accounts.get_or_create("000000000000");
+            for (id, status) in [("run", "RUNNING"), ("pend", "PENDING"), ("done", "STOPPED")] {
+                let mut t = make_task(id);
+                t.last_status = status.into();
+                acct.tasks.insert(id.into(), t);
+            }
+            let state: SharedEcsState = Arc::new(RwLock::new(accounts));
+            for id in ["run", "pend", "done"] {
+                mark_stopping(&state, "000000000000", id);
+            }
+            let accounts = state.read();
+            let tasks = &accounts.get("000000000000").unwrap().tasks;
+            assert_eq!(tasks["run"].last_status, "STOPPING");
+            assert!(tasks["run"].stopping_at.is_some());
+            assert_eq!(tasks["pend"].last_status, "PENDING");
+            assert_eq!(tasks["done"].last_status, "STOPPED");
+        }
     }
 }

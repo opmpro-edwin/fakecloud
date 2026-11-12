@@ -549,8 +549,13 @@ impl EcsService {
             task.stop_code = Some("UserInitiated".into());
             (task_id, account, task.clone())
         };
+        // The containers get their stop timeouts in the background: StopTask
+        // returns at once, as on ECS.
         if let Some(rt) = &self.runtime {
-            rt.stop_task(&task_id, &reason).await;
+            let rt = rt.clone();
+            tokio::spawn(async move {
+                rt.stop_task(&task_id, &reason).await;
+            });
         }
         let _ = account;
         Ok(AwsResponse::ok_json(json!({
@@ -1457,7 +1462,7 @@ mod port_mapping_tests {
             volume_mounts: Vec::new(),
             ulimits: Vec::new(),
             linux_parameters: None,
-            stop_timeout: None,
+            stop_timeout: crate::runtime::DEFAULT_STOP_TIMEOUT_SECS,
             user: None,
             working_directory: None,
             tty: false,

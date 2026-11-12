@@ -77,7 +77,7 @@ The runtime translates the following task-definition fields straight into `docke
 - `user` -> `--user`
 - `readonlyRootFilesystem=true` -> `--read-only`
 - `pseudoTerminal=true` -> `--tty`
-- `stopTimeout` -> `--stop-timeout` (also bounds the SIGTERM→SIGKILL grace inside force-stop)
+- `stopTimeout` -> `--stop-timeout`, and the grace between the stop signal (the image's `STOPSIGNAL`, `SIGTERM` by default) and `SIGKILL` whenever the task stops: StopTask, service scale-in or deployment replacement, an essential container's exit, force-stop. Unset, it is 30 seconds (the Fargate default and the ECS agent's `ECS_CONTAINER_STOP_TIMEOUT` default); a Fargate task's value is held to Fargate's 2-120 seconds. A task's containers stop side by side in the background: StopTask returns at once and the task shows `lastStatus` `STOPPING` until they have exited, then `STOPPED`. The Kubernetes backend sets the Pod's `terminationGracePeriodSeconds` to the longest container stop timeout.
 - `volumeConfigurations[]` (per-task EBS attachments) -> volume per task with size, encryption, and FS type recorded on the task's `attachments[]` and bind-mounted at the declared `mountPoint`
 
 ### awslogs flush before STOPPED

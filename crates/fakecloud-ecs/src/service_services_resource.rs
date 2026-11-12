@@ -1029,7 +1029,10 @@ impl EcsService {
                 }
             }
             if let Some(rt) = &self.runtime {
-                rt.stop_task(id, "ECS service deletion").await;
+                let (rt, id) = (rt.clone(), id.clone());
+                tokio::spawn(async move {
+                    rt.stop_task(&id, "ECS service deletion").await;
+                });
             }
         }
 

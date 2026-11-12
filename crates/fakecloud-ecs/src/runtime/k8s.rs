@@ -986,6 +986,15 @@ fn build_task_pod(
         },
         spec: Some(PodSpec {
             restart_policy: Some("Never".to_string()),
+            // A Pod has one grace period between SIGTERM and SIGKILL for
+            // all its containers: the longest container stop timeout.
+            termination_grace_period_seconds: Some(i64::from(
+                resolved
+                    .iter()
+                    .map(|(plan, _)| plan.stop_timeout)
+                    .max()
+                    .unwrap_or(crate::runtime::DEFAULT_STOP_TIMEOUT_SECS),
+            )),
             init_containers: (!init_containers.is_empty()).then_some(init_containers),
             containers: app_containers,
             volumes: (!pod_volumes.is_empty()).then_some(pod_volumes),
@@ -1181,7 +1190,7 @@ mod tests {
             volume_mounts: vec![],
             ulimits: vec![],
             linux_parameters: None,
-            stop_timeout: None,
+            stop_timeout: crate::runtime::DEFAULT_STOP_TIMEOUT_SECS,
             user: None,
             working_directory: None,
             tty: false,
@@ -1292,6 +1301,19 @@ mod tests {
         assert_eq!(map[0].original, "web");
         assert_eq!(spec.containers[0].name, "web");
         assert_eq!(spec.restart_policy.as_deref(), Some("Never"));
+        // The default ECS stop timeout.
+        assert_eq!(spec.termination_grace_period_seconds, Some(30));
+    }
+
+    /// One grace period for the Pod: its longest container stop timeout.
+    #[test]
+    fn pod_grace_period_is_the_longest_container_stop_timeout() {
+        let mut slow = plan("slow", true);
+        slow.stop_timeout = 90;
+        let mut quick = plan("quick", false);
+        quick.stop_timeout = 5;
+        let (pod, _) = build(&[(quick, vec![]), (slow, vec![])]);
+        assert_eq!(pod.spec.unwrap().termination_grace_period_seconds, Some(90));
     }
 
     #[test]
