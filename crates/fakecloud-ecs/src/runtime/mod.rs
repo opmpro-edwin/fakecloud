@@ -188,10 +188,11 @@ pub struct EcsRuntime {
     /// (see [`EcsRuntime::spawn_exec_command`]); aborted when the task stops.
     exec_sessions:
         parking_lot::Mutex<std::collections::HashMap<String, Vec<tokio::task::JoinHandle<()>>>>,
-    /// Wakes a running task's exit wait when a stop is requested for it, so
-    /// the task shows `STOPPING` while its containers get their stop
-    /// timeout. Keyed by task ID; present while the wait runs.
-    stop_requests: parking_lot::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Notify>>>,
+    /// Per running task (keyed by task ID, present while the runtime runs
+    /// it): what a stop request needs to show the task `STOPPING`, take it
+    /// out of its target groups before signalling its containers, and wake
+    /// its exit wait.
+    stop_requests: parking_lot::Mutex<std::collections::HashMap<String, StopHook>>,
 }
 
 mod aws_env;
@@ -649,17 +650,31 @@ pub(crate) fn task_desired_stopped(
 /// A running task whose stop was requested shows `STOPPING` while its
 /// containers get their stop signal and stop timeout, as on ECS; `STOPPED`
 /// follows once they have exited. Other statuses are left alone.
-pub(crate) fn mark_stopping(state: &SharedEcsState, account_id: &str, task_id: &str) {
+/// Returns whether the task moved.
+pub(crate) fn mark_stopping(state: &SharedEcsState, account_id: &str, task_id: &str) -> bool {
     let mut accounts = state.write();
-    if let Some(task) = accounts
+    let Some(task) = accounts
         .get_mut(account_id)
         .and_then(|s| s.tasks.get_mut(task_id))
-    {
-        if task.last_status == "RUNNING" {
-            task.last_status = "STOPPING".into();
-            task.stopping_at = task.stopping_at.or(Some(Utc::now()));
-        }
+    else {
+        return false;
+    };
+    if task.last_status != "RUNNING" {
+        return false;
     }
+    task.last_status = "STOPPING".into();
+    task.stopping_at = task.stopping_at.or(Some(Utc::now()));
+    true
+}
+
+/// How a stop request reaches a task the runtime is running: the state it
+/// runs in (to show `STOPPING` and leave its target groups before any
+/// container is signalled) and the wake for its exit wait.
+#[derive(Clone)]
+pub(crate) struct StopHook {
+    pub(crate) state: SharedEcsState,
+    pub(crate) account_id: String,
+    pub(crate) wake: Arc<tokio::sync::Notify>,
 }
 
 /// The region a task runs in: the region its ARN names, else the ECS state's
@@ -3676,8 +3691,10 @@ mod tests {
         assert_eq!(tg_targets[0].1, Some(32768));
     }
 
-    #[test]
-    fn compute_elbv2_targets_awsvpc_uses_eni_ip() {
+    /// Account `000000000000` with an `awsvpc` task `t1` of service `svc`,
+    /// whose load balancer is target group `tg/abc` on container port 80; the
+    /// task's ENI is `eni-0task` at `172.18.0.2`.
+    fn awsvpc_task_behind_a_target_group() -> MultiAccountState<EcsState> {
         let mut accounts: MultiAccountState<EcsState> =
             MultiAccountState::new("000000000000", "us-east-1", "http://localhost:4566");
         let acct = accounts.get_or_create("000000000000");
@@ -3772,6 +3789,10 @@ mod tests {
             status: "ATTACHED".into(),
             details: vec![
                 crate::state::AttachmentDetail {
+                    name: "networkInterfaceId".into(),
+                    value: "eni-0task".into(),
+                },
+                crate::state::AttachmentDetail {
                     name: "privateIPv4Address".into(),
                     value: "172.18.0.2".into(),
                 },
@@ -3782,6 +3803,13 @@ mod tests {
             ],
         }];
         acct.tasks.insert("t1".into(), task);
+        accounts
+    }
+
+    #[test]
+    fn compute_elbv2_targets_awsvpc_uses_eni_ip() {
+        let mut accounts = awsvpc_task_behind_a_target_group();
+        let acct = accounts.get_or_create("000000000000");
 
         let state = acct.clone();
         let targets = compute_elbv2_targets(&state, state.tasks.get("t1").unwrap());
@@ -3897,14 +3925,14 @@ mod tests {
         use std::time::Instant;
 
         /// A fake container CLI that logs each call to `calls.log` and takes
-        /// one second to `stop` a container.
+        /// two seconds to `stop` a container.
         fn stop_cli() -> (tempfile::TempDir, String) {
             fakecloud_core::test_support::fake_cli(
                 "cli",
                 r#"d=$(dirname "$0")
     [ "$1" = warmup ] && exit 0
     echo "$*" >> "$d/calls.log"
-    [ "$1" = stop ] && sleep 1
+    [ "$1" = stop ] && sleep 2
     exit 0
     "#,
             )
@@ -4047,15 +4075,152 @@ mod tests {
             );
             let started = Instant::now();
             assert!(rt.stop_task("t1", "test").await);
-            // Two one-second stops side by side, not one after the other.
+            // Two two-second stops side by side take two seconds, one after
+            // the other four; the margin leaves room for a loaded host.
             assert!(
-                started.elapsed() < Duration::from_millis(1900),
+                started.elapsed() < Duration::from_millis(3500),
                 "{:?}",
                 started.elapsed()
             );
             let mut calls = calls(&dir);
             calls.sort();
             assert_eq!(calls, ["stop --time 30 c-sidecar", "stop --time 5 c-app"]);
+        }
+
+        /// Target-group membership and ENI deletions, as the bus reports them.
+        #[derive(Default)]
+        struct Net {
+            targets: parking_lot::Mutex<Vec<String>>,
+            deleted_enis: parking_lot::Mutex<Vec<String>>,
+        }
+        impl fakecloud_core::delivery::Elbv2TargetRegistration for Net {
+            fn register_targets(&self, _: &str, tg: &str, targets: Vec<(String, Option<i64>)>) {
+                for (id, port) in targets {
+                    self.targets.lock().push(format!("{tg} {id}:{port:?}"));
+                }
+            }
+            fn deregister_targets(&self, _: &str, tg: &str, targets: Vec<(String, Option<i64>)>) {
+                for (id, port) in targets {
+                    let gone = format!("{tg} {id}:{port:?}");
+                    self.targets.lock().retain(|t| *t != gone);
+                }
+            }
+            fn target_health(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+                _: Option<i64>,
+            ) -> Option<fakecloud_core::delivery::TargetHealthView> {
+                None
+            }
+        }
+        impl fakecloud_core::delivery::Ec2NetworkLookup for Net {
+            fn create_task_eni(
+                &self,
+                _: &str,
+                _: &str,
+                _: Vec<String>,
+                _: String,
+            ) -> Result<fakecloud_core::delivery::TaskEni, String> {
+                Err("not used".into())
+            }
+            fn delete_task_eni(&self, _: &str, eni_id: &str) {
+                self.deleted_enis.lock().push(eni_id.to_string());
+            }
+        }
+
+        /// As ECS deregisters a stopping task first: StopTask takes the task out
+        /// of its target group (and shows it `STOPPING`) before its containers are
+        /// signalled, while they still run; its ENI stays until it is `STOPPED`.
+        #[tokio::test]
+        async fn stopping_task_leaves_its_target_group_before_its_containers_stop() {
+            let (dir, cli) = stop_cli();
+            let net = Arc::new(Net::default());
+            let bus = DeliveryBus::new()
+                .with_elbv2_target_registration(net.clone())
+                .with_ec2_network_lookup(net.clone());
+            let rt =
+                Arc::new(EcsRuntime::with_cli_for_tests(&cli).with_delivery_bus(Arc::new(bus)));
+            let mut accounts = awsvpc_task_behind_a_target_group();
+            let task = accounts
+                .get_or_create("000000000000")
+                .tasks
+                .get_mut("t1")
+                .unwrap();
+            task.last_status = "RUNNING".into();
+            task.desired_status = "STOPPED".into();
+            let state: SharedEcsState = Arc::new(RwLock::new(accounts));
+            rt.register_lb_targets(&state, "000000000000", "t1");
+            assert_eq!(net.targets.lock().len(), 1);
+            // The task as `run_task_inner` holds it while it runs.
+            rt.containers
+                .write()
+                .insert("t1".into(), vec![("app".into(), "c-app".into(), 5)]);
+            rt.stop_requests.lock().insert(
+                "t1".into(),
+                StopHook {
+                    state: state.clone(),
+                    account_id: "000000000000".into(),
+                    wake: Arc::default(),
+                },
+            );
+
+            let stopping = tokio::spawn({
+                let rt = rt.clone();
+                async move { rt.stop_task("t1", "test").await }
+            });
+            // Wait for the container's two-second stop to be under way.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !calls(&dir).iter().any(|c| c == "stop --time 5 c-app") {
+                assert!(
+                    Instant::now() < deadline,
+                    "the container was never signalled"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(!stopping.is_finished(), "the container still runs");
+            assert!(
+                net.targets.lock().is_empty(),
+                "still a target while stopping"
+            );
+            {
+                let accounts = state.read();
+                let t = &accounts.get("000000000000").unwrap().tasks["t1"];
+                assert_eq!(t.last_status, "STOPPING");
+            }
+            assert!(
+                net.deleted_enis.lock().is_empty(),
+                "ENI gone before STOPPED"
+            );
+            assert!(stopping.await.unwrap());
+
+            // At STOPPED the ENI goes; deregistering again is harmless.
+            rt.release_task_network(&state, "000000000000", "t1");
+            assert_eq!(*net.deleted_enis.lock(), ["eni-0task"]);
+            assert!(net.targets.lock().is_empty());
+        }
+
+        /// fakecloud's reset kills a task's containers instead of waiting out their
+        /// stop timeouts.
+        #[tokio::test]
+        async fn kill_task_kills_without_a_stop_timeout() {
+            let (dir, cli) = stop_cli();
+            let rt = EcsRuntime::with_cli_for_tests(&cli);
+            rt.containers.write().insert(
+                "t1".into(),
+                vec![
+                    ("app".into(), "c-app".into(), 3600),
+                    ("sidecar".into(), "c-sidecar".into(), 30),
+                ],
+            );
+            let started = Instant::now();
+            assert!(rt.kill_task("t1").await);
+            assert!(started.elapsed() < Duration::from_secs(2));
+            let mut calls = calls(&dir);
+            calls.sort();
+            assert_eq!(calls, ["kill c-app", "kill c-sidecar"]);
+            assert!(!rt.kill_task("unknown").await);
         }
 
         #[test]

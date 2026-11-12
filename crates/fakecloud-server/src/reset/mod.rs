@@ -447,13 +447,14 @@ impl ResetState {
         });
         if let Some(rt) = self.ecs_runtime.clone() {
             if !tasks.is_empty() {
-                // Each `stop_task` waits out its containers' stop timeout:
-                // stop them all at once.
+                // Reset is no AWS operation and nothing observes a graceful
+                // stop: kill the dropped tasks' containers at once rather
+                // than wait out their stop timeouts.
                 teardown.push(async move {
                     let mut stops = tokio::task::JoinSet::new();
                     for task in tasks {
                         let rt = rt.clone();
-                        stops.spawn(async move { rt.stop_task(&task, "fakecloud reset").await });
+                        stops.spawn(async move { rt.kill_task(&task).await });
                     }
                     stops.join_all().await;
                 });

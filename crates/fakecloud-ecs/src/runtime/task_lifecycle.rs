@@ -255,6 +255,24 @@ impl EcsRuntime {
             .write()
             .entry(task_id.to_string())
             .or_default();
+        // From here on a stop request finds the task's state, so it can show
+        // the task `STOPPING` and take it out of its target groups before
+        // signalling any container. Dropped when the run ends, however.
+        self.stop_requests.lock().insert(
+            task_id.to_string(),
+            StopHook {
+                state: state.clone(),
+                account_id: account_id.to_string(),
+                wake: Arc::default(),
+            },
+        );
+        struct ForgetStopHook<'a>(&'a EcsRuntime, &'a str);
+        impl Drop for ForgetStopHook<'_> {
+            fn drop(&mut self) {
+                self.0.stop_requests.lock().remove(self.1);
+            }
+        }
+        let _forget_stop_hook = ForgetStopHook(self, task_id);
         let mut started: Vec<RunningContainer> = Vec::with_capacity(resolved_plans.len());
         for (idx, (rp, run_image)) in resolved_plans.iter().zip(run_images.iter()).enumerate() {
             // Wait for every dependsOn[] entry on this container. Upstreams
@@ -396,7 +414,7 @@ impl EcsRuntime {
                 .map_or(DEFAULT_STOP_TIMEOUT_SECS, |rp| rp.plan.stop_timeout)
         };
         if task_desired_stopped(state, account_id, task_id) {
-            mark_stopping(state, account_id, task_id);
+            self.begin_stopping(state, account_id, task_id);
             self.stop_containers(
                 started
                     .iter()
@@ -438,7 +456,7 @@ impl EcsRuntime {
                 stop_code,
                 Some(reason.clone()),
             );
-            self.deregister_lb_targets(state, account_id, task_id);
+            self.release_task_network(state, account_id, task_id);
             self.emit_state_change(
                 state,
                 account_id,
@@ -470,7 +488,7 @@ impl EcsRuntime {
 
         // Stop and reap any sidecars still running. Best-effort — failures
         // here shouldn't keep the task from transitioning to STOPPED.
-        mark_stopping(state, account_id, task_id);
+        self.begin_stopping(state, account_id, task_id);
         let mut final_containers = started.clone();
         let mut stragglers: Vec<usize> = Vec::new();
         for (i, rc) in started.iter().enumerate() {
@@ -612,7 +630,7 @@ impl EcsRuntime {
             stop_code,
             stopped_reason.clone(),
         );
-        self.deregister_lb_targets(state, account_id, task_id);
+        self.release_task_network(state, account_id, task_id);
         self.emit_state_change(
             state,
             account_id,
@@ -747,8 +765,12 @@ impl EcsRuntime {
         if list.is_empty() {
             return false;
         }
-        if let Some(wake) = self.stop_requests.lock().get(task_id) {
-            wake.notify_one();
+        // The task leaves its target groups before any container is
+        // signalled, as ECS deregisters a stopping task first.
+        let hook = self.stop_requests.lock().get(task_id).cloned();
+        if let Some(hook) = hook {
+            self.begin_stopping(&hook.state, &hook.account_id, task_id);
+            hook.wake.notify_one();
         }
         tracing::info!(task = %task_id, reason = %reason, "ecs task stop requested");
         self.stop_containers(
@@ -757,6 +779,35 @@ impl EcsRuntime {
                 .collect(),
         )
         .await;
+        true
+    }
+
+    /// Kill every container behind a task at once, with no stop timeout:
+    /// for fakecloud's reset, which drops the task and is no AWS operation,
+    /// so nothing observes a graceful stop. The wait loop in
+    /// `run_task_inner` still sees the exits and reaps the containers.
+    pub async fn kill_task(&self, task_id: &str) -> bool {
+        if let Some(k) = &self.k8s {
+            return k.stop_task(task_id).await;
+        }
+        self.abort_execs(Some(task_id));
+        let ids: Vec<String> = self
+            .containers
+            .read()
+            .get(task_id)
+            .map(|list| list.iter().map(|(_, id, _)| id.clone()).collect())
+            .unwrap_or_default();
+        if ids.is_empty() {
+            return false;
+        }
+        let mut kills = tokio::task::JoinSet::new();
+        for id in ids {
+            let cli = self.container_cli();
+            kills.spawn(async move {
+                let _ = cli.output(["kill", id.as_str()], CLI_CALL_TIMEOUT).await;
+            });
+        }
+        kills.join_all().await;
         true
     }
 
