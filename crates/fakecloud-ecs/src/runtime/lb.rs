@@ -3,6 +3,11 @@
 use super::*;
 
 impl EcsRuntime {
+    /// Register the task's targets with its load balancers and remember
+    /// them as registered, so they are deregistered once
+    /// ([`Self::deregister_lb_targets_once`]). Registering and recording
+    /// happen under one lock: a concurrent deregistration sees either
+    /// nothing yet (and leaves the targets to a later one) or both.
     pub(super) fn register_lb_targets(
         &self,
         state: &SharedEcsState,
@@ -12,55 +17,60 @@ impl EcsRuntime {
         let Some(ref bus) = self.delivery_bus else {
             return;
         };
-        let accounts = state.read();
-        let Some(s) = accounts.get(account_id) else {
-            return;
+        let mut registered = self.lb_registered.lock();
+        let targets = {
+            let accounts = state.read();
+            let Some(s) = accounts.get(account_id) else {
+                return;
+            };
+            let Some(task) = s.tasks.get(task_id) else {
+                return;
+            };
+            compute_elbv2_targets(s, task)
         };
-        let Some(task) = s.tasks.get(task_id) else {
+        if targets.is_empty() {
             return;
-        };
-        let targets = compute_elbv2_targets(s, task);
-        drop(accounts);
-        for (tg_arn, tg_targets) in targets {
-            bus.register_elbv2_targets(account_id, &tg_arn, tg_targets);
         }
+        for (tg_arn, tg_targets) in &targets {
+            bus.register_elbv2_targets(account_id, tg_arn, tg_targets.clone());
+        }
+        registered.insert(
+            task_id.to_string(),
+            RegisteredTargets {
+                account_id: account_id.to_string(),
+                targets,
+            },
+        );
     }
 
     /// Take the task out of its load balancers' target groups, as ECS does
     /// when a task starts stopping (`DEACTIVATING`), before its containers
     /// get the stop signal: the load balancer sends it no new requests while
-    /// it drains. Idempotent; the task's ENI and published ports stay until
-    /// it is `STOPPED` ([`Self::release_task_network`]).
-    pub(super) fn deregister_lb_targets(
-        &self,
-        state: &SharedEcsState,
-        account_id: &str,
-        task_id: &str,
-    ) {
+    /// it drains. Exactly once per registration: the first call removes the
+    /// targets this runtime registered for the task, later calls do nothing.
+    /// So a late call -- after the task's containers exited and freed a
+    /// fixed `host:port` that a replacement then registered as the
+    /// identical target -- cannot take the replacement's target away. The
+    /// check and the deregistration share the registration's lock. The
+    /// task's ENI and published ports stay until it is `STOPPED`
+    /// ([`Self::release_task_network`]).
+    pub(super) fn deregister_lb_targets_once(&self, task_id: &str) {
         let Some(ref bus) = self.delivery_bus else {
             return;
         };
-        let accounts = state.read();
-        let Some(s) = accounts.get(account_id) else {
+        let mut registered = self.lb_registered.lock();
+        let Some(entry) = registered.remove(task_id) else {
             return;
         };
-        let Some(task) = s.tasks.get(task_id) else {
-            return;
-        };
-        let targets = compute_elbv2_targets(s, task);
-        drop(accounts);
-        for (tg_arn, tg_targets) in targets {
-            bus.deregister_elbv2_targets(account_id, &tg_arn, tg_targets);
+        for (tg_arn, tg_targets) in entry.targets {
+            bus.deregister_elbv2_targets(&entry.account_id, &tg_arn, tg_targets);
         }
     }
 
     /// A `STOPPED` task's published awsvpc ports and its ENI go, as on ECS.
-    /// Its load balancer targets are not touched: on the Docker backend they
-    /// went when it started stopping ([`Self::begin_stopping`]), and its
-    /// containers are already gone, so a replacement may by now have taken
-    /// the same `host:port` target (bridge / host mode with a fixed host
-    /// port) -- deregistering again would remove the replacement's. The
-    /// Kubernetes backend deregisters on its own before calling this.
+    /// Its load balancer targets are not touched here: they left once
+    /// ([`Self::deregister_lb_targets_once`]) when it started stopping or
+    /// before this, on every backend.
     pub(super) fn release_task_network(
         &self,
         state: &SharedEcsState,
@@ -83,34 +93,35 @@ impl EcsRuntime {
 
     /// The task starts stopping: a RUNNING task shows `STOPPING`, and the
     /// task leaves its target groups before any container is signalled.
-    /// The targets go whatever the status says -- an agent's
+    /// The targets go whatever the status says (an agent's
     /// SubmitTaskStateChange may have rewritten it while the runtime runs
-    /// the task -- which is safe because the task's containers still run:
-    /// no replacement can hold the same `host:port` target yet.
+    /// the task), but only if they are still registered: a second caller,
+    /// e.g. the exit wait after a stop request already deregistered them,
+    /// does nothing.
     pub(super) fn begin_stopping(&self, state: &SharedEcsState, account_id: &str, task_id: &str) {
         mark_stopping(state, account_id, task_id);
-        self.deregister_lb_targets(state, account_id, task_id);
+        self.deregister_lb_targets_once(task_id);
     }
 
     /// A task whose run failed after it started (its targets possibly
-    /// registered, its ENI attached) leaves its target groups and releases
-    /// its network before it is marked `STOPPED`, as a stopped task does.
-    /// Its containers are not yet gone for good and nothing replaces it
-    /// before `STOPPED`. A task that never started registered nothing and is
-    /// left alone. Idempotent.
+    /// still registered, its ENI attached) leaves its target groups and
+    /// releases its network before it is marked `STOPPED`, as a stopped
+    /// task does. Targets a stop already deregistered stay gone (and a
+    /// replacement's identical target stays). A task that never started
+    /// has no network to release. Idempotent.
     pub(super) fn release_failed_task(
         &self,
         state: &SharedEcsState,
         account_id: &str,
         task_id: &str,
     ) {
+        self.deregister_lb_targets_once(task_id);
         let started = state
             .read()
             .get(account_id)
             .and_then(|s| s.tasks.get(task_id))
             .is_some_and(|t| t.started_at.is_some());
         if started {
-            self.deregister_lb_targets(state, account_id, task_id);
             self.release_task_network(state, account_id, task_id);
         }
     }
@@ -118,9 +129,11 @@ impl EcsRuntime {
     /// Register a task that just went RUNNING with its load balancers,
     /// unless a stop has landed meanwhile. A stop between the RUNNING
     /// transition and this registration already moved the task to
-    /// `STOPPING` (deregistering nothing), and nothing would take the new
-    /// targets out again while its containers drain: re-check after
-    /// registering and deregister such a task.
+    /// `STOPPING` (deregistering nothing, since nothing was registered),
+    /// and nothing would take the new targets out again while its
+    /// containers drain: re-check after registering and deregister such a
+    /// task. A stop that lands after the re-check deregisters the targets
+    /// itself.
     pub(super) fn register_lb_targets_unless_stopping(
         &self,
         state: &SharedEcsState,
@@ -130,7 +143,7 @@ impl EcsRuntime {
         self.register_lb_targets(state, account_id, task_id);
         if task_desired_stopped(state, account_id, task_id) {
             mark_stopping(state, account_id, task_id);
-            self.deregister_lb_targets(state, account_id, task_id);
+            self.deregister_lb_targets_once(task_id);
         }
     }
 

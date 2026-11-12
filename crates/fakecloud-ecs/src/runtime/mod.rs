@@ -193,6 +193,11 @@ pub struct EcsRuntime {
     /// out of its target groups before signalling its containers, and wake
     /// its exit wait.
     stop_requests: parking_lot::Mutex<std::collections::HashMap<String, StopHook>>,
+    /// Per task (keyed by task ID): the load-balancer targets this runtime
+    /// registered for it and has not deregistered yet. Deregistration takes
+    /// the entry out, so each task's targets leave their target groups
+    /// exactly once (see [`EcsRuntime::deregister_lb_targets_once`]).
+    lb_registered: parking_lot::Mutex<std::collections::HashMap<String, RegisteredTargets>>,
 }
 
 mod aws_env;
@@ -243,6 +248,7 @@ impl EcsRuntime {
             docker_config,
             containers: RwLock::new(std::collections::HashMap::new()),
             stop_requests: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            lb_registered: parking_lot::Mutex::new(std::collections::HashMap::new()),
             delivery_bus: None,
             logs_state: None,
             secretsmanager_state: None,
@@ -276,6 +282,7 @@ impl EcsRuntime {
             docker_config: None,
             containers: RwLock::new(std::collections::HashMap::new()),
             stop_requests: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            lb_registered: parking_lot::Mutex::new(std::collections::HashMap::new()),
             delivery_bus: None,
             logs_state: None,
             secretsmanager_state: None,
@@ -665,6 +672,15 @@ pub(crate) fn mark_stopping(state: &SharedEcsState, account_id: &str, task_id: &
     task.last_status = "STOPPING".into();
     task.stopping_at = task.stopping_at.or(Some(Utc::now()));
     true
+}
+
+/// Load-balancer targets per target group ARN: `(id, port)` each.
+type Elbv2Targets = Vec<(String, Vec<(String, Option<i64>)>)>;
+
+/// The load-balancer targets registered for one task, and its account.
+pub(crate) struct RegisteredTargets {
+    account_id: String,
+    targets: Elbv2Targets,
 }
 
 /// How a stop request reaches a task the runtime is running: the state it
@@ -2182,6 +2198,7 @@ impl EcsRuntime {
             docker_config: None,
             containers: RwLock::new(std::collections::HashMap::new()),
             stop_requests: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            lb_registered: parking_lot::Mutex::new(std::collections::HashMap::new()),
             delivery_bus: None,
             logs_state: None,
             secretsmanager_state: None,
@@ -4092,6 +4109,7 @@ mod tests {
         struct Net {
             targets: parking_lot::Mutex<Vec<String>>,
             deleted_enis: parking_lot::Mutex<Vec<String>>,
+            deregistrations: std::sync::atomic::AtomicUsize,
         }
         impl fakecloud_core::delivery::Elbv2TargetRegistration for Net {
             fn register_targets(&self, _: &str, tg: &str, targets: Vec<(String, Option<i64>)>) {
@@ -4100,6 +4118,8 @@ mod tests {
                 }
             }
             fn deregister_targets(&self, _: &str, tg: &str, targets: Vec<(String, Option<i64>)>) {
+                self.deregistrations
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 for (id, port) in targets {
                     let gone = format!("{tg} {id}:{port:?}");
                     self.targets.lock().retain(|t| *t != gone);
@@ -4336,6 +4356,166 @@ mod tests {
             rt.release_task_network(&state, "000000000000", "t1");
             assert_eq!(net.targets.lock().len(), 1, "the replacement's target went");
             assert_eq!(*net.deleted_enis.lock(), ["eni-0task"]);
+        }
+
+        fn deregistrations(net: &Net) -> usize {
+            net.deregistrations
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        /// A replacement task `t2` with the same targets as `t1` (the same
+        /// fixed `host:port`, or here the same ENI IP), registered through
+        /// the runtime.
+        fn register_replacement(rt: &EcsRuntime, state: &SharedEcsState) {
+            {
+                let mut accounts = state.write();
+                let s = accounts.get_mut("000000000000").unwrap();
+                let mut t2 = s.tasks["t1"].clone();
+                t2.task_arn = t2.task_arn.replace("t1", "t2");
+                t2.last_status = "RUNNING".into();
+                t2.desired_status = "RUNNING".into();
+                s.tasks.insert("t2".into(), t2);
+            }
+            rt.register_lb_targets(state, "000000000000", "t2");
+        }
+
+        /// StopTask deregisters the task; after its containers exit, a
+        /// replacement registers the identical target, and the exit wait's
+        /// `begin_stopping` (run_task_inner after the wait) leaves it alone.
+        #[tokio::test]
+        async fn a_stopped_tasks_late_stopping_leaves_a_replacements_target() {
+            let (_dir, cli) = stop_cli();
+            let net = Arc::new(Net::default());
+            let bus = DeliveryBus::new()
+                .with_elbv2_target_registration(net.clone())
+                .with_ec2_network_lookup(net.clone());
+            let rt = EcsRuntime::with_cli_for_tests(&cli).with_delivery_bus(Arc::new(bus));
+            let state: SharedEcsState = Arc::new(RwLock::new(awsvpc_task_behind_a_target_group()));
+            set_status(&state, "RUNNING", "RUNNING");
+            rt.register_lb_targets_unless_stopping(&state, "000000000000", "t1");
+            assert_eq!(net.targets.lock().len(), 1);
+            rt.containers
+                .write()
+                .insert("t1".into(), vec![("app".into(), "c-app".into(), 5)]);
+            rt.stop_requests.lock().insert(
+                "t1".into(),
+                StopHook {
+                    state: state.clone(),
+                    account_id: "000000000000".into(),
+                    wake: Arc::default(),
+                },
+            );
+            set_status(&state, "RUNNING", "STOPPED");
+            assert!(rt.stop_task("t1", "test").await);
+            assert!(net.targets.lock().is_empty());
+            assert_eq!(deregistrations(&net), 1);
+
+            register_replacement(&rt, &state);
+            assert_eq!(net.targets.lock().len(), 1);
+            // The exit wait's first stop-seeing pass, then run_task_inner
+            // after the wait.
+            rt.begin_stopping(&state, "000000000000", "t1");
+            rt.begin_stopping(&state, "000000000000", "t1");
+            assert_eq!(net.targets.lock().len(), 1, "the replacement's target went");
+            assert_eq!(deregistrations(&net), 1);
+            // The replacement still leaves when it stops.
+            rt.begin_stopping(&state, "000000000000", "t2");
+            assert!(net.targets.lock().is_empty());
+        }
+
+        /// A task whose essential container exited by itself (desired
+        /// RUNNING) leaves its target groups once, after the wait.
+        #[test]
+        fn a_self_exited_task_deregisters_once() {
+            let (net, rt, state) = net_runtime();
+            set_status(&state, "RUNNING", "RUNNING");
+            rt.register_lb_targets_unless_stopping(&state, "000000000000", "t1");
+            assert_eq!(net.targets.lock().len(), 1);
+            rt.begin_stopping(&state, "000000000000", "t1");
+            assert!(net.targets.lock().is_empty());
+            assert_eq!(deregistrations(&net), 1);
+            // A stop request landing afterwards, or a failure while reaping,
+            // deregisters nothing more.
+            rt.begin_stopping(&state, "000000000000", "t1");
+            rt.release_failed_task(&state, "000000000000", "t1");
+            assert_eq!(deregistrations(&net), 1);
+        }
+
+        /// A run that fails after a stop already deregistered the task leaves
+        /// a replacement's identical target; one that fails with its targets
+        /// still registered deregisters them.
+        #[test]
+        fn a_failed_run_deregisters_only_targets_still_registered() {
+            let (net, rt, state) = net_runtime();
+            set_status(&state, "RUNNING", "RUNNING");
+            rt.register_lb_targets_unless_stopping(&state, "000000000000", "t1");
+            set_status(&state, "RUNNING", "STOPPED");
+            rt.begin_stopping(&state, "000000000000", "t1");
+            register_replacement(&rt, &state);
+            rt.release_failed_task(&state, "000000000000", "t1");
+            assert_eq!(net.targets.lock().len(), 1, "the replacement's target went");
+            assert_eq!(deregistrations(&net), 1);
+
+            let (net, rt, state) = net_runtime();
+            set_status(&state, "RUNNING", "RUNNING");
+            rt.register_lb_targets_unless_stopping(&state, "000000000000", "t1");
+            rt.release_failed_task(&state, "000000000000", "t1");
+            assert!(net.targets.lock().is_empty());
+            assert_eq!(deregistrations(&net), 1);
+        }
+
+        /// A stop racing the registration on another thread always ends with
+        /// the task deregistered.
+        #[test]
+        fn a_stop_racing_the_registration_ends_deregistered() {
+            for _ in 0..200 {
+                let (net, rt, state) = net_runtime();
+                set_status(&state, "RUNNING", "RUNNING");
+                let rt = Arc::new(rt);
+                let barrier = Arc::new(std::sync::Barrier::new(2));
+                let registering = std::thread::spawn({
+                    let (rt, state, barrier) = (rt.clone(), state.clone(), barrier.clone());
+                    move || {
+                        barrier.wait();
+                        rt.register_lb_targets_unless_stopping(&state, "000000000000", "t1");
+                    }
+                });
+                let stopping = std::thread::spawn({
+                    let (rt, state, barrier) = (rt.clone(), state.clone(), barrier.clone());
+                    move || {
+                        barrier.wait();
+                        // StopTask: desiredStatus first, then the runtime stop.
+                        set_status(&state, "RUNNING", "STOPPED");
+                        rt.begin_stopping(&state, "000000000000", "t1");
+                    }
+                });
+                registering.join().unwrap();
+                stopping.join().unwrap();
+                assert!(net.targets.lock().is_empty(), "a stopped task is routable");
+                assert!(deregistrations(&net) <= 1);
+            }
+        }
+
+        /// A status an agent's SubmitTaskStateChange rewrote does not keep the
+        /// task's targets registered, nor deregister them twice.
+        #[test]
+        fn a_rewritten_status_still_deregisters_exactly_once() {
+            for status in ["PENDING", "STOPPING", "STOPPED"] {
+                let (net, rt, state) = net_runtime();
+                set_status(&state, "RUNNING", "RUNNING");
+                rt.register_lb_targets_unless_stopping(&state, "000000000000", "t1");
+                set_status(&state, status, "STOPPED");
+                rt.begin_stopping(&state, "000000000000", "t1");
+                register_replacement(&rt, &state);
+                rt.begin_stopping(&state, "000000000000", "t1");
+                rt.release_failed_task(&state, "000000000000", "t1");
+                assert_eq!(deregistrations(&net), 1, "{status}");
+                assert_eq!(
+                    net.targets.lock().len(),
+                    1,
+                    "{status}: replacement's target went"
+                );
+            }
         }
 
         /// fakecloud's reset kills a task's containers instead of waiting out their

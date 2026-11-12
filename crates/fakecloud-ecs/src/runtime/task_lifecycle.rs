@@ -489,6 +489,10 @@ impl EcsRuntime {
 
         // Stop and reap any sidecars still running. Best-effort — failures
         // here shouldn't keep the task from transitioning to STOPPED.
+        // A task that exited by itself leaves its target groups here (its
+        // slot is held until STOPPED, so nothing has replaced it yet); one
+        // a stop request already deregistered stays as it is, whatever a
+        // replacement registered meanwhile.
         self.begin_stopping(state, account_id, task_id);
         let mut final_containers = started.clone();
         let mut stragglers: Vec<usize> = Vec::new();

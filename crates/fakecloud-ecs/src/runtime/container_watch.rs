@@ -527,8 +527,8 @@ impl super::EcsRuntime {
         let mut first_exited: Option<usize> = None;
         let mut health_shown: Vec<Option<&'static str>> = vec![None; started.len()];
         loop {
-            // Once: a later pass may run after a container has exited and
-            // freed its host port for a replacement's identical target.
+            // Once per wait; the targets themselves leave at most once
+            // whoever calls (see `deregister_lb_targets_once`).
             if !stopping_begun && super::task_desired_stopped(state, account_id, task_id) {
                 self.begin_stopping(state, account_id, task_id);
                 stopping_begun = true;
