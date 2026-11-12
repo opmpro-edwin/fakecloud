@@ -1687,6 +1687,15 @@ mod verify_sigv4_registry_auth_tests {
         assert_eq!(status, StatusCode::OK, "{body}");
     }
 
+    /// Removes an upload spool file when dropped, so a test leaves none
+    /// behind even when an assertion fails.
+    struct RemoveOnDrop(std::path::PathBuf);
+    impl Drop for RemoveOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
     /// Seed `default-app` (the runtime credential's account) with one layer
     /// and one tagged manifest; returns `(layer digest, manifest digest)`.
     fn seed_default_image(t: &Setup) -> (String, String) {
@@ -1754,7 +1763,7 @@ mod verify_sigv4_registry_auth_tests {
         }
 
         // An in-flight upload, so PATCH/PUT reach a real upload id.
-        let upload_id = {
+        let (upload_id, spool_cleanup) = {
             let mut guard = t.ecr.state_handle().write();
             let s = guard.get_mut(DEFAULT).unwrap();
             let id = "upload-runtime".to_string();
@@ -1770,7 +1779,7 @@ mod verify_sigv4_registry_auth_tests {
                     append_in_flight: false,
                 },
             );
-            id
+            (id, RemoveOnDrop(spool))
         };
 
         // Bodies differ only in their request id.
@@ -1825,7 +1834,8 @@ mod verify_sigv4_registry_auth_tests {
             0,
             "no bytes appended"
         );
-        let _ = std::fs::remove_file(spool);
+        drop(spool_cleanup);
+        assert!(!std::path::Path::new(&spool).exists());
     }
 
     /// An issued token keeps full access: it can push where the runtime
@@ -1847,7 +1857,19 @@ mod verify_sigv4_registry_auth_tests {
         let (status, body) = t
             .send_method("POST", "/v2/app/blobs/uploads/", &auth, Vec::new())
             .await;
+        // The upload's spool file goes with the test.
+        let _spools: Vec<RemoveOnDrop> = t
+            .ecr
+            .state_handle()
+            .read()
+            .get(OWNER)
+            .unwrap()
+            .layer_uploads
+            .values()
+            .map(|u| RemoveOnDrop(u.spool_path.clone().into()))
+            .collect();
         assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        assert_eq!(_spools.len(), 1);
     }
 
     /// B1: an unverified presign query riding along with Basic credentials
