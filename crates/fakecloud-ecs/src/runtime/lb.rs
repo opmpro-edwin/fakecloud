@@ -81,12 +81,37 @@ impl EcsRuntime {
         }
     }
 
-    /// The task starts stopping: a RUNNING task shows `STOPPING` and leaves
-    /// its target groups before any container is signalled. No-op for a task
-    /// that is not RUNNING (already stopping, or stopped before it ran).
+    /// The task starts stopping: a RUNNING task shows `STOPPING`, and the
+    /// task leaves its target groups before any container is signalled.
+    /// The targets go whatever the status says -- an agent's
+    /// SubmitTaskStateChange may have rewritten it while the runtime runs
+    /// the task -- which is safe because the task's containers still run:
+    /// no replacement can hold the same `host:port` target yet.
     pub(super) fn begin_stopping(&self, state: &SharedEcsState, account_id: &str, task_id: &str) {
-        if mark_stopping(state, account_id, task_id) {
+        mark_stopping(state, account_id, task_id);
+        self.deregister_lb_targets(state, account_id, task_id);
+    }
+
+    /// A task whose run failed after it started (its targets possibly
+    /// registered, its ENI attached) leaves its target groups and releases
+    /// its network before it is marked `STOPPED`, as a stopped task does.
+    /// Its containers are not yet gone for good and nothing replaces it
+    /// before `STOPPED`. A task that never started registered nothing and is
+    /// left alone. Idempotent.
+    pub(super) fn release_failed_task(
+        &self,
+        state: &SharedEcsState,
+        account_id: &str,
+        task_id: &str,
+    ) {
+        let started = state
+            .read()
+            .get(account_id)
+            .and_then(|s| s.tasks.get(task_id))
+            .is_some_and(|t| t.started_at.is_some());
+        if started {
             self.deregister_lb_targets(state, account_id, task_id);
+            self.release_task_network(state, account_id, task_id);
         }
     }
 

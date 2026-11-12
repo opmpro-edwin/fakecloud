@@ -4256,6 +4256,58 @@ mod tests {
             );
         }
 
+        /// An agent's SubmitTaskStateChange may rewrite the status of a task
+        /// the runtime runs; stopping it still takes it out of its target
+        /// groups.
+        #[test]
+        fn stopping_deregisters_whatever_the_status_says() {
+            for status in ["PENDING", "STOPPING", "STOPPED"] {
+                let (net, rt, state) = net_runtime();
+                set_status(&state, "RUNNING", "RUNNING");
+                rt.register_lb_targets(&state, "000000000000", "t1");
+                assert_eq!(net.targets.lock().len(), 1);
+                set_status(&state, status, "STOPPED");
+                rt.begin_stopping(&state, "000000000000", "t1");
+                assert!(net.targets.lock().is_empty(), "{status}: still a target");
+                assert_eq!(
+                    state.read().get("000000000000").unwrap().tasks["t1"].last_status,
+                    status,
+                    "only a RUNNING task moves to STOPPING"
+                );
+            }
+        }
+
+        /// A run that fails after the task started (e.g. a container removed
+        /// behind the runtime's back) releases the task's targets, ports and
+        /// ENI before it goes STOPPED; one that never started registered
+        /// nothing and is left alone.
+        #[test]
+        fn a_failed_started_task_releases_its_targets_and_eni() {
+            let (net, rt, state) = net_runtime();
+            set_status(&state, "RUNNING", "RUNNING");
+            state
+                .write()
+                .get_mut("000000000000")
+                .unwrap()
+                .tasks
+                .get_mut("t1")
+                .unwrap()
+                .started_at = Some(Utc::now());
+            rt.register_lb_targets(&state, "000000000000", "t1");
+            assert_eq!(net.targets.lock().len(), 1);
+            rt.release_failed_task(&state, "000000000000", "t1");
+            assert!(net.targets.lock().is_empty());
+            assert_eq!(*net.deleted_enis.lock(), ["eni-0task"]);
+            // Idempotent.
+            rt.release_failed_task(&state, "000000000000", "t1");
+            assert!(net.targets.lock().is_empty());
+
+            let (net, rt, state) = net_runtime();
+            set_status(&state, "PENDING", "RUNNING");
+            rt.release_failed_task(&state, "000000000000", "t1");
+            assert!(net.deleted_enis.lock().is_empty());
+        }
+
         /// A replacement that took the stopped task's `host:port` target (its
         /// containers gone, the port free) keeps it through the old task's
         /// STOPPED cleanup.

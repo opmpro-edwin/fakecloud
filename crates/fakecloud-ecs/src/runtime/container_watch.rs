@@ -521,13 +521,17 @@ impl super::EcsRuntime {
             .map(|hook| hook.wake.clone())
             .unwrap_or_default();
 
+        let mut stopping_begun = false;
         let any_essential = started.iter().any(|c| c.essential);
         let mut working: Vec<super::RunningContainer> = started.to_vec();
         let mut first_exited: Option<usize> = None;
         let mut health_shown: Vec<Option<&'static str>> = vec![None; started.len()];
         loop {
-            if super::task_desired_stopped(state, account_id, task_id) {
+            // Once: a later pass may run after a container has exited and
+            // freed its host port for a replacement's identical target.
+            if !stopping_begun && super::task_desired_stopped(state, account_id, task_id) {
                 self.begin_stopping(state, account_id, task_id);
+                stopping_begun = true;
             }
             let observed: Vec<Option<Observed>> = ids.iter().map(|id| watch.observed(id)).collect();
             // Health first, so a container that turns unhealthy and exits

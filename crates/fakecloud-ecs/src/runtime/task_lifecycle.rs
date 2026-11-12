@@ -19,6 +19,7 @@ impl EcsRuntime {
                 // holders of the task's containers behind.
                 rt.remove_netns_holders(&task_id).await;
                 rt.abort_execs(Some(&task_id));
+                rt.release_failed_task(&state, &account_id, &task_id);
                 finalize_failure(&state, &account_id, &task_id, &err.to_string());
                 rt.emit_state_change(
                     &state,
