@@ -485,3 +485,237 @@ async fn minimum_healthy_100_keeps_the_old_tasks_serving_a_failing_deployment() 
     );
     f.delete().await;
 }
+
+/// A free host port for a bridge-mode `hostPort`.
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// `(id, port, state)` of every target registered in `tg_arn`.
+async fn target_health(
+    elbv2: &aws_sdk_elasticloadbalancingv2::Client,
+    tg_arn: &str,
+) -> Vec<(String, i32, String)> {
+    let mut out: Vec<_> = elbv2
+        .describe_target_health()
+        .target_group_arn(tg_arn)
+        .send()
+        .await
+        .expect("describe_target_health")
+        .target_health_descriptions()
+        .iter()
+        .map(|d| {
+            let t = d.target().unwrap();
+            (
+                t.id().unwrap().to_string(),
+                t.port().unwrap_or_default(),
+                d.target_health()
+                    .and_then(|h| h.state())
+                    .map(|s| s.as_str().to_string())
+                    .unwrap_or_default(),
+            )
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// Bridge-mode tasks all register as `127.0.0.1` and differ only by host
+/// port, so the target group must key them by (id, port): the new task's
+/// target is added beside the old one, and deregistering the old task's
+/// target leaves the new one in place. The group is never empty.
+#[tokio::test]
+async fn bridge_deployment_keeps_each_tasks_target_and_never_empties_the_group() {
+    if !require_docker_or_skip(
+        "bridge_deployment_keeps_each_tasks_target_and_never_empties_the_group",
+    ) {
+        return;
+    }
+    let server = TestServer::start().await;
+    let ec2 = server.ec2_client().await;
+    let ecs = server.ecs_client().await;
+    let elbv2 = server.elbv2_client().await;
+
+    let vpc = ec2
+        .create_vpc()
+        .cidr_block("10.41.0.0/16")
+        .send()
+        .await
+        .expect("create_vpc")
+        .vpc()
+        .unwrap()
+        .vpc_id()
+        .unwrap()
+        .to_string();
+    let lb_arn = elbv2
+        .create_load_balancer()
+        .name("bridge-alb")
+        .scheme(LoadBalancerSchemeEnum::Internal)
+        .send()
+        .await
+        .expect("create_load_balancer")
+        .load_balancers()[0]
+        .load_balancer_arn()
+        .unwrap()
+        .to_string();
+    let tg_arn = elbv2
+        .create_target_group()
+        .name("bridge-tg")
+        .protocol(ProtocolEnum::Http)
+        .port(8080)
+        .vpc_id(&vpc)
+        .target_type(TargetTypeEnum::Instance)
+        .health_check_path("/")
+        .health_check_interval_seconds(5)
+        .health_check_timeout_seconds(2)
+        .healthy_threshold_count(2)
+        .send()
+        .await
+        .expect("create_target_group")
+        .target_groups()[0]
+        .target_group_arn()
+        .unwrap()
+        .to_string();
+    elbv2
+        .create_listener()
+        .load_balancer_arn(&lb_arn)
+        .protocol(ProtocolEnum::Http)
+        .port(80)
+        .default_actions(
+            Action::builder()
+                .r#type(ActionTypeEnum::Forward)
+                .target_group_arn(&tg_arn)
+                .build(),
+        )
+        .send()
+        .await
+        .expect("create_listener");
+    ecs.create_cluster()
+        .cluster_name(CLUSTER)
+        .send()
+        .await
+        .expect("create_cluster");
+
+    // Each revision publishes its own host port, as dynamic host ports would.
+    let register_bridge = |host_port: u16, version: &'static str| {
+        let ecs = ecs.clone();
+        async move {
+            ecs.register_task_definition()
+                .family("web")
+                .network_mode(NetworkMode::Bridge)
+                .container_definitions(
+                    ContainerDefinition::builder()
+                        .name("app")
+                        .image(IMAGE)
+                        .essential(true)
+                        .memory(128)
+                        .port_mappings(
+                            PortMapping::builder()
+                                .container_port(8080)
+                                .host_port(i32::from(host_port))
+                                .build(),
+                        )
+                        .environment(
+                            KeyValuePair::builder()
+                                .name("VERSION")
+                                .value(version)
+                                .build(),
+                        )
+                        .command("--port")
+                        .command("8080")
+                        .build(),
+                )
+                .send()
+                .await
+                .expect("register_task_definition");
+        }
+    };
+    let old_port = free_port();
+    let new_port = loop {
+        let port = free_port();
+        if port != old_port {
+            break port;
+        }
+    };
+    register_bridge(old_port, "1").await;
+    ecs.create_service()
+        .cluster(CLUSTER)
+        .service_name(SERVICE)
+        .task_definition("web:1")
+        .desired_count(1)
+        .deployment_configuration(
+            DeploymentConfiguration::builder()
+                .minimum_healthy_percent(100)
+                .maximum_percent(200)
+                .build(),
+        )
+        .load_balancers(
+            LoadBalancer::builder()
+                .target_group_arn(&tg_arn)
+                .container_name("app")
+                .container_port(8080)
+                .build(),
+        )
+        .send()
+        .await
+        .expect("create_service");
+    let f = Fixture {
+        _server: server,
+        ecs: ecs.clone(),
+    };
+
+    let host = "127.0.0.1".to_string();
+    let deadline = Instant::now() + Duration::from_secs(150);
+    loop {
+        let targets = target_health(&elbv2, &tg_arn).await;
+        if targets == vec![(host.clone(), i32::from(old_port), "healthy".to_string())] {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "first task never became a healthy target: {targets:?}"
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+
+    register_bridge(new_port, "2").await;
+    f.deploy("2").await;
+
+    let mut saw_both = false;
+    let deadline = Instant::now() + Duration::from_secs(180);
+    loop {
+        let targets = target_health(&elbv2, &tg_arn).await;
+        assert!(
+            !targets.is_empty(),
+            "the target group went empty during the deployment: {}",
+            summary(&f.describe().await)
+        );
+        let ports: Vec<i32> = targets.iter().map(|t| t.1).collect();
+        saw_both |= ports.contains(&i32::from(old_port)) && ports.contains(&i32::from(new_port));
+        let svc = f.describe().await;
+        let done = svc.deployments().len() == 1
+            && svc.deployments()[0]
+                .task_definition()
+                .unwrap_or_default()
+                .ends_with("web:2")
+            && svc.deployments()[0].rollout_state().map(|r| r.as_str()) == Some("COMPLETED");
+        if done && targets == vec![(host.clone(), i32::from(new_port), "healthy".to_string())] {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "deployment never settled on the new target: {targets:?} {}",
+            summary(&svc)
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    assert!(
+        saw_both,
+        "both tasks' targets are registered side by side during the deployment"
+    );
+    f.delete().await;
+}

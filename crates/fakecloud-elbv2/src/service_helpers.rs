@@ -1530,19 +1530,9 @@ pub(crate) fn parse_target_descriptions(req: &AwsRequest) -> Vec<crate::state::T
                 .query_params
                 .get(&format!("Targets.member.{n}.AvailabilityZone"))
                 .cloned();
-            out.push(crate::state::TargetDescription {
-                id,
-                port,
-                availability_zone: az,
-                health: if crate::prober::probes_enabled() {
-                    crate::state::TargetHealth::initial()
-                } else {
-                    crate::state::TargetHealth::default()
-                },
-                consecutive_success: 0,
-                consecutive_failure: 0,
-                last_probe_at: None,
-            });
+            out.push(crate::state::TargetDescription::new_registered(
+                id, port, az,
+            ));
         } else {
             break;
         }

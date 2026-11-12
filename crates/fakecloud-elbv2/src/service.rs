@@ -1316,9 +1316,7 @@ impl Elbv2Service {
             .get_mut(&arn)
             .ok_or_else(|| target_group_not_found(&arn))?;
         for t in targets {
-            // Replace existing entry with same id+port, otherwise append.
-            tg.targets.retain(|x| !(x.id == t.id && x.port == t.port));
-            tg.targets.push(t);
+            tg.register_target(t);
         }
         Ok(xml_metadata_only("RegisterTargets", &req.request_id))
     }
@@ -1336,8 +1334,7 @@ impl Elbv2Service {
             .get_mut(&arn)
             .ok_or_else(|| target_group_not_found(&arn))?;
         for t in targets {
-            tg.targets
-                .retain(|x| !(x.id == t.id && (t.port.is_none() || x.port == t.port)));
+            tg.deregister_target(&t.id, t.port);
         }
         Ok(xml_metadata_only("DeregisterTargets", &req.request_id))
     }

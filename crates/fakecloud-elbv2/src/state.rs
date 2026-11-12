@@ -191,6 +191,50 @@ pub struct TargetDescription {
     pub last_probe_at: Option<DateTime<Utc>>,
 }
 
+impl TargetGroup {
+    /// RegisterTargets: a target is identified by (Id, Port), so the same id
+    /// on another port is a separate target (bridge/host-mode ECS tasks all
+    /// share one host address). Re-registering the same pair replaces its
+    /// entry instead of adding a duplicate.
+    pub fn register_target(&mut self, target: TargetDescription) {
+        self.targets
+            .retain(|x| !(x.id == target.id && x.port == target.port));
+        self.targets.push(target);
+    }
+
+    /// DeregisterTargets: removes the target with this id on this port; a
+    /// port-less request removes the id on every port.
+    pub fn deregister_target(&mut self, id: &str, port: Option<i32>) {
+        self.targets
+            .retain(|x| !(x.id == id && (port.is_none() || x.port == port)));
+    }
+}
+
+impl TargetDescription {
+    /// A freshly registered target: `initial` until the prober has seen
+    /// enough passing checks, or healthy outright when health probes are
+    /// turned off (nothing would ever move it on).
+    pub fn new_registered(
+        id: String,
+        port: Option<i32>,
+        availability_zone: Option<String>,
+    ) -> Self {
+        Self {
+            id,
+            port,
+            availability_zone,
+            health: if crate::prober::probes_enabled() {
+                TargetHealth::initial()
+            } else {
+                TargetHealth::default()
+            },
+            consecutive_success: 0,
+            consecutive_failure: 0,
+            last_probe_at: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TargetHealth {
     pub state: String,
@@ -443,5 +487,60 @@ mod tests {
         // The rest of the target survives the round-trip.
         assert_eq!(restored.id, "i-abc");
         assert_eq!(restored.port, Some(8080));
+    }
+
+    fn tg_with(targets: &[(&str, Option<i32>)]) -> TargetGroup {
+        let json = serde_json::json!({
+            "arn": "arn:tg", "name": "tg", "protocol": "HTTP", "port": 80,
+            "vpc_id": null, "target_type": "instance", "ip_address_type": "ipv4",
+            "protocol_version": null, "health_check_protocol": null,
+            "health_check_port": null, "health_check_enabled": true,
+            "health_check_path": null, "health_check_interval_seconds": 30,
+            "health_check_timeout_seconds": 5, "healthy_threshold_count": 5,
+            "unhealthy_threshold_count": 2, "matcher_http_code": null,
+            "matcher_grpc_code": null, "load_balancer_arns": [], "targets": [],
+            "tags": [], "attributes": {}, "created_time": "2024-01-01T00:00:00Z"
+        });
+        let mut tg: TargetGroup = serde_json::from_value(json).expect("target group");
+        for (id, port) in targets {
+            tg.register_target(TargetDescription::new_registered(
+                id.to_string(),
+                *port,
+                None,
+            ));
+        }
+        tg
+    }
+
+    fn pairs(tg: &TargetGroup) -> Vec<(String, Option<i32>)> {
+        let mut out: Vec<_> = tg.targets.iter().map(|t| (t.id.clone(), t.port)).collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn targets_are_identified_by_id_and_port() {
+        let mut tg = tg_with(&[("127.0.0.1", Some(32768)), ("127.0.0.1", Some(32769))]);
+        assert_eq!(tg.targets.len(), 2);
+        // Re-registering the same pair replaces it, never duplicates it.
+        tg.register_target(TargetDescription::new_registered(
+            "127.0.0.1".into(),
+            Some(32768),
+            None,
+        ));
+        assert_eq!(tg.targets.len(), 2);
+        tg.deregister_target("127.0.0.1", Some(32768));
+        assert_eq!(pairs(&tg), vec![("127.0.0.1".to_string(), Some(32769))]);
+    }
+
+    #[test]
+    fn port_less_deregistration_removes_the_id_on_every_port() {
+        let mut tg = tg_with(&[
+            ("127.0.0.1", Some(32768)),
+            ("127.0.0.1", None),
+            ("10.0.0.1", Some(80)),
+        ]);
+        tg.deregister_target("127.0.0.1", None);
+        assert_eq!(pairs(&tg), vec![("10.0.0.1".to_string(), Some(80))]);
     }
 }

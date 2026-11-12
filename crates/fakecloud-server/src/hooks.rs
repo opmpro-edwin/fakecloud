@@ -255,23 +255,13 @@ impl fakecloud_core::delivery::Elbv2TargetRegistration for Elbv2TargetRegistrati
             return;
         };
         for (id, port) in targets {
-            tg.targets.retain(|t| t.id != id);
-            tg.targets.push(fakecloud_elbv2::TargetDescription {
+            // Same (Id, Port) matching as RegisterTargets: bridge/host-mode
+            // tasks share one host address and differ only by port.
+            tg.register_target(fakecloud_elbv2::TargetDescription::new_registered(
                 id,
-                port: port.map(|p| p as i32),
-                availability_zone: None,
-                // Same as RegisterTargets: `initial` until the prober has
-                // seen enough passing checks, or healthy outright when health
-                // probes are turned off (nothing would ever move it on).
-                health: if fakecloud_elbv2::prober::probes_enabled() {
-                    fakecloud_elbv2::TargetHealth::initial()
-                } else {
-                    fakecloud_elbv2::TargetHealth::default()
-                },
-                consecutive_success: 0,
-                consecutive_failure: 0,
-                last_probe_at: None,
-            });
+                port.map(|p| p as i32),
+                None,
+            ));
         }
     }
 
@@ -286,8 +276,10 @@ impl fakecloud_core::delivery::Elbv2TargetRegistration for Elbv2TargetRegistrati
         let Some(tg) = st.target_groups.get_mut(target_group_arn) else {
             return;
         };
-        for (id, _port) in targets {
-            tg.targets.retain(|t| t.id != id);
+        for (id, port) in targets {
+            // Same (Id, Port) matching as DeregisterTargets: only this task's
+            // port goes, never another task's target on the same address.
+            tg.deregister_target(&id, port.map(|p| p as i32));
         }
     }
 
@@ -568,5 +560,140 @@ mod task_eni_tests {
             .unwrap()
             .network_interfaces
             .contains_key(&eni.eni_id));
+    }
+}
+
+#[cfg(test)]
+mod elbv2_target_registration_tests {
+    use super::*;
+    use fakecloud_core::delivery::Elbv2TargetRegistration;
+
+    const ACCOUNT: &str = "123456789012";
+    const TG: &str = "arn:aws:elasticloadbalancing:us-east-1:123456789012:targetgroup/tg/1";
+
+    fn hook_with_target_group() -> Elbv2TargetRegistrationImpl {
+        let state: fakecloud_elbv2::SharedElbv2State = Arc::new(parking_lot::RwLock::new(
+            fakecloud_elbv2::Elbv2Accounts::new(),
+        ));
+        state.write().get_or_create(ACCOUNT).target_groups.insert(
+            TG.to_string(),
+            fakecloud_elbv2::TargetGroup {
+                arn: TG.to_string(),
+                name: "tg".to_string(),
+                protocol: Some("HTTP".to_string()),
+                port: Some(80),
+                vpc_id: None,
+                target_type: "instance".to_string(),
+                ip_address_type: "ipv4".to_string(),
+                protocol_version: None,
+                health_check_protocol: None,
+                health_check_port: None,
+                health_check_enabled: true,
+                health_check_path: None,
+                health_check_interval_seconds: 30,
+                health_check_timeout_seconds: 5,
+                healthy_threshold_count: 5,
+                unhealthy_threshold_count: 2,
+                matcher_http_code: None,
+                matcher_grpc_code: None,
+                load_balancer_arns: Vec::new(),
+                targets: Vec::new(),
+                tags: Vec::new(),
+                attributes: Default::default(),
+                created_time: chrono::Utc::now(),
+            },
+        );
+        Elbv2TargetRegistrationImpl { state }
+    }
+
+    fn targets(hook: &Elbv2TargetRegistrationImpl) -> Vec<(String, Option<i32>)> {
+        let accounts = hook.state.read();
+        let mut out: Vec<_> = accounts.get(ACCOUNT).unwrap().target_groups[TG]
+            .targets
+            .iter()
+            .map(|t| (t.id.clone(), t.port))
+            .collect();
+        out.sort();
+        out
+    }
+
+    fn host(port: Option<i64>) -> Vec<(String, Option<i64>)> {
+        vec![("127.0.0.1".to_string(), port)]
+    }
+
+    #[test]
+    fn bridge_tasks_on_one_host_address_each_keep_their_target() {
+        let hook = hook_with_target_group();
+        hook.register_targets(ACCOUNT, TG, host(Some(32768)));
+        hook.register_targets(ACCOUNT, TG, host(Some(32769)));
+        assert_eq!(
+            targets(&hook),
+            vec![
+                ("127.0.0.1".to_string(), Some(32768)),
+                ("127.0.0.1".to_string(), Some(32769)),
+            ]
+        );
+        assert!(hook
+            .target_health(ACCOUNT, TG, "127.0.0.1", Some(32768))
+            .is_some());
+        assert!(hook
+            .target_health(ACCOUNT, TG, "127.0.0.1", Some(32769))
+            .is_some());
+    }
+
+    #[test]
+    fn deregistering_one_task_leaves_the_other_on_the_same_address() {
+        // A rolling deployment: the new task registers before the old one is
+        // deregistered; the group must never go empty.
+        let hook = hook_with_target_group();
+        hook.register_targets(ACCOUNT, TG, host(Some(32768)));
+        hook.register_targets(ACCOUNT, TG, host(Some(32769)));
+        hook.deregister_targets(ACCOUNT, TG, host(Some(32768)));
+        assert_eq!(targets(&hook), vec![("127.0.0.1".to_string(), Some(32769))]);
+        assert!(hook
+            .target_health(ACCOUNT, TG, "127.0.0.1", Some(32768))
+            .is_none());
+    }
+
+    #[test]
+    fn re_registering_the_same_target_does_not_duplicate_it() {
+        let hook = hook_with_target_group();
+        hook.register_targets(ACCOUNT, TG, host(Some(32768)));
+        hook.register_targets(ACCOUNT, TG, host(Some(32768)));
+        assert_eq!(targets(&hook), vec![("127.0.0.1".to_string(), Some(32768))]);
+    }
+
+    #[test]
+    fn port_less_targets_follow_the_register_and_deregister_rules() {
+        let hook = hook_with_target_group();
+        // Port-less registration is its own (id, no port) entry, as with
+        // RegisterTargets, and re-registering it does not duplicate it.
+        hook.register_targets(ACCOUNT, TG, host(None));
+        hook.register_targets(ACCOUNT, TG, host(None));
+        hook.register_targets(ACCOUNT, TG, host(Some(32768)));
+        assert_eq!(
+            targets(&hook),
+            vec![
+                ("127.0.0.1".to_string(), None),
+                ("127.0.0.1".to_string(), Some(32768)),
+            ]
+        );
+        // Deregistering a specific port leaves the port-less entry alone.
+        hook.deregister_targets(ACCOUNT, TG, host(Some(32768)));
+        assert_eq!(targets(&hook), vec![("127.0.0.1".to_string(), None)]);
+        // A port-less deregistration removes the id on every port, as with
+        // DeregisterTargets.
+        hook.register_targets(ACCOUNT, TG, host(Some(32769)));
+        hook.deregister_targets(ACCOUNT, TG, host(None));
+        assert!(targets(&hook).is_empty());
+    }
+
+    #[test]
+    fn awsvpc_targets_with_distinct_addresses_are_unchanged() {
+        let hook = hook_with_target_group();
+        hook.register_targets(ACCOUNT, TG, vec![("10.0.1.5".to_string(), Some(8080))]);
+        hook.register_targets(ACCOUNT, TG, vec![("10.0.1.6".to_string(), Some(8080))]);
+        hook.deregister_targets(ACCOUNT, TG, vec![("10.0.1.5".to_string(), Some(8080))]);
+        assert_eq!(targets(&hook), vec![("10.0.1.6".to_string(), Some(8080))]);
     }
 }
