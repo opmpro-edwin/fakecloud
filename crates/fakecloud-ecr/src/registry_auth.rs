@@ -8,7 +8,8 @@
 //! Under `--verify-sigv4` ([`RegistryAuth::set_verified`]) only such a token, or
 //! the server's own runtime credential
 //! ([`fakecloud_core::container_net::registry_runtime_basic_credentials`]),
-//! authenticates. Without it the registry stays lenient: any `AWS:*` or
+//! authenticates. The runtime credential is pull-only (`GET`/`HEAD`; see
+//! `oci::authorized`). Without it the registry stays lenient: any `AWS:*` or
 //! `test*` user passes, in the account dispatch resolved.
 
 use std::collections::HashMap;
@@ -36,7 +37,7 @@ pub(crate) struct RegistryToken {
 pub(crate) enum RegistryCaller {
     /// A token this server issued: the request runs as its identity.
     Token(RegistryToken),
-    /// fakecloud's own container runtime pulling an image.
+    /// fakecloud's own container runtime pulling an image (pull-only).
     Runtime,
     /// Lenient (verification off) acceptance of any `AWS:*` / `test*` user.
     Unverified,

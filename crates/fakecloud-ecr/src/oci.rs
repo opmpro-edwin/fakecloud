@@ -274,8 +274,18 @@ pub(crate) fn registry_caller(
     }
 }
 
+/// Whether the request may proceed. fakecloud's runtime credential exists
+/// only so its own ECS/Lambda image pulls authenticate: it is pull-only
+/// (`GET`/`HEAD`); any write it attempts gets the same 401 as a refused
+/// credential. Tokens from `GetAuthorizationToken` keep full access.
 fn authorized(service: &EcrService, request: &AwsRequest) -> Result<bool, AwsServiceError> {
-    Ok(registry_caller(service, request)?.is_some())
+    Ok(match registry_caller(service, request)? {
+        None => false,
+        Some(RegistryCaller::Runtime) => {
+            matches!(request.method, Method::GET | Method::HEAD)
+        }
+        Some(_) => true,
+    })
 }
 
 fn base_response(status: StatusCode, content_type: &str, body: Vec<u8>) -> AwsResponse {
@@ -1557,11 +1567,21 @@ mod verify_sigv4_registry_auth_tests {
 
     impl Setup {
         async fn send(&self, uri: &str, auth: &str) -> (StatusCode, String) {
+            self.send_method("GET", uri, auth, Vec::new()).await
+        }
+
+        async fn send_method(
+            &self,
+            method: &str,
+            uri: &str,
+            auth: &str,
+            body: Vec<u8>,
+        ) -> (StatusCode, String) {
             let request = Request::builder()
-                .method("GET")
+                .method(method)
                 .uri(uri)
                 .header("authorization", auth)
-                .body(Body::empty())
+                .body(Body::from(body))
                 .unwrap();
             let resp =
                 dispatch_to_service("ecr", self.registry.clone(), self.cfg.clone(), request).await;
@@ -1665,6 +1685,169 @@ mod verify_sigv4_registry_auth_tests {
         let auth = basic(&fakecloud_core::container_net::registry_runtime_basic_credentials());
         let (status, body) = t.send("/v2/default-app/tags/list", &auth).await;
         assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    /// Seed `default-app` (the runtime credential's account) with one layer
+    /// and one tagged manifest; returns `(layer digest, manifest digest)`.
+    fn seed_default_image(t: &Setup) -> (String, String) {
+        let blob = b"layer bytes".to_vec();
+        let layer_digest = super::sha256_digest(&blob);
+        let manifest =
+            format!("{{\"schemaVersion\":2,\"config\":{{\"digest\":\"{layer_digest}\"}}}}");
+        let manifest_digest = super::sha256_digest(manifest.as_bytes());
+        let mut guard = t.ecr.state_handle().write();
+        let repo = guard
+            .get_mut(DEFAULT)
+            .unwrap()
+            .repositories
+            .get_mut("default-app")
+            .unwrap();
+        repo.layers.insert(
+            layer_digest.clone(),
+            crate::state::Layer {
+                digest: layer_digest.clone(),
+                size: blob.len() as u64,
+                blob_b64: base64::engine::general_purpose::STANDARD.encode(&blob),
+                media_type: "application/octet-stream".into(),
+                encrypted_with_kms_key: None,
+            },
+        );
+        repo.images.insert(
+            manifest_digest.clone(),
+            crate::state::Image {
+                image_digest: manifest_digest.clone(),
+                image_manifest: manifest.clone(),
+                image_manifest_media_type: "application/vnd.docker.distribution.manifest.v2+json"
+                    .into(),
+                artifact_media_type: None,
+                image_size_in_bytes: manifest.len() as u64,
+                image_pushed_at: chrono::Utc::now(),
+                last_recorded_pull_time: None,
+                image_status: "ACTIVE".into(),
+                last_archived_at: None,
+                last_activated_at: None,
+                last_in_use_at: None,
+                in_use_count: 0,
+            },
+        );
+        repo.image_tags.insert("v1".into(), manifest_digest.clone());
+        (layer_digest, manifest_digest)
+    }
+
+    /// The runtime credential is pull-only: it reads manifests and blobs
+    /// but every write answers the registry's 401, as a refused credential.
+    #[tokio::test]
+    async fn runtime_credential_is_pull_only() {
+        let t = setup(true);
+        let (layer, manifest) = seed_default_image(&t);
+        let runtime = basic(&fakecloud_core::container_net::registry_runtime_basic_credentials());
+
+        for method in ["GET", "HEAD"] {
+            for uri in [
+                "/v2/default-app/manifests/v1".to_string(),
+                format!("/v2/default-app/manifests/{manifest}"),
+                format!("/v2/default-app/blobs/{layer}"),
+            ] {
+                let (status, body) = t.send_method(method, &uri, &runtime, Vec::new()).await;
+                assert_eq!(status, StatusCode::OK, "{method} {uri}: {body}");
+            }
+        }
+
+        // An in-flight upload, so PATCH/PUT reach a real upload id.
+        let upload_id = {
+            let mut guard = t.ecr.state_handle().write();
+            let s = guard.get_mut(DEFAULT).unwrap();
+            let id = "upload-runtime".to_string();
+            let spool = super::create_upload_spool(&id).unwrap();
+            s.layer_uploads.insert(
+                id.clone(),
+                crate::state::LayerUpload {
+                    upload_id: id.clone(),
+                    repository_name: "default-app".into(),
+                    created_at: chrono::Utc::now(),
+                    spool_path: spool.to_string_lossy().into_owned(),
+                    last_byte_received: 0,
+                    append_in_flight: false,
+                },
+            );
+            id
+        };
+
+        // Bodies differ only in their request id.
+        let strip_id = |body: &str| {
+            body.lines()
+                .filter(|l| !l.contains("<RequestId>"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let (_, refused_body) = t.send("/v2/", &basic("AWS:forged")).await;
+        for (method, uri) in [
+            ("PUT", "/v2/default-app/manifests/v2".to_string()),
+            ("DELETE", format!("/v2/default-app/manifests/{manifest}")),
+            ("DELETE", format!("/v2/default-app/blobs/{layer}")),
+            ("POST", "/v2/default-app/blobs/uploads/".to_string()),
+            (
+                "PATCH",
+                format!("/v2/default-app/blobs/uploads/{upload_id}"),
+            ),
+            (
+                "PUT",
+                format!("/v2/default-app/blobs/uploads/{upload_id}?digest={layer}"),
+            ),
+            (
+                "DELETE",
+                format!("/v2/default-app/blobs/uploads/{upload_id}"),
+            ),
+        ] {
+            let (status, body) = t
+                .send_method(method, &uri, &runtime, b"payload".to_vec())
+                .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {uri}: {body}");
+            assert_eq!(
+                strip_id(&body),
+                strip_id(&refused_body),
+                "same body as a refused credential"
+            );
+        }
+
+        // Nothing changed: the tag, manifest, layer and upload are intact.
+        let guard = t.ecr.state_handle().read();
+        let s = guard.get(DEFAULT).unwrap();
+        let repo = s.repositories.get("default-app").unwrap();
+        assert!(repo.images.contains_key(&manifest));
+        assert!(repo.layers.contains_key(&layer));
+        assert_eq!(repo.image_tags.len(), 1);
+        assert!(s.layer_uploads.contains_key(&upload_id));
+        let spool = s.layer_uploads[&upload_id].spool_path.clone();
+        drop(guard);
+        assert_eq!(
+            std::fs::metadata(&spool).unwrap().len(),
+            0,
+            "no bytes appended"
+        );
+        let _ = std::fs::remove_file(spool);
+    }
+
+    /// An issued token keeps full access: it can push where the runtime
+    /// credential cannot.
+    #[tokio::test]
+    async fn issued_token_can_still_write() {
+        let t = setup(true);
+        let auth = t.login().await;
+        let manifest = "{\"schemaVersion\":2,\"config\":{\"digest\":\"sha256:00\"}}";
+        let (status, body) = t
+            .send_method(
+                "PUT",
+                "/v2/app/manifests/v1",
+                &auth,
+                manifest.as_bytes().to_vec(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let (status, body) = t
+            .send_method("POST", "/v2/app/blobs/uploads/", &auth, Vec::new())
+            .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
     }
 
     /// B1: an unverified presign query riding along with Basic credentials
