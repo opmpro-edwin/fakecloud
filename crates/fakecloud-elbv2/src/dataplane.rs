@@ -14,7 +14,9 @@
 //! times out after 10 seconds, and an exchange with the target that is
 //! idle for longer than the load balancer's
 //! `idle_timeout.timeout_seconds` (60 by default) ends: a 504 before
-//! the answer's head arrives, the connection closed after.
+//! the answer's head arrives, the connection closed after. A WebSocket
+//! connection upgraded through the ALB is closed once it has been idle in
+//! both directions for that long.
 //!
 //! TLS termination, mTLS, and raw NLB TCP are intentionally next-
 //! batch work items. The data-plane doc page enumerates the gap.
@@ -1590,7 +1592,7 @@ async fn forward_upgrade(
     client: hyper::upgrade::OnUpgrade,
     log_ctx: &mut RequestLogContext,
 ) -> Response<Full<Bytes>> {
-    let mut sender = match open_upgrade_connection(upstream, tls).await {
+    let mut sender = match open_upgrade_connection(upstream, tls, CONNECT_TIMEOUT).await {
         Ok(s) => s,
         Err(UpstreamConnectError { message, timed_out }) => {
             log_ctx.error_reason = format!("UpstreamError: {message}");
@@ -1629,15 +1631,31 @@ async fn forward_upgrade(
     if target_resp.status() != StatusCode::SWITCHING_PROTOCOLS {
         let status = target_resp.status();
         let target_headers = target_resp.headers().clone();
-        let body = match target_resp.into_body().collect().await {
-            Ok(c) => c.to_bytes(),
-            Err(e) => {
-                return canned(
-                    StatusCode::BAD_GATEWAY,
-                    &format!("Upstream body error: {e}"),
-                );
+        // The refusal is buffered before it goes back, so a target that
+        // goes silent mid-body is bounded by the idle timeout too.
+        let mut body = Vec::new();
+        let mut incoming = target_resp.into_body();
+        loop {
+            match tokio::time::timeout(idle_timeout, incoming.frame()).await {
+                Ok(Some(Ok(frame))) => {
+                    if let Ok(data) = frame.into_data() {
+                        body.extend_from_slice(&data);
+                    }
+                }
+                Ok(None) => break,
+                Ok(Some(Err(e))) => {
+                    return canned(
+                        StatusCode::BAD_GATEWAY,
+                        &format!("Upstream body error: {e}"),
+                    );
+                }
+                Err(_) => {
+                    log_ctx.error_reason = "UpstreamError: idle timeout".to_string();
+                    return upstream_error("idle timeout", true);
+                }
             }
-        };
+        }
+        let body = Bytes::from(body);
         let mut resp = Response::new(Full::new(body));
         *resp.status_mut() = status;
         for (k, v) in target_headers.iter() {
@@ -1662,19 +1680,104 @@ async fn forward_upgrade(
                 return;
             }
         };
-        let mut client = TokioIo::new(client);
-        let mut target = TokioIo::new(target);
-        if let Err(e) = tokio::io::copy_bidirectional(&mut client, &mut target).await {
-            trace!("ELBv2 data plane: upgraded connection ended: {e}");
-        }
+        splice_with_idle_timeout(TokioIo::new(client), TokioIo::new(target), idle_timeout).await;
     });
     resp
+}
+
+/// Joins an upgraded client connection to its target until both directions
+/// end, either fails, or no byte has moved in either direction for
+/// `idle_timeout`. As on an ALB, the idle timeout applies to upgraded
+/// (WebSocket) connections: any traffic either way restarts it, and on
+/// expiry both connections are closed. It is not a cap on the connection's
+/// lifetime.
+async fn splice_with_idle_timeout<A, B>(client: A, target: B, idle_timeout: Duration)
+where
+    A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let (mut client_rd, mut client_wr) = tokio::io::split(client);
+    let (mut target_rd, mut target_wr) = tokio::io::split(target);
+    let activity = Activity::new();
+    let both = async {
+        tokio::try_join!(
+            pump(&mut client_rd, &mut target_wr, &activity),
+            pump(&mut target_rd, &mut client_wr, &activity),
+        )
+    };
+    tokio::select! {
+        r = both => {
+            if let Err(e) = r {
+                trace!("ELBv2 data plane: upgraded connection ended: {e}");
+            }
+        }
+        () = activity.idle_for(idle_timeout) => {
+            trace!("ELBv2 data plane: upgraded connection idle, closing");
+        }
+    }
+    // Dropping the halves closes both connections.
+}
+
+/// When bytes last moved on an upgraded connection.
+struct Activity {
+    start: tokio::time::Instant,
+    /// Milliseconds after `start` of the last traffic.
+    last_ms: std::sync::atomic::AtomicU64,
+}
+
+impl Activity {
+    fn new() -> Self {
+        Self {
+            start: tokio::time::Instant::now(),
+            last_ms: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn touch(&self) {
+        let ms = u64::try_from(self.start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.last_ms.store(ms, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Resolves once no traffic has been recorded for `idle_timeout`.
+    async fn idle_for(&self, idle_timeout: Duration) {
+        loop {
+            let last =
+                Duration::from_millis(self.last_ms.load(std::sync::atomic::Ordering::Relaxed));
+            let deadline = self.start + last + idle_timeout;
+            if tokio::time::Instant::now() >= deadline {
+                return;
+            }
+            tokio::time::sleep_until(deadline).await;
+        }
+    }
+}
+
+/// Copies `from` into `to` until `from` ends (then half-closes `to`),
+/// recording traffic on `activity`.
+async fn pump<R, W>(from: &mut R, to: &mut W, activity: &Activity) -> std::io::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut buf = vec![0u8; 16 * 1024];
+    loop {
+        let n = from.read(&mut buf).await?;
+        if n == 0 {
+            return to.shutdown().await;
+        }
+        activity.touch();
+        to.write_all(&buf[..n]).await?;
+        to.flush().await?;
+        activity.touch();
+    }
 }
 
 /// Why a connection to the target for an upgrade could not be opened.
 struct UpstreamConnectError {
     message: String,
-    /// The TCP connect did not complete in [`CONNECT_TIMEOUT`].
+    /// The TCP connect (and, to an HTTPS target, the TLS handshake) did not
+    /// complete in the connect timeout.
     timed_out: bool,
 }
 
@@ -1689,37 +1792,47 @@ impl UpstreamConnectError {
 
 /// Opens an HTTP/1.1 connection to the target for a WebSocket handshake:
 /// TLS for an HTTPS target group (any certificate accepted, as by an ALB),
-/// plain TCP otherwise. The connection task runs with upgrades enabled so the
+/// plain TCP otherwise. The TCP connect and the TLS handshake together have
+/// `connect_timeout` ([`CONNECT_TIMEOUT`] on an ALB), so a target that
+/// accepts the connection and then stays silent times out like one that
+/// cannot be reached. The connection task runs with upgrades enabled so the
 /// target's `101` hands the stream over.
 async fn open_upgrade_connection(
     upstream: &fakecloud_core::dataplane::Endpoint,
     tls: bool,
+    connect_timeout: Duration,
 ) -> Result<
     hyper::client::conn::http1::SendRequest<http_body_util::Empty<Bytes>>,
     UpstreamConnectError,
 > {
-    let stream = match tokio::time::timeout(
-        CONNECT_TIMEOUT,
+    let deadline = tokio::time::Instant::now() + connect_timeout;
+    let timed_out = |what: &str| UpstreamConnectError {
+        message: format!("{what} timeout"),
+        timed_out: true,
+    };
+    let stream = match tokio::time::timeout_at(
+        deadline,
         tokio::net::TcpStream::connect((upstream.host.as_str(), upstream.port)),
     )
     .await
     {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => return Err(UpstreamConnectError::failed(e)),
-        Err(_) => {
-            return Err(UpstreamConnectError {
-                message: "connect timeout".to_string(),
-                timed_out: true,
-            })
-        }
+        Err(_) => return Err(timed_out("connect")),
     };
     if tls {
         let server_name = rustls::pki_types::ServerName::try_from(upstream.host.clone())
             .map_err(UpstreamConnectError::failed)?;
-        let stream = tokio_rustls::TlsConnector::from(target_tls_config())
-            .connect(server_name, stream)
-            .await
-            .map_err(UpstreamConnectError::failed)?;
+        let stream = match tokio::time::timeout_at(
+            deadline,
+            tokio_rustls::TlsConnector::from(target_tls_config()).connect(server_name, stream),
+        )
+        .await
+        {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => return Err(UpstreamConnectError::failed(e)),
+            Err(_) => return Err(timed_out("TLS handshake")),
+        };
         upgrade_handshake(stream).await
     } else {
         upgrade_handshake(stream).await
@@ -2645,6 +2758,119 @@ mod forward_tests {
         let target_port = spawn_target(false).await;
         alb.set_targets(vec![target("127.0.0.1", target_port, "healthy")]);
         websocket_echo(&alb).await;
+    }
+
+    /// [`websocket_echo`], returning the upgraded client connection.
+    async fn websocket_open(alb: &Alb) -> tokio::net::TcpStream {
+        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", alb.port))
+            .await
+            .unwrap();
+        s.write_all(
+            b"GET /ws HTTP/1.1\r\nHost: dp\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\
+              Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            assert_eq!(s.read(&mut byte).await.unwrap(), 1, "connection closed");
+            head.push(byte[0]);
+        }
+        assert!(head.starts_with(b"HTTP/1.1 101"));
+        s
+    }
+
+    /// Whether the ALB closed `s` within `within` (EOF or reset).
+    async fn closed_within(s: &mut tokio::net::TcpStream, within: Duration) -> bool {
+        let mut buf = [0u8; 16];
+        matches!(
+            tokio::time::timeout(within, s.read(&mut buf)).await,
+            Ok(Ok(0)) | Ok(Err(_))
+        )
+    }
+
+    #[tokio::test]
+    async fn idle_upgraded_connection_is_closed_after_the_idle_timeout() {
+        for tls in [false, true] {
+            let alb = alb(
+                if tls { "HTTPS" } else { "HTTP" },
+                &[("idle_timeout.timeout_seconds", "1")],
+            )
+            .await;
+            let target_port = spawn_target(tls).await;
+            alb.set_targets(vec![target("127.0.0.1", target_port, "healthy")]);
+            let mut s = websocket_open(&alb).await;
+            s.write_all(b"ping").await.unwrap();
+            let mut echo = [0u8; 4];
+            s.read_exact(&mut echo).await.unwrap();
+            let idle_from = Instant::now();
+            assert!(
+                closed_within(&mut s, Duration::from_secs(5)).await,
+                "tls={tls}: an idle upgraded connection stays open"
+            );
+            let waited = idle_from.elapsed();
+            assert!(
+                waited >= Duration::from_millis(900),
+                "tls={tls}: closed after only {waited:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn active_upgraded_connection_outlives_the_idle_timeout() {
+        let alb = alb("HTTP", &[("idle_timeout.timeout_seconds", "1")]).await;
+        let target_port = spawn_target(false).await;
+        alb.set_targets(vec![target("127.0.0.1", target_port, "healthy")]);
+        let mut s = websocket_open(&alb).await;
+        let started = Instant::now();
+        // Frames every 400 ms for 3 s: three times the idle timeout.
+        while started.elapsed() < Duration::from_secs(3) {
+            s.write_all(b"ping").await.unwrap();
+            let mut echo = [0u8; 4];
+            tokio::time::timeout(Duration::from_secs(1), s.read_exact(&mut echo))
+                .await
+                .expect("echo")
+                .expect("connection still open");
+            assert_eq!(&echo, b"ping");
+            tokio::time::sleep(Duration::from_millis(400)).await;
+        }
+        // Once the traffic stops, the idle timeout closes it.
+        assert!(closed_within(&mut s, Duration::from_secs(5)).await);
+    }
+
+    #[tokio::test]
+    async fn silent_tls_target_bounds_the_upgrade_connect() {
+        // Accepts TCP, then never speaks TLS.
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+        let upstream = fakecloud_core::dataplane::Endpoint {
+            host: "127.0.0.1".to_string(),
+            port,
+        };
+        let started = Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            open_upgrade_connection(&upstream, true, Duration::from_millis(300)),
+        )
+        .await
+        .expect("the TLS handshake is bounded");
+        let Err(err) = result else {
+            panic!("a silent target cannot complete a TLS handshake")
+        };
+        assert!(err.timed_out, "{}", err.message);
+        assert!(started.elapsed() >= Duration::from_millis(300));
+        // Answered as a connect timeout: 504.
+        assert_eq!(
+            upstream_error(&err.message, err.timed_out).status(),
+            StatusCode::GATEWAY_TIMEOUT
+        );
     }
 
     #[tokio::test]
